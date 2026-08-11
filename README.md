@@ -1,7 +1,9 @@
 # Throttle
 
-Throttle is a local, bring-your-own-endpoint CLI for measuring an existing
-OpenAI-compatible chat-completions server. It provisions nothing, changes
+**A local CLI for benchmarking LLM inference endpoints**
+
+Throttle is a bring-your-own-endpoint CLI for measuring existing
+OpenAI-compatible chat-completions servers. It provisions nothing, changes
 nothing on the server, and never claims universal optimization or projected
 savings.
 
