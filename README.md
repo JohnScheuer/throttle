@@ -23,10 +23,15 @@ Version 0.2 has four explicit modes:
 
 Results describe only the declared workload and manifest.
 
-## Try it safely
+## Installation
 
-Throttle requires Python 3.11+. Clone the public repository and install the
-reviewed v0.2.0 wheel:
+### Requirements
+- Python 3.11 or higher
+- An OpenAI-compatible inference endpoint
+
+### Quick Start
+
+Clone the repository and install the v0.2.0 wheel:
 
 ```sh
 git clone https://github.com/KushagraKanaujia/throttle.git
