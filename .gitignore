@@ -42,6 +42,8 @@ Thumbs.db
 /smoke.json
 /benchmark.json
 /comparison.json
+*.json.bak
+demo-*.json
 
 # Keep only the reviewed v0.2.0 wheel for fast tester installation.
 dist/*
