@@ -7,19 +7,14 @@ OpenAI-compatible chat-completions servers. It provisions nothing, changes
 nothing on the server, and never claims universal optimization or projected
 savings.
 
-Version 0.2 has four explicit modes:
+## Features
 
-- `throttle plan` sends zero traffic and shows the destination, request/token
-  ceilings, duration, cost bound, and privacy implications.
-- `throttle smoke` is a short connectivity/load-shape check. Its default is 27
-  calls: concurrency 1/4/8 × (8 measured + 1 separate warm-up). It is always
-  non-decision-grade.
-- `throttle benchmark` runs sustained, repeated blocks using closed-loop
-  concurrency or open-loop request rates. It reports a best *tested* condition,
-  never an optimum.
-- `throttle compare` compares saved reports offline. Two inputs perform a
-  normal saved-run comparison; six ordered inputs validate the golden
-  B1/C1/B2/C2/B3/C3 protocol.
+Version 0.2 provides four operational modes:
+
+- **`throttle plan`** - Zero-traffic dry run showing destination, request/token limits, duration, cost bounds, and privacy implications
+- **`throttle smoke`** - Quick connectivity check with 27 calls across concurrency levels 1/4/8 (non-decision-grade)
+- **`throttle benchmark`** - Sustained load testing with repeated blocks using closed-loop concurrency or open-loop request rates
+- **`throttle compare`** - Offline comparison of saved runs with statistical confidence intervals
 
 Results describe only the declared workload and manifest.
 
