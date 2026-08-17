@@ -2,6 +2,17 @@
 
 All notable changes to Throttle will be documented in this file.
 
+## Unreleased
+
+### Added
+- Platform-aware accelerator provenance for CUDA, Metal, ROCm, and CPU runs
+- Immutable software-environment pins for decision-grade direct-host benchmarks
+- `--accelerator` and `--accelerator-fingerprint` aliases for existing GPU fields
+
+### Changed
+- Runtime manifest 1.1 supports non-CUDA comparisons while preserving manifest
+  1.0 CUDA report compatibility and CUDA's existing image/driver requirements
+
 ## [0.2.0] - 2026-08-17
 
 ### Added

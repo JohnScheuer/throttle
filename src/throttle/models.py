@@ -19,6 +19,7 @@ CostKind = Literal[
 TrafficKind = Literal["closed_loop", "open_loop"]
 RunMode = Literal["smoke", "benchmark"]
 BackendKind = Literal["native", "guidellm"]
+AcceleratorBackend = Literal["cuda", "metal", "rocm", "cpu"]
 OPEN_LOOP_RATE_RELATIVE_TOLERANCE = 0.05
 OPEN_LOOP_SCHEDULER_LAG_INTERVAL_TOLERANCE = 1.0
 
@@ -317,6 +318,10 @@ class RunConfig:
     gpu_fingerprint: str = "unknown"
     cuda_version: str = "unknown"
     driver_version: str = "unknown"
+    accelerator_backend: AcceleratorBackend = "cuda"
+    accelerator_runtime_version: str = "unknown"
+    host_os_version: str = "unknown"
+    software_environment_digest: str = "unknown"
     server_version: str = "unknown"
     engine_flags: tuple[tuple[str, str], ...] = ()
     engine_flags_provenance: str = "operator_attested"

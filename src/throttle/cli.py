@@ -26,6 +26,7 @@ from .benchmark import (
 from .compare import ComparisonInputError, compare_reports, load_report
 from .golden import validate_golden_sequence
 from .models import CostModel, EndpointConfig, LoadCondition, RunConfig, SafetyLimits
+from .provenance import ACCELERATOR_BACKENDS
 
 DEFAULT_OUTPUT = Path("throttle-report.json")
 DEFAULT_COMPARE_OUTPUT = Path("throttle-comparison.json")
@@ -168,10 +169,23 @@ def _add_manifest_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--model-revision", default="unknown")
     parser.add_argument("--image-digest", default="unknown")
-    parser.add_argument("--gpu", default="unknown")
-    parser.add_argument("--gpu-fingerprint", default="unknown")
+    parser.add_argument("--gpu", "--accelerator", dest="gpu", default="unknown")
+    parser.add_argument(
+        "--gpu-fingerprint",
+        "--accelerator-fingerprint",
+        dest="gpu_fingerprint",
+        default="unknown",
+    )
     parser.add_argument("--cuda-version", default="unknown")
     parser.add_argument("--driver-version", default="unknown")
+    parser.add_argument(
+        "--accelerator-backend",
+        choices=ACCELERATOR_BACKENDS,
+        default="cuda",
+    )
+    parser.add_argument("--accelerator-runtime-version", default="unknown")
+    parser.add_argument("--host-os-version", default="unknown")
+    parser.add_argument("--software-environment-digest", default="unknown")
     parser.add_argument("--server-version", default="unknown")
     parser.add_argument(
         "--engine-flag",
@@ -423,6 +437,10 @@ def _build_config(
         gpu_fingerprint=args.gpu_fingerprint,
         cuda_version=args.cuda_version,
         driver_version=args.driver_version,
+        accelerator_backend=args.accelerator_backend,
+        accelerator_runtime_version=args.accelerator_runtime_version,
+        host_os_version=args.host_os_version,
+        software_environment_digest=args.software_environment_digest,
         server_version=args.server_version,
         engine_flags=_engine_flags(parser, args.engine_flag),
         engine_flags_provenance=args.engine_flags_provenance,
@@ -492,6 +510,18 @@ def _print_plan(
     )
     print(f"Max estimated spend: ${plan['limits']['max_estimated_spend']:.6f} USD")
     print(f"Destination: {plan['destination']['normalized_url']}")
+    runtime = plan["runtime"]
+    print(
+        "Runtime: "
+        f"{runtime['accelerator_backend']} / {runtime['accelerator']} / "
+        f"{runtime['accelerator_runtime_version']}"
+    )
+    runtime_reasons = plan["runtime_provenance_reasons"]
+    print(
+        "Runtime evidence: complete"
+        if not runtime_reasons
+        else "Runtime evidence: " + ", ".join(runtime_reasons)
+    )
     if not plan["traffic_preflight"]["backend_supported_on_this_platform"]:
         print(
             "Traffic preflight: blocked because GuideLLM subprocess-tree safety "

@@ -11,6 +11,11 @@ from typing import Any, Mapping, Sequence
 from . import __version__
 from .benchmark import SCHEMA_VERSION
 from .compare import _condition_map, _path, _safe_preflight_reason
+from .provenance import (
+    CURRENT_MANIFEST_VERSION,
+    LEGACY_RUNTIME_CONTROLLED_PATHS,
+    PLATFORM_RUNTIME_CONTROLLED_PATHS,
+)
 from .statistics import relative_delta_percent, t_interval_95
 
 GOLDEN_ARTIFACT_TYPE = "throttle_golden_live_comparison"
@@ -22,7 +27,6 @@ EXPECTED_VARIANTS = (
     "baseline",
     "candidate",
 )
-IMMUTABLE_IMAGE = re.compile(r"^(?:[^\s]+@)?sha256:[0-9a-f]{64}$")
 IMMUTABLE_REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
@@ -110,16 +114,18 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
         if any(starts[index] < ends[index - 1] for index in range(1, 6)):  # type: ignore[operator]
             reasons.append("runs_overlap_or_are_out_of_order")
 
+    manifest_version = _path(reports[0], "manifest", "manifest_version")
+    runtime_paths = (
+        PLATFORM_RUNTIME_CONTROLLED_PATHS
+        if manifest_version == CURRENT_MANIFEST_VERSION
+        else LEGACY_RUNTIME_CONTROLLED_PATHS
+    )
     required_common = (
+        ("manifest", "manifest_version"),
         ("manifest", "tool"),
         ("manifest", "model", "id"),
         ("manifest", "model", "immutable_revision"),
-        ("manifest", "runtime", "image_digest"),
-        ("manifest", "runtime", "gpu"),
-        ("manifest", "runtime", "gpu_fingerprint_sha256"),
-        ("manifest", "runtime", "gpu_fingerprint_supplied"),
-        ("manifest", "runtime", "cuda_version"),
-        ("manifest", "runtime", "driver_version"),
+        *(tuple(("manifest", *path) for path in runtime_paths)),
         ("manifest", "engine", "backend"),
         ("manifest", "engine", "backend_version"),
         ("manifest", "engine", "http_client_version"),
@@ -143,24 +149,15 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
     for path in required_common:
         if not _all_equal_present(reports, *path):
             reasons.append("uncontrolled_or_missing_" + "_".join(path[1:]))
-    image = _path(reports[0], "manifest", "runtime", "image_digest")
     revision = _path(reports[0], "manifest", "model", "immutable_revision")
-    if not isinstance(image, str) or not IMMUTABLE_IMAGE.fullmatch(image):
-        reasons.append("image_is_not_pinned_by_digest")
     if not isinstance(revision, str) or not IMMUTABLE_REVISION.fullmatch(revision):
         reasons.append("model_revision_is_not_immutable")
     for path, code in (
-        (("manifest", "runtime", "gpu"), "gpu_identity_missing"),
-        (("manifest", "runtime", "gpu_fingerprint_sha256"), "gpu_fingerprint_missing"),
-        (("manifest", "runtime", "cuda_version"), "cuda_version_missing"),
-        (("manifest", "runtime", "driver_version"), "driver_version_missing"),
         (("manifest", "engine", "server_version"), "server_version_missing"),
     ):
         value = _path(reports[0], *path)
         if not isinstance(value, str) or value == "unknown":
             reasons.append(code)
-    if _path(reports[0], "manifest", "runtime", "gpu_fingerprint_supplied") is not True:
-        reasons.append("gpu_fingerprint_not_supplied")
     if _path(reports[0], "manifest", "engine", "backend") != "native":
         reasons.append("golden_protocol_requires_strict_native_completion_validation")
     if any(
