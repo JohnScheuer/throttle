@@ -18,6 +18,14 @@ from .models import (
     OPEN_LOOP_SCHEDULER_LAG_INTERVAL_TOLERANCE,
     LoadCondition,
 )
+from .provenance import (
+    CURRENT_MANIFEST_VERSION,
+    LEGACY_RUNTIME_CONTROLLED_PATHS,
+    PLATFORM_RUNTIME_CONTROLLED_PATHS,
+    SUPPORTED_MANIFEST_VERSIONS,
+    runtime_preflight_reason,
+    runtime_provenance_reasons,
+)
 from .statistics import (
     paired_relative_delta_interval_95,
     relative_delta_percent,
@@ -356,8 +364,11 @@ def _preflight_reason(report: Mapping[str, Any]) -> str | None:
     if report.get("stop_reason") is not None:
         return "complete_report_has_stop_reason"
     manifest = report.get("manifest")
-    if not isinstance(manifest, Mapping) or manifest.get("manifest_version") != "1.0":
+    if not isinstance(manifest, Mapping) or manifest.get(
+        "manifest_version"
+    ) not in SUPPORTED_MANIFEST_VERSIONS:
         return "missing_or_invalid_manifest"
+    manifest_version = manifest.get("manifest_version")
     required_text = (
         _path(report, "manifest", "tool", "name"),
         _path(report, "manifest", "tool", "version"),
@@ -367,10 +378,6 @@ def _preflight_reason(report: Mapping[str, Any]) -> str | None:
         _path(report, "manifest", "engine", "server_version"),
         _path(report, "manifest", "model", "id"),
         _path(report, "manifest", "model", "immutable_revision"),
-        _path(report, "manifest", "runtime", "image_digest"),
-        _path(report, "manifest", "runtime", "gpu"),
-        _path(report, "manifest", "runtime", "cuda_version"),
-        _path(report, "manifest", "runtime", "driver_version"),
         _path(report, "manifest", "workload", "cache_policy"),
     )
     if any(
@@ -381,8 +388,12 @@ def _preflight_reason(report: Mapping[str, Any]) -> str | None:
         for value in required_text
     ):
         return "unverified_manifest_metadata"
+    runtime_reason = runtime_preflight_reason(
+        _path(report, "manifest", "runtime"), manifest_version
+    )
+    if runtime_reason is not None:
+        return runtime_reason
     for digest_path in (
-        ("manifest", "runtime", "gpu_fingerprint_sha256"),
         ("manifest", "workload", "measured_sha256"),
         ("manifest", "workload", "warmup_sha256"),
     ):
@@ -394,8 +405,6 @@ def _preflight_reason(report: Mapping[str, Any]) -> str | None:
         or _path(report, "manifest", "workload", "warmup_prompts_disjoint") is not True
     ):
         return "warmup_workload_not_separate"
-    if _path(report, "manifest", "runtime", "gpu_fingerprint_supplied") is not True:
-        return "gpu_fingerprint_not_supplied"
     seed = _path(report, "manifest", "workload", "seed")
     if not isinstance(seed, int) or isinstance(seed, bool):
         return "invalid_manifest_seed"
@@ -991,12 +1000,6 @@ _CONTROLLED_MANIFEST_PATHS: tuple[tuple[str, ...], ...] = (
     ("tool", "version"),
     ("model", "id"),
     ("model", "immutable_revision"),
-    ("runtime", "image_digest"),
-    ("runtime", "gpu"),
-    ("runtime", "gpu_fingerprint_sha256"),
-    ("runtime", "gpu_fingerprint_supplied"),
-    ("runtime", "cuda_version"),
-    ("runtime", "driver_version"),
     ("workload", "seed"),
     ("workload", "measured_sha256"),
     ("workload", "warmup_sha256"),
@@ -1040,7 +1043,15 @@ def _compatibility_reasons(
     baseline: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> list[str]:
     reasons: list[str] = []
-    for parts in _CONTROLLED_MANIFEST_PATHS:
+    baseline_manifest_version = _path(baseline, "manifest", "manifest_version")
+    candidate_manifest_version = _path(candidate, "manifest", "manifest_version")
+    runtime_paths = (
+        PLATFORM_RUNTIME_CONTROLLED_PATHS
+        if baseline_manifest_version == candidate_manifest_version
+        == CURRENT_MANIFEST_VERSION
+        else LEGACY_RUNTIME_CONTROLLED_PATHS
+    )
+    for parts in (*_CONTROLLED_MANIFEST_PATHS, *runtime_paths):
         if not _has_path(baseline, "manifest", *parts) or not _has_path(
             candidate, "manifest", *parts
         ):
@@ -1437,12 +1448,12 @@ def compare_reports(
         != "runtime_verified"
     ):
         eligibility_reasons.append("runtime_verified_engine_flags_required")
-    image = _path(baseline, "manifest", "runtime", "image_digest")
     revision = _path(baseline, "manifest", "model", "immutable_revision")
-    if not isinstance(image, str) or not re.fullmatch(
-        r"(?:[^\s]+@)?sha256:[0-9a-f]{64}", image
-    ):
-        eligibility_reasons.append("immutable_image_digest_required")
+    runtime_reasons = runtime_provenance_reasons(
+        _path(baseline, "manifest", "runtime"),
+        _path(baseline, "manifest", "manifest_version"),
+    )
+    eligibility_reasons.extend(runtime_reasons)
     if not isinstance(revision, str) or not re.fullmatch(
         r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision
     ):
@@ -1460,13 +1471,7 @@ def compare_reports(
         == "runtime_verified"
         and _path(candidate, "manifest", "engine", "effective_flags_provenance")
         == "runtime_verified"
-        and isinstance(_path(baseline, "manifest", "runtime", "image_digest"), str)
-        and bool(
-            re.fullmatch(
-                r"(?:[^\s]+@)?sha256:[0-9a-f]{64}",
-                _path(baseline, "manifest", "runtime", "image_digest"),
-            )
-        )
+        and not runtime_reasons
         and isinstance(_path(baseline, "manifest", "model", "immutable_revision"), str)
         and bool(
             re.fullmatch(

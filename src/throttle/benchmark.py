@@ -34,6 +34,12 @@ from .models import (
     LoadCondition,
     RunConfig,
 )
+from .provenance import (
+    ACCELERATOR_BACKENDS,
+    CURRENT_MANIFEST_VERSION,
+    build_runtime_manifest,
+    runtime_provenance_reasons,
+)
 from .statistics import (
     intervals_overlap,
     summarize_distribution_ms,
@@ -449,6 +455,8 @@ def validate_config(config: RunConfig, *, for_traffic: bool = True) -> None:
         raise ValueError("unsupported evidence source")
     if config.engine_flags_provenance not in {"operator_attested", "runtime_verified"}:
         raise ValueError("unsupported engine flag provenance")
+    if config.accelerator_backend not in ACCELERATOR_BACKENDS:
+        raise ValueError("unsupported accelerator backend")
     for name, value in (
         ("model", config.model),
         ("model_revision", config.model_revision),
@@ -457,6 +465,9 @@ def validate_config(config: RunConfig, *, for_traffic: bool = True) -> None:
         ("gpu_fingerprint", config.gpu_fingerprint),
         ("cuda_version", config.cuda_version),
         ("driver_version", config.driver_version),
+        ("accelerator_runtime_version", config.accelerator_runtime_version),
+        ("host_os_version", config.host_os_version),
+        ("software_environment_digest", config.software_environment_digest),
         ("server_version", config.server_version),
         ("variant", config.variant),
         ("sequence_position", config.sequence_position),
@@ -499,6 +510,7 @@ def build_plan(
     )
     planned = config.planned_request_count()
     planned_tokens = config.planned_requested_output_tokens()
+    runtime_manifest = build_runtime_manifest(config)
     return {
         "mode": config.mode,
         "backend": config.backend,
@@ -523,6 +535,10 @@ def build_plan(
         ),
         "cost_model": config.cost.public_dict(config.limits.max_elapsed_seconds),
         "destination": destination,
+        "runtime": runtime_manifest,
+        "runtime_provenance_reasons": runtime_provenance_reasons(
+            runtime_manifest, CURRENT_MANIFEST_VERSION
+        ),
         "workload": {
             "measured_prompt_count": len(prompts),
             "warmup_prompt_count": len(warmup_prompts),
@@ -1894,7 +1910,7 @@ def _manifest(
         for name in engine_flags
     )
     return {
-        "manifest_version": "1.0",
+        "manifest_version": CURRENT_MANIFEST_VERSION,
         "tool": {"name": "throttle-bench", "version": __version__},
         "engine": {
             "backend": config.backend,
@@ -1907,16 +1923,7 @@ def _manifest(
             "effective_flags_provenance": config.engine_flags_provenance,
         },
         "model": {"id": config.model, "immutable_revision": config.model_revision},
-        "runtime": {
-            "image_digest": config.image_digest,
-            "gpu": config.gpu,
-            "gpu_fingerprint_sha256": hashlib.sha256(
-                config.gpu_fingerprint.encode("utf-8")
-            ).hexdigest(),
-            "gpu_fingerprint_supplied": config.gpu_fingerprint != "unknown",
-            "cuda_version": config.cuda_version,
-            "driver_version": config.driver_version,
-        },
+        "runtime": build_runtime_manifest(config),
         "workload": {
             "seed": config.seed,
             "measured_sha256": canonical_workload_hash(prompts),
@@ -2100,20 +2107,15 @@ def _finalize_report(
         decision_reasons.append("runtime_verified_engine_flags_required")
     if config.cache_policy == "unknown":
         decision_reasons.append("explicit_cache_policy_required")
-    if not re.fullmatch(r"(?:[^\s]+@)?sha256:[0-9a-f]{64}", config.image_digest):
-        decision_reasons.append("immutable_image_digest_required")
     if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", config.model_revision):
         decision_reasons.append("immutable_model_revision_required")
-    if any(
-        value == "unknown"
-        for value in (
-            config.gpu,
-            config.gpu_fingerprint,
-            config.cuda_version,
-            config.driver_version,
-            config.server_version,
+    decision_reasons.extend(
+        runtime_provenance_reasons(
+            report["manifest"]["runtime"],
+            report["manifest"]["manifest_version"],
         )
-    ):
+    )
+    if config.server_version == "unknown":
         decision_reasons.append("complete_runtime_provenance_required")
     if not report["manifest"]["workload"].get("warmup_prompts_disjoint"):
         decision_reasons.append("warmup_prompts_must_be_disjoint")

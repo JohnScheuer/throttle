@@ -638,6 +638,25 @@ def _set_nonstream_ttft_unavailable(report: dict[str, object]) -> None:
     condition["diagnostic_metrics"]["ttft_ms"] = copy.deepcopy(aggregate)
 
 
+def _set_metal_runtime(report: dict[str, object]) -> None:
+    manifest = report["manifest"]  # type: ignore[index]
+    manifest["manifest_version"] = "1.1"  # type: ignore[index]
+    runtime = manifest["runtime"]  # type: ignore[index]
+    runtime.update(  # type: ignore[union-attr]
+        image_digest="unknown",
+        gpu="Apple Silicon integrated GPU",
+        cuda_version="unknown",
+        driver_version="unknown",
+        accelerator_backend="metal",
+        accelerator="Apple Silicon integrated GPU",
+        accelerator_fingerprint_sha256="e" * 64,
+        accelerator_fingerprint_supplied=True,
+        accelerator_runtime_version="MLX 0.32.0",
+        host_os_version="macOS 15.0 build 24A335",
+        software_environment_digest="python-environment@sha256:" + "f" * 64,
+    )
+
+
 def _golden_sequence(
     completion_tokens_by_position: tuple[int, int, int, int, int, int] = (
         300,
@@ -921,6 +940,119 @@ class StatisticsAndBoundaryTests(unittest.TestCase):
 
 
 class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cuda_runtime_keeps_the_existing_image_and_driver_contract(
+        self,
+    ) -> None:
+        config = _run_config()
+        report = await run_native(
+            config,
+            PROMPTS,
+            WARMUPS,
+            transport=httpx.MockTransport(lambda _: _completion()),
+        )
+        runtime = report["manifest"]["runtime"]
+        self.assertEqual(runtime["accelerator_backend"], "cuda")
+        self.assertEqual(
+            runtime["accelerator_runtime_version"], config.cuda_version
+        )
+        self.assertEqual(
+            runtime["software_environment_digest"], config.image_digest
+        )
+        self.assertNotIn(
+            "complete_runtime_provenance_required",
+            report["decision_ineligible_reasons"],
+        )
+        self.assertNotIn(
+            "immutable_image_digest_required",
+            report["decision_ineligible_reasons"],
+        )
+
+    async def test_metal_runtime_uses_platform_pins_instead_of_cuda_fields(
+        self,
+    ) -> None:
+        config = replace(
+            _run_config(),
+            accelerator_backend="metal",
+            accelerator_runtime_version="MLX 0.32.0",
+            host_os_version="macOS 15.0 build 24A335",
+            software_environment_digest="python-environment@sha256:" + "f" * 64,
+            image_digest="unknown",
+            gpu="Apple Silicon integrated GPU",
+            gpu_fingerprint="private-apple-device-id",
+            cuda_version="unknown",
+            driver_version="unknown",
+        )
+        report = await run_native(
+            config,
+            PROMPTS,
+            WARMUPS,
+            transport=httpx.MockTransport(lambda _: _completion()),
+        )
+
+        runtime = report["manifest"]["runtime"]
+        self.assertEqual(report["manifest"]["manifest_version"], "1.1")
+        self.assertEqual(runtime["accelerator_backend"], "metal")
+        self.assertEqual(runtime["accelerator"], "Apple Silicon integrated GPU")
+        self.assertEqual(runtime["image_digest"], "unknown")
+        self.assertEqual(runtime["cuda_version"], "unknown")
+        self.assertNotIn(
+            "complete_runtime_provenance_required",
+            report["decision_ineligible_reasons"],
+        )
+        self.assertNotIn(
+            "immutable_image_digest_required",
+            report["decision_ineligible_reasons"],
+        )
+
+    async def test_metal_runtime_requires_an_immutable_environment_digest(
+        self,
+    ) -> None:
+        config = replace(
+            _run_config(),
+            accelerator_backend="metal",
+            accelerator_runtime_version="MLX 0.32.0",
+            host_os_version="macOS 15.0 build 24A335",
+            image_digest="unknown",
+            gpu="Apple Silicon integrated GPU",
+            cuda_version="unknown",
+            driver_version="unknown",
+        )
+        report = await run_native(
+            config,
+            PROMPTS,
+            WARMUPS,
+            transport=httpx.MockTransport(lambda _: _completion()),
+        )
+        self.assertIn(
+            "immutable_software_environment_digest_required",
+            report["decision_ineligible_reasons"],
+        )
+
+    async def test_saved_metal_runs_can_support_a_decision_grade_comparison(
+        self,
+    ) -> None:
+        baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+        candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+        for report in (baseline, candidate):
+            _set_metal_runtime(report)
+
+        comparison = compare_reports(baseline, candidate)
+        self.assertTrue(comparison["compatibility"]["compatible"])
+        self.assertTrue(comparison["decision_eligible"])
+        self.assertEqual(
+            comparison["overall_outcome"], "candidate_higher_throughput"
+        )
+
+        candidate["manifest"]["runtime"][  # type: ignore[index]
+            "accelerator_runtime_version"
+        ] = "MLX 0.32.1"
+        changed_runtime = compare_reports(baseline, candidate)
+        self.assertFalse(changed_runtime["compatibility"]["compatible"])
+        self.assertIn(
+            "manifest_mismatch_runtime_accelerator_runtime_version",
+            changed_runtime["compatibility"]["reasons"],
+        )
+
     async def test_open_loop_uses_rate_shape_and_respects_in_flight_ceiling(
         self,
     ) -> None:
@@ -1662,6 +1794,14 @@ class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GoldenProtocolTests(unittest.TestCase):
+    def test_metal_runs_can_pass_the_golden_runtime_gate(self) -> None:
+        reports = _golden_sequence()
+        for report in reports:
+            _set_metal_runtime(report)
+        result = validate_golden_sequence(reports)
+        self.assertTrue(result["golden_protocol_eligible"])
+        self.assertEqual(result["eligibility_reasons"], [])
+
     def test_six_sequential_live_runs_pass_the_golden_gate(self) -> None:
         result = validate_golden_sequence(_golden_sequence())
         self.assertEqual(result["status"], "complete")

@@ -37,6 +37,7 @@ from .models import (
     OPEN_LOOP_RATE_RELATIVE_TOLERANCE,
     OPEN_LOOP_SCHEDULER_LAG_INTERVAL_TOLERANCE,
 )
+from .provenance import CURRENT_MANIFEST_VERSION, build_runtime_manifest
 
 PINNED_GUIDELLM_VERSION = "0.7.3"
 GUIDELLM_VERSION = PINNED_GUIDELLM_VERSION
@@ -984,7 +985,7 @@ def _matrix_manifest(config: Any, prompt_tokens: int) -> dict[str, Any]:
     }
     shape_hash = _canonical_hash(shape)
     return {
-        "manifest_version": "1.0",
+        "manifest_version": CURRENT_MANIFEST_VERSION,
         "tool": {"name": "throttle-bench", "version": __version__},
         "engine": {
             "backend": "guidellm",
@@ -998,16 +999,7 @@ def _matrix_manifest(config: Any, prompt_tokens: int) -> dict[str, Any]:
             "id": config.model,
             "immutable_revision": config.model_revision,
         },
-        "runtime": {
-            "image_digest": config.image_digest,
-            "gpu": config.gpu,
-            "gpu_fingerprint_sha256": hashlib.sha256(
-                config.gpu_fingerprint.encode("utf-8")
-            ).hexdigest(),
-            "gpu_fingerprint_supplied": config.gpu_fingerprint != "unknown",
-            "cuda_version": config.cuda_version,
-            "driver_version": config.driver_version,
-        },
+        "runtime": build_runtime_manifest(config),
         "workload": {
             "format_version": "guidellm-synthetic-text-v1",
             "source": "guidellm_synthetic_text",

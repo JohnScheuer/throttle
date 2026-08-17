@@ -136,9 +136,11 @@ decision-grade only if:
 
 A statistically supported run is still decision-ineligible unless it uses the
 strict native streaming path, live-inference evidence, an explicit cache
-policy, immutable image/model pins, a supplied GPU fingerprint, complete
-runtime versions, and runtime-verified engine flags. Those fixed reasons are
-written under `decision_ineligible_reasons` instead of being hidden.
+policy, immutable model and software-environment pins, a supplied accelerator
+fingerprint, complete runtime versions, and runtime-verified engine flags.
+CUDA keeps the additional immutable container-image, CUDA, and driver
+requirements. Those fixed reasons are written under
+`decision_ineligible_reasons` instead of being hidden.
 
 Example pinned native run:
 
@@ -156,6 +158,7 @@ throttle benchmark \
   --ttft-slo-ms 1000 \
   --cache-policy disabled \
   --model-revision 0123456789abcdef0123456789abcdef01234567 \
+  --accelerator-backend cuda \
   --image-digest 'registry.example/vllm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   --gpu 'NVIDIA A100 80GB PCIe' \
   --gpu-fingerprint 'operator-private-stable-device-id' \
@@ -171,6 +174,24 @@ throttle benchmark \
   --total-hourly-price 1.39 \
   --output B1.json
 ```
+
+Direct-host Metal, ROCm, and CPU runs use platform-neutral provenance instead
+of fake CUDA or container values. For example, append the following runtime
+controls to a pinned Apple Silicon run:
+
+```sh
+--accelerator-backend metal \
+--accelerator 'Apple Silicon integrated GPU' \
+--accelerator-fingerprint 'operator-private-stable-device-id' \
+--accelerator-runtime-version 'MLX 0.32.0' \
+--host-os-version 'macOS 15.0 build 24A335' \
+--software-environment-digest 'python-environment@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+```
+
+The software-environment digest must identify retained immutable evidence such
+as a canonical dependency lock, installed-package manifest, or native binary
+closure. Throttle validates the declaration and comparisons; it does not build
+or independently inspect that environment.
 
 Use `--block-seconds 20` instead of `--requests-per-block` for duration-bounded
 blocks. The achieved duration—not merely the configured value—controls the
@@ -358,12 +379,14 @@ throttle compare B1.json C1.json B2.json C2.json B3.json C3.json \
   --output golden.json
 ```
 
-The gate requires live inference, exact ordering/non-overlap, one hashed GPU
-fingerprint, pinned image digest and full model commit, runtime-verified engine
-flags, the same workload/SLO/cache policy, zero invalid responses, and the
-1-versus-8 treatment. It evaluates order-balanced phase contrasts and retains
-the 5% completion-token guard across every position; a declared SLO must also
-hold in all six runs. See [the full protocol](docs/GOLDEN_PROTOCOL.md).
+The gate requires live inference, exact ordering/non-overlap, one hashed
+accelerator fingerprint, a pinned software environment and full model commit,
+runtime-verified engine flags, the same workload/SLO/cache policy, zero invalid
+responses, and the 1-versus-8 treatment. CUDA positions additionally require a
+pinned image digest and CUDA/driver versions. It evaluates order-balanced phase
+contrasts and retains the 5% completion-token guard across every position; a
+declared SLO must also hold in all six runs. See
+[the full protocol](docs/GOLDEN_PROTOCOL.md).
 
 Throttle never provisions or reconfigures the GPU/server. In this repository no
 server credentials or endpoint identifiers are retained. A sanitized completed
@@ -377,7 +400,7 @@ is not a universal performance, savings, or production recommendation.
 Reports contain hashes and aggregate numeric evidence, not endpoint URLs,
 hostnames, keys, authorization headers, prompts, responses, raw exception text,
 or GuideLLM raw output. Engine flag names/values are validated before they can
-enter a manifest; GPU fingerprints are stored only as SHA-256.
+enter a manifest; accelerator fingerprints are stored only as SHA-256.
 
 - `0`: complete smoke, or a supported benchmark/comparison result.
 - `1`: stopped/invalid/operational failure; a sanitized artifact is written
