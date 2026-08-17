@@ -410,3 +410,7 @@ production-log load discovery, monthly-savings claims, or a polished UI.
 
 Remaining limitations and the current evidence boundary are listed in
 [Known gaps](docs/KNOWN_GAPS.md).
+
+## License
+
+Throttle is released under the [MIT License](LICENSE).
