@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from throttle.benchmark import (
     RequestResult,
     RunBudget,
     SCHEMA_VERSION,
+    _block_report,
     _best_tested,
     canonical_workload_hash,
     run_native,
@@ -1606,10 +1608,10 @@ class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
             return _completion()
 
         config = _run_config(
-            conditions=(LoadCondition("open_loop", 100.0, 2),),
-            # Eight launch intervals are long enough to test the real asyncio
-            # scheduler without turning a ±1 ms, three-request timing sample
-            # into a flaky assertion on Python 3.14.
+            conditions=(LoadCondition("open_loop", 100.0, 8),),
+            # Keep enough in-flight capacity to test transport scheduling
+            # without making validity depend on a sub-100 ms host-clock sample.
+            # Target-rate reconciliation is tested deterministically below.
             requests_per_block=8,
         )
         report = await run_native(
@@ -1624,13 +1626,115 @@ class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(condition["target_offered_request_rate"], 100.0)
         self.assertIsNotNone(condition["achieved_offered_request_rate"])
         self.assertIsNotNone(condition["offered_rate_relative_error"])
-        self.assertTrue(condition["blocks"][0]["open_loop_target_achieved"])
         self.assertEqual(
             condition["metrics"]["e2e_latency_ms"]["p95_repeated_block_ci"]["method"],
             "student_t_blocks",
         )
-        self.assertLessEqual(report["run_totals"]["peak_in_flight"], 2)
+        self.assertLessEqual(report["run_totals"]["peak_in_flight"], 8)
         self.assertEqual(report["best_tested"]["field"], "best_tested_request_rate")
+
+    def test_open_loop_exact_offered_rate_is_reconciled_deterministically(
+        self,
+    ) -> None:
+        config = _run_config(
+            conditions=(LoadCondition("open_loop", 100.0, 8),),
+            requests_per_block=8,
+        )
+        results = [
+            RequestResult(
+                status_code=200,
+                e2e_seconds=0.01,
+                completion_tokens=1,
+                prompt_tokens=1,
+                finish_reason="stop",
+            )
+            for _ in range(8)
+        ]
+        report = _block_report(
+            BlockOutcome(
+                results=results,
+                wall_seconds=0.08,
+                complete=True,
+                scheduler_lag_seconds=[0.0] * 8,
+                offered_requests=8,
+                peak_in_flight=8,
+                target_offered_request_rate=100.0,
+                launch_window_seconds=0.07,
+            ),
+            config,
+            index=0,
+            seed=1,
+        )
+
+        self.assertAlmostEqual(report["achieved_offered_request_rate"], 100.0)
+        self.assertAlmostEqual(report["offered_rate_relative_error"], 0.0)
+        self.assertEqual(report["scheduler_lag_interval_ratio_p95"], 0.0)
+        self.assertTrue(report["open_loop_target_achieved"])
+
+    async def test_open_loop_prestart_backpressure_reconciles_cancellation(
+        self,
+    ) -> None:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            return _completion()
+
+        config = _run_config(
+            conditions=(LoadCondition("open_loop", 100.0, 2),),
+            requests_per_block=8,
+        )
+        shared_budget = RunBudget(config)
+        real_create_task = asyncio.create_task
+        real_perf_counter = time.perf_counter
+        clock_offset = 0.0
+        task_count = 0
+
+        def perf_counter() -> float:
+            return real_perf_counter() + clock_offset
+
+        def create_task(coro: Any) -> asyncio.Task[Any]:
+            nonlocal clock_offset, task_count
+            task = real_create_task(coro)
+            task_count += 1
+            if task_count == 1:
+                # Model host preemption before the first reserved request gets
+                # an event-loop turn. Three arrivals are then due at once.
+                clock_offset = 0.035
+            return task
+
+        with (
+            patch(
+                "throttle.benchmark.time.perf_counter",
+                side_effect=perf_counter,
+            ),
+            patch(
+                "throttle.benchmark.asyncio.create_task",
+                side_effect=create_task,
+            ),
+        ):
+            report = await run_native(
+                config,
+                PROMPTS,
+                WARMUPS,
+                transport=httpx.MockTransport(handler),
+                shared_budget=shared_budget,
+            )
+
+        condition = report["conditions"][0]
+        self.assertEqual(report["status"], "stopped")
+        self.assertEqual(report["stop_reason"], "open_loop_backpressure")
+        self.assertFalse(report["decision_eligible"])
+        self.assertEqual(condition["request_counts"]["valid"], 0)
+        self.assertEqual(condition["blocks"][0]["offered_requests"], 2)
+        self.assertIn(
+            "open_loop_backpressure",
+            condition["blocks"][0]["invalid_reasons"],
+        )
+        self.assertEqual(report["run_totals"]["requests_started"], 2)
+        self.assertEqual(report["run_totals"]["requests_completed"], 0)
+        self.assertEqual(report["run_totals"]["requests_cancelled"], 2)
+        self.assertEqual(report["run_totals"]["requests_in_flight"], 0)
+        self.assertEqual(report["run_totals"]["peak_in_flight"], 2)
+        self.assertEqual(shared_budget.requests_cancelled, 2)
+        self.assertEqual(shared_budget.in_flight, 0)
 
     async def test_open_loop_missed_offered_rate_is_not_decision_grade(self) -> None:
         config = _run_config(

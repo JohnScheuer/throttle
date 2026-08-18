@@ -1244,6 +1244,28 @@ async def _execute_reserved(
     return result
 
 
+async def _cancel_reserved_tasks(
+    tasks: set[asyncio.Task[RequestResult]], budget: RunBudget
+) -> None:
+    """Cancel open-loop tasks and settle reservations that never started."""
+
+    cancelled_tasks = tuple(tasks)
+    for task in cancelled_tasks:
+        task.cancel()
+    await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
+    # A task cancelled before its first event-loop turn cannot enter
+    # _execute_reserved's CancelledError handler. All tasks owned by this block
+    # are terminal here, so any remaining local in-flight reservations belong
+    # to cancelled tasks that still need conservative cancellation accounting.
+    unaccounted = min(
+        budget.in_flight,
+        sum(task.cancelled() for task in cancelled_tasks),
+    )
+    for _ in range(unaccounted):
+        budget.record_cancelled()
+
+
 def _prompt_order(prompts: Prompts, seed: int) -> list[int]:
     indexes = list(range(len(prompts)))
     random.Random(seed).shuffle(indexes)
@@ -1400,18 +1422,15 @@ async def _run_open_block(
         # it before cancelling only the requests that are genuinely still live.
         harvest()
         if budget.stop_reason and tasks:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await _cancel_reserved_tasks(tasks, budget)
             tasks.clear()
         elif tasks:
             completed = await asyncio.gather(*tasks)
             results.extend(completed)
             tasks.clear()
     except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await _cancel_reserved_tasks(tasks, budget)
+        tasks.clear()
         raise
     wall = time.perf_counter() - started
     target_complete = (
