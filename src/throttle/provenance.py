@@ -39,21 +39,35 @@ _CREDENTIAL_TOKEN = re.compile(
     r"ya29\.[A-Za-z0-9_-]{8,})(?=$|@|[^A-Za-z0-9_])",
     re.IGNORECASE,
 )
-_CREDENTIAL_USERINFO = re.compile(
-    r"(?:^|[^A-Za-z0-9])[^/:@\s]+:"
-    r"(?:api[\s_-]*key|password|passwd|secret|token)@",
-    re.IGNORECASE,
-)
-_GENERIC_USERINFO = re.compile(
-    r"(?:^|\s)[^/:@\s]+:[^/@\s]+@"
-    r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?=$|[/:])"
-)
 _JWT_TOKEN = re.compile(
     r"(?:^|[^A-Za-z0-9_])eyJ[A-Za-z0-9_-]+\."
     r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
 )
 _UNSAFE_URI_SCHEME = re.compile(
     r"^(?:data|file|ftp|ftps|gs|https?|mailto|s3|ssh):",
+    re.IGNORECASE,
+)
+_UNSAFE_URI_AT_OFFSET = re.compile(
+    r"(?:https?|ftp|ftps|ssh)://|"
+    r"file:(?:/{1,2}|\\)|"
+    r"data:[^\s,;]{1,128}[,;]|"
+    r"mailto:[^\s@]+@|"
+    r"(?:^|[\s=\"'(<\[{,;:])(?:data|file|ftp|ftps|gs|https?|mailto|s3|ssh):",
+    re.IGNORECASE,
+)
+_ABSOLUTE_PATH_AT_OFFSET = re.compile(
+    r"(?:^|[\s=\"'(<\[{,;:])(?:"
+    r"/(?!/)(?=[A-Za-z0-9._~-])|~[/\\]|"
+    r"[A-Za-z]:[/\\]|[/\\]{2}[^/\\\s])"
+)
+_TRAVERSAL_AT_OFFSET = re.compile(
+    r"(?:^|[\s=\"'(<\[{,;:/\\])\.\.?(?=$|[/\\])"
+)
+_ARTIFACT_DIGEST_SUFFIX = re.compile(rf"{_ARTIFACT_DIGEST}(?=$|\s)")
+_CREDENTIAL_VALUE_LABEL = re.compile(
+    r"(?:access[\s_-]*token|api[\s_-]*key|auth[\s_-]*token|"
+    r"authorization|bearer|client[\s_-]*secret|credentials?|password|"
+    r"passwd|private[\s_-]*key|secret(?:[\s_-]*key)?|token)",
     re.IGNORECASE,
 )
 _UNKNOWN_FINGERPRINT_SHA256 = hashlib.sha256(b"unknown").hexdigest()
@@ -79,14 +93,73 @@ PLATFORM_RUNTIME_CONTROLLED_PATHS: tuple[tuple[str, ...], ...] = (
 )
 
 
-def is_safe_public_metadata(
+def _contains_userinfo(value: str) -> bool:
+    """Detect ``user:password@`` shapes in linear time.
+
+    An OCI artifact's ``name:tag@algorithm:digest`` shape is the one explicit
+    exception. The digest grammar is length-bounded, so checking a candidate
+    suffix cannot turn a string with many ``@`` characters quadratic.
+    """
+
+    artifact_reference = SAFE_ARTIFACT_REFERENCE.fullmatch(value) is not None
+    segment_start = 0
+    candidate_colon: int | None = None
+    for index, character in enumerate(value):
+        if character == ":":
+            candidate_colon = index if index > segment_start else None
+            segment_start = index + 1
+            continue
+        if character == "@":
+            if candidate_colon is not None and index > segment_start:
+                candidate_value = value[segment_start:index]
+                if _CREDENTIAL_VALUE_LABEL.fullmatch(candidate_value) is not None:
+                    return True
+                if (
+                    not artifact_reference
+                    or _ARTIFACT_DIGEST_SUFFIX.match(value, index + 1) is None
+                ):
+                    return True
+            candidate_colon = None
+            segment_start = index + 1
+            continue
+        if character.isspace() or character in "/\\":
+            candidate_colon = None
+            segment_start = index + 1
+    return False
+
+
+def _metadata_form_is_unsafe(value: str) -> bool:
+    lowered = value.lower()
+    if (
+        "://" in lowered
+        or "bearer " in lowered
+        or "authorization:" in lowered
+        or _CREDENTIAL_ASSIGNMENT.search(value)
+        or _CREDENTIAL_TOKEN.search(value)
+        or _contains_userinfo(value)
+        or _JWT_TOKEN.search(value)
+        or _UNSAFE_URI_AT_OFFSET.search(value)
+        or _ABSOLUTE_PATH_AT_OFFSET.search(value)
+        or _TRAVERSAL_AT_OFFSET.search(value)
+    ):
+        return True
+    normalized_path = value.replace("\\", "/")
+    return (
+        value.startswith(("/", "~/", "\\"))
+        or re.match(r"^[A-Za-z]:[\\/]", value) is not None
+        or any(segment in {".", ".."} for segment in normalized_path.split("/"))
+    )
+
+
+def validated_public_metadata_size(
     value: object, *, max_length: int = 256
-) -> bool:
-    """Return whether operator metadata is safe to persist and display.
+) -> int | None:
+    """Return bounded string-work bytes when public metadata is safe.
 
     This is deliberately shape-based rather than an attempt to prove that an
     attestation is truthful.  The same boundary is used for generated and
     loaded reports so hand-edited evidence cannot bypass the CLI sanitizer.
+    Charging the larger raw or NFKC form bounds aggregate normalization work.
     """
 
     if (
@@ -95,35 +168,42 @@ def is_safe_public_metadata(
         or value != value.strip()
         or len(value) > max_length
     ):
-        return False
-    if value.lower() == "unknown" and value != "unknown":
-        return False
-    lowered = value.lower()
-    if (
-        "://" in lowered
-        or "bearer " in lowered
-        or "authorization:" in lowered
-        or _CREDENTIAL_ASSIGNMENT.search(value)
-        or _CREDENTIAL_TOKEN.search(value)
-        or _CREDENTIAL_USERINFO.search(value)
-        or _GENERIC_USERINFO.search(value)
-        or _JWT_TOKEN.search(value)
-    ):
-        return False
-    normalized_path = value.replace("\\", "/")
-    if (
-        value.startswith(("/", "~/", "\\"))
-        or re.match(r"^[A-Za-z]:[\\/]", value)
-        or any(segment in {".", ".."} for segment in normalized_path.split("/"))
-    ):
-        return False
+        return None
     if any(
         ord(character) == 127
-        or unicodedata.category(character) in {"Cc", "Cf"}
+        or unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
         for character in value
     ):
-        return False
-    return True
+        return None
+    normalized = unicodedata.normalize("NFKC", value)
+    # Common compatibility forms (fullwidth text, ligatures, circled digits)
+    # expand only a few code points. Reject pathological decompositions before
+    # regex scanning so a small persisted string cannot consume outsized work.
+    if (
+        not normalized
+        or normalized != normalized.strip()
+        or len(normalized) > max_length
+        or len(normalized) > len(value) * 4
+    ):
+        return None
+    raw_bytes = len(value.encode("utf-8"))
+    normalized_bytes = len(normalized.encode("utf-8"))
+    if raw_bytes > max_length or normalized_bytes > max_length:
+        return None
+    if normalized.lower() == "unknown" and value != "unknown":
+        return None
+    for candidate in dict.fromkeys((value, normalized)):
+        if _metadata_form_is_unsafe(candidate):
+            return None
+    return max(raw_bytes, normalized_bytes)
+
+
+def is_safe_public_metadata(
+    value: object, *, max_length: int = 256
+) -> bool:
+    """Return whether operator metadata is safe to persist and display."""
+
+    return validated_public_metadata_size(value, max_length=max_length) is not None
 
 
 def _public_text(value: object) -> bool:

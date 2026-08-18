@@ -67,6 +67,14 @@ successful optimization claim.
     operator confirmations and stops further client traffic at its session
     ceiling, but it cannot stop or bill-discover the provider resource. Keep a
     provider-side budget/auto-stop active during every transition.
+13. **Sanitization is a boundary, not a secret detector.** Generated and loaded
+    metadata reject the credential, URL, path, Unicode-spoofing, and structural
+    shapes covered by the versioned test corpus, but no finite pattern set can
+    prove arbitrary text is non-secret. Operators must never place credentials,
+    endpoint details, private paths, prompts, or responses in provenance or
+    engine-flag metadata. The Golden consumed-evidence fingerprint projection is
+    versioned and must be updated whenever a future schema adds new decision
+    evidence.
 
 Deferred by design: automatic engine reconfiguration, provisioning,
 autoscaling, GPU selection, spot management, cache systems, production proxying,

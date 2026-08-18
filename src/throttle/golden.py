@@ -18,12 +18,14 @@ from .provenance import (
     LEGACY_RUNTIME_CONTROLLED_PATHS,
     PLATFORM_RUNTIME_CONTROLLED_PATHS,
     build_runtime_manifest,
+    is_safe_public_metadata,
     runtime_provenance_reasons,
 )
 from .statistics import relative_delta_percent, t_interval_95
 
 GOLDEN_ARTIFACT_TYPE = "throttle_golden_live_comparison"
 GOLDEN_SESSION_ARTIFACT_TYPE = "throttle_golden_session"
+RUN_FINGERPRINT_BASIS = "validated_consumed_evidence_projection_v1"
 GOLDEN_POSITIONS = (
     ("B1", "baseline", 1),
     ("C1", "candidate", 8),
@@ -232,12 +234,380 @@ def build_golden_plan(
     }
 
 
+_FINGERPRINT_ROOT_PATHS: tuple[tuple[str, ...], ...] = (
+    ("schema_version",),
+    ("artifact_type",),
+    ("started_at",),
+    ("completed_at",),
+    ("mode",),
+    ("status",),
+    ("stop_reason",),
+    ("manifest", "manifest_version"),
+    ("manifest", "tool", "name"),
+    ("manifest", "tool", "version"),
+    ("manifest", "model", "id"),
+    ("manifest", "model", "immutable_revision"),
+    ("manifest", "workload", "seed"),
+    ("manifest", "workload", "measured_sha256"),
+    ("manifest", "workload", "warmup_sha256"),
+    ("manifest", "workload", "warmup_is_separate"),
+    ("manifest", "workload", "warmup_prompts_disjoint"),
+    ("manifest", "workload", "cache_policy"),
+    ("manifest", "request", "type"),
+    ("manifest", "request", "temperature"),
+    ("manifest", "request", "max_tokens"),
+    ("manifest", "request", "stop"),
+    ("manifest", "request", "stream"),
+    ("manifest", "request", "timeout_seconds"),
+    ("manifest", "traffic", "blocks"),
+    ("manifest", "traffic", "requests_per_block"),
+    ("manifest", "traffic", "block_duration_seconds"),
+    ("manifest", "traffic", "warmup_requests_per_condition"),
+    ("manifest", "traffic", "p95_slo_ms"),
+    ("manifest", "traffic", "ttft_slo_ms"),
+    ("manifest", "traffic", "open_loop_rate_relative_tolerance"),
+    (
+        "manifest",
+        "traffic",
+        "open_loop_scheduler_lag_interval_tolerance",
+    ),
+    ("manifest", "engine", "backend"),
+    ("manifest", "engine", "backend_version"),
+    ("manifest", "engine", "http_client_version"),
+    ("manifest", "engine", "server_version"),
+    ("manifest", "engine", "effective_flags_provenance"),
+    ("manifest", "provenance", "evidence_source"),
+    ("manifest", "provenance", "variant"),
+    ("manifest", "provenance", "sequence_position"),
+    ("manifest", "safety", "ambient_proxy_environment_used"),
+    ("manifest", "safety", "redirects_followed"),
+)
+
+_FINGERPRINT_TRAFFIC_CONDITION_FIELDS = (
+    "id",
+    "kind",
+    "value",
+    "max_in_flight",
+)
+_FINGERPRINT_SAFETY_LIMIT_FIELDS = (
+    "max_requests",
+    "max_tokens_per_request",
+    "max_total_requested_tokens",
+    "max_errors",
+    "max_elapsed_seconds",
+    "max_estimated_spend",
+    "max_concurrency",
+    "max_response_bytes",
+)
+_FINGERPRINT_SAFETY_OVERRIDE_FIELDS = (
+    "insecure_http",
+    "unknown_cost_acknowledged",
+    "guidellm_validation_gaps_acknowledged",
+)
+_FINGERPRINT_COST_FIELDS = (
+    "kind",
+    "currency",
+    "accounting_basis",
+    "pre_run_upper_bound",
+    "total_hourly_rate",
+    "gpu_count",
+    "active_second_rate",
+    "max_active_workers",
+    "billed_active_seconds",
+    "user_supplied_total",
+)
+_FINGERPRINT_METRIC_DEFINITION_FIELDS = (
+    "e2e_latency",
+    "ttft",
+    "tpot",
+    "itl",
+    "inter_chunk_latency",
+    "throughput",
+    "decision_throughput",
+    "slo_goodput",
+    "slo_decision_ci",
+)
+_FINGERPRINT_COUNT_FIELDS = ("attempted", "valid", "invalid")
+_FINGERPRINT_COUNT_MAP_FIELDS = (
+    "status_counts",
+    "error_counts",
+    "finish_reason_counts",
+)
+_FINGERPRINT_CONDITION_FIELDS = (
+    "valid",
+    "decision_grade",
+    "measured_wall_seconds",
+    "observed_peak_in_flight",
+)
+_FINGERPRINT_OPEN_LOOP_CONDITION_FIELDS = (
+    "target_offered_request_rate",
+    "achieved_offered_request_rate",
+    "offered_rate_relative_error",
+    "open_loop_target_achieved",
+)
+_FINGERPRINT_BLOCK_FIELDS = (
+    "block_index",
+    "valid",
+    "wall_duration_seconds",
+    "observed_peak_in_flight",
+    "offered_requests",
+)
+_FINGERPRINT_OPEN_LOOP_BLOCK_FIELDS = (
+    "target_offered_request_rate",
+    "launch_window_seconds",
+    "achieved_offered_request_rate",
+    "offered_rate_relative_error",
+    "scheduler_lag_interval_ratio_p95",
+    "open_loop_target_achieved",
+)
+_FINGERPRINT_AGGREGATE_METRIC_FIELDS = (
+    "valid_response_count",
+    "completion_tokens",
+    "requests_per_second",
+    "output_tokens_per_second",
+    "block_mean_output_tokens_per_second",
+    "block_mean_requests_per_second",
+    "error_rate",
+)
+_FINGERPRINT_BLOCK_METRIC_FIELDS = (
+    "valid_response_count",
+    "completion_tokens",
+    "requests_per_second",
+    "output_tokens_per_second",
+    "error_rate",
+)
+_FINGERPRINT_INTERVAL_FIELDS = (
+    "low",
+    "high",
+    "confidence",
+    "method",
+    "n",
+)
+_FINGERPRINT_SCHEDULER_FIELDS = (
+    "count",
+    "mean",
+    "p50",
+    "p90",
+    "p95",
+    "p99",
+)
+_FINGERPRINT_RUN_TOTAL_FIELDS = (
+    "requests_started",
+    "requests_completed",
+    "requests_cancelled",
+    "requests_in_flight",
+    "peak_in_flight",
+    "errors",
+    "reserved_output_tokens",
+    "elapsed_seconds",
+)
+_FINGERPRINT_COST_SUMMARY_FIELDS = (
+    "kind",
+    "total_cost",
+    "completion_tokens",
+    "cost_per_million_output_tokens",
+)
+_JSON_SCALAR_TYPES = {type(None), bool, int, float, str}
+
+
+def _fingerprint_scalar(value: object) -> object:
+    if type(value) not in _JSON_SCALAR_TYPES:
+        raise ValueError("fingerprint evidence must be scalar")
+    return value
+
+
+def _fingerprint_fields(
+    value: object, fields: Sequence[str]
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("fingerprint evidence must be a mapping")
+    return {
+        field: _fingerprint_scalar(value.get(field))
+        for field in fields
+    }
+
+
+def _fingerprint_count_map(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("fingerprint count evidence must be a mapping")
+    projected = _fingerprint_fields(value, _FINGERPRINT_COUNT_FIELDS)
+    for field in _FINGERPRINT_COUNT_MAP_FIELDS:
+        count_map = value.get(field)
+        if not isinstance(count_map, Mapping):
+            raise ValueError("fingerprint count evidence must be a mapping")
+        projected[field] = {
+            str(name): _fingerprint_scalar(count)
+            for name, count in sorted(count_map.items())
+        }
+    return projected
+
+
+def _fingerprint_interval(value: object) -> dict[str, object]:
+    return _fingerprint_fields(value, _FINGERPRINT_INTERVAL_FIELDS)
+
+
+def _fingerprint_aggregate_metrics(value: object) -> dict[str, object]:
+    projected = _fingerprint_fields(value, _FINGERPRINT_AGGREGATE_METRIC_FIELDS)
+    assert isinstance(value, Mapping)
+    for field in (
+        "block_mean_output_tokens_per_second_ci",
+        "block_mean_requests_per_second_ci",
+    ):
+        interval = value.get(field)
+        projected[field] = (
+            _fingerprint_interval(interval) if isinstance(interval, Mapping) else None
+        )
+    for field in ("e2e_latency_ms", "ttft_ms"):
+        distribution = value.get(field)
+        if not isinstance(distribution, Mapping):
+            raise ValueError("fingerprint latency evidence must be a mapping")
+        projected[field] = {
+            "p95_repeated_block_ci": _fingerprint_interval(
+                distribution.get("p95_repeated_block_ci")
+            )
+        }
+    return projected
+
+
+def _fingerprint_block_metrics(value: object) -> dict[str, object]:
+    projected = _fingerprint_fields(value, _FINGERPRINT_BLOCK_METRIC_FIELDS)
+    assert isinstance(value, Mapping)
+    for field in ("e2e_latency_ms", "ttft_ms"):
+        distribution = value.get(field)
+        if not isinstance(distribution, Mapping):
+            raise ValueError("fingerprint latency evidence must be a mapping")
+        projected[field] = {
+            "p95": _fingerprint_scalar(distribution.get("p95"))
+        }
+    return projected
+
+
+def _fingerprint_condition(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("fingerprint condition evidence must be a mapping")
+    projected = _fingerprint_fields(value, _FINGERPRINT_CONDITION_FIELDS)
+    condition_projection = _fingerprint_fields(
+        value.get("condition"), _FINGERPRINT_TRAFFIC_CONDITION_FIELDS
+    )
+    projected["condition"] = condition_projection
+    open_loop = condition_projection["kind"] == "open_loop"
+    if open_loop:
+        projected.update(
+            _fingerprint_fields(value, _FINGERPRINT_OPEN_LOOP_CONDITION_FIELDS)
+        )
+    projected["warmup"] = _fingerprint_count_map(value.get("warmup"))
+    projected["request_counts"] = _fingerprint_count_map(
+        value.get("request_counts")
+    )
+    projected["metrics"] = _fingerprint_aggregate_metrics(value.get("metrics"))
+    blocks = value.get("blocks")
+    if not isinstance(blocks, list):
+        raise ValueError("fingerprint block evidence must be a list")
+    projected_blocks: list[dict[str, object]] = []
+    for block in blocks:
+        block_projection = _fingerprint_fields(block, _FINGERPRINT_BLOCK_FIELDS)
+        assert isinstance(block, Mapping)
+        if open_loop:
+            block_projection.update(
+                _fingerprint_fields(block, _FINGERPRINT_OPEN_LOOP_BLOCK_FIELDS)
+            )
+        block_projection["request_counts"] = _fingerprint_count_map(
+            block.get("request_counts")
+        )
+        if open_loop:
+            block_projection["scheduler_lag_ms"] = _fingerprint_fields(
+                block.get("scheduler_lag_ms"), _FINGERPRINT_SCHEDULER_FIELDS
+            )
+        block_projection["metrics"] = _fingerprint_block_metrics(
+            block.get("metrics")
+        )
+        projected_blocks.append(block_projection)
+    projected["blocks"] = projected_blocks
+    return projected
+
+
+def _fingerprint_projection(report: Mapping[str, Any]) -> dict[str, object]:
+    """Return only evidence consumed by report and Golden validation.
+
+    Ignored extension fields are intentionally absent so the public digest
+    cannot be used as an oracle for attacker-controlled payloads.
+    """
+
+    projection: dict[str, object] = {
+        ".".join(path): _fingerprint_scalar(_path(report, *path))
+        for path in _FINGERPRINT_ROOT_PATHS
+    }
+    projection["fingerprint_basis"] = RUN_FINGERPRINT_BASIS
+    manifest = _path(report, "manifest")
+    if not isinstance(manifest, Mapping):
+        raise ValueError("fingerprint manifest evidence must be a mapping")
+    runtime = manifest.get("runtime")
+    runtime_paths = (
+        PLATFORM_RUNTIME_CONTROLLED_PATHS
+        if manifest.get("manifest_version") == CURRENT_MANIFEST_VERSION
+        else LEGACY_RUNTIME_CONTROLLED_PATHS
+    )
+    projection["manifest.runtime"] = _fingerprint_fields(
+        runtime, tuple(path[-1] for path in runtime_paths)
+    )
+    projection["manifest.metric_definitions"] = _fingerprint_fields(
+        manifest.get("metric_definitions"),
+        _FINGERPRINT_METRIC_DEFINITION_FIELDS,
+    )
+    engine_flags = _flag_map(report)
+    if engine_flags is None:
+        raise ValueError("fingerprint engine flags are invalid")
+    projection["manifest.engine.effective_flags"] = dict(
+        sorted(engine_flags.items())
+    )
+    traffic = manifest.get("traffic")
+    if not isinstance(traffic, Mapping):
+        raise ValueError("fingerprint traffic evidence must be a mapping")
+    conditions = traffic.get("conditions")
+    if not isinstance(conditions, list):
+        raise ValueError("fingerprint traffic conditions must be a list")
+    projection["manifest.traffic.conditions"] = [
+        _fingerprint_fields(item, _FINGERPRINT_TRAFFIC_CONDITION_FIELDS)
+        for item in conditions
+    ]
+    safety = manifest.get("safety")
+    if not isinstance(safety, Mapping):
+        raise ValueError("fingerprint safety evidence must be a mapping")
+    projection["manifest.safety.limits"] = _fingerprint_fields(
+        safety.get("limits"), _FINGERPRINT_SAFETY_LIMIT_FIELDS
+    )
+    projection["manifest.safety.overrides"] = _fingerprint_fields(
+        safety.get("overrides"), _FINGERPRINT_SAFETY_OVERRIDE_FIELDS
+    )
+    projection["manifest.cost"] = _fingerprint_fields(
+        manifest.get("cost"), _FINGERPRINT_COST_FIELDS
+    )
+    run_conditions = report.get("conditions")
+    if not isinstance(run_conditions, list):
+        raise ValueError("fingerprint conditions must be a list")
+    projection["conditions"] = [
+        _fingerprint_condition(condition) for condition in run_conditions
+    ]
+    projection["run_totals"] = _fingerprint_fields(
+        report.get("run_totals"), _FINGERPRINT_RUN_TOTAL_FIELDS
+    )
+    projection["cost_summary"] = _fingerprint_fields(
+        report.get("cost_summary"), _FINGERPRINT_COST_SUMMARY_FIELDS
+    )
+    return projection
+
+
 def _safe_report_fingerprint(report: Mapping[str, Any]) -> str | None:
+    if _safe_preflight_reason(report) is not None:
+        return None
     try:
         encoded = json.dumps(
-            report, sort_keys=True, separators=(",", ":"), allow_nan=False
+            _fingerprint_projection(report),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
         ).encode("utf-8")
-    except (TypeError, ValueError):
+    except (RecursionError, TypeError, ValueError):
         return None
     return hashlib.sha256(encoded).hexdigest()
 
@@ -258,11 +628,16 @@ def _flag_map(report: Mapping[str, Any]) -> dict[str, str] | None:
         return None
     output: dict[str, str] = {}
     for name, value in raw.items():
-        normalized = str(name).replace("_", "-").lower()
-        if not re.fullmatch(r"[a-z0-9-]{1,128}", normalized) or not isinstance(
-            value, str
+        if not isinstance(name, str) or not is_safe_public_metadata(
+            name, max_length=128
         ):
             return None
+        normalized = name.replace("_", "-").lower()
+        if not re.fullmatch(
+            r"[a-z0-9-]{1,128}", normalized
+        ) or not is_safe_public_metadata(value):
+            return None
+        assert isinstance(value, str)
         output[normalized] = value
     return output
 
@@ -527,6 +902,7 @@ def validate_golden_sequence(reports: Sequence[Mapping[str, Any]]) -> dict[str, 
         "decision_eligible": False,
         "decision_state": "inconclusive",
         "eligibility_reasons": reasons,
+        "run_fingerprint_basis": RUN_FINGERPRINT_BASIS,
         "run_fingerprints": [_safe_report_fingerprint(report) for report in reports],
         "sequence": list(EXPECTED_VARIANTS),
         "conditions": [],
