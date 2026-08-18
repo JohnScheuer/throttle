@@ -4,9 +4,13 @@ This protocol produces one sanitized, repeatable live comparison artifact from
 six saved native Throttle reports. Throttle does not provision or reconfigure
 the server; the operator performs each controlled change between runs.
 
+The supported live workflow is one `throttle golden` invocation. It automates
+the six measurements, persistence, ordering, and final validation, while
+pausing at explicit operator checkpoints for each server-side transition.
+
 A sanitized completed example is checked in under
 `validation/golden-live-20260817`. It demonstrates this protocol for one pinned
-model, GPU, workload, and time window; it is not external validation or a
+model, accelerator, workload, and time window; it is not external validation or a
 universal performance, savings, or production claim. The offline suite also
 validates the gate and comparison mechanics independently.
 
@@ -41,7 +45,8 @@ Before traffic, record and independently retain evidence for:
 - for direct-host Metal, ROCm, or CPU, the host OS version;
 - runtime-verified effective engine flags;
 - model, `temperature=0`, fixed `max_tokens`, no stop tokens, streaming mode,
-  request timeout, workload hash/order/seed, load shape, SLOs, and safety caps;
+  request timeout, workload hash/order/seed, load shape, declared SLOs (or an
+  explicit throughput-only objective), and safety caps;
 - an explicit cache policy; and
 - the same physical accelerator for all six positions.
 
@@ -60,14 +65,16 @@ blocks per condition. Each condition must achieve either:
 - at least 60 measured seconds.
 
 The default three blocks × 67 requests gives 201 measured requests per
-condition. Use three × 20-second blocks for a time-bounded alternative. Every
-response must pass strict shape, finish, usage, stream-termination, and size
-validation. One failed, malformed, incomplete, cancelled, or partial response
-invalidates the position; do not delete a bad block and keep the rest.
+condition. The one-command v0.3 orchestrator currently requires count-bounded
+positions. A time-bounded alternative (for example, three × 20-second blocks)
+is available through the manual six-report flow and offline validator described
+below. Every response must pass strict shape, finish, usage, stream-termination,
+and size validation. One failed, malformed, incomplete, cancelled, or partial
+response invalidates the position; do not delete a bad block and keep the rest.
 
 ## Order
 
-Use one endpoint/GPU sequentially, never two simultaneous endpoints:
+Use one endpoint/accelerator sequentially, never two simultaneous endpoints:
 
 ```text
 phase 1: B1 → C1 → B2
@@ -85,11 +92,75 @@ The six reports must not overlap. Use exactly these manifest values:
 | B3 | baseline | B3 | 1 |
 | C3 | candidate | C3 | 8 |
 
-Run `throttle plan --run-mode benchmark` with each intended command before its
-position. Confirm the exact request/token ceiling, spend bound, destination,
-and privacy warning. Reconfigure only `max_num_seqs`, verify the effective
-runtime flag, then execute the next position. Do not count server startup or
-the first warm-up as measurement.
+## One-command orchestration
+
+Build the full zero-traffic session plan first:
+
+```sh
+throttle golden --dry-run \
+  --model Qwen/Qwen3-8B \
+  --url https://inference.example/v1 \
+  --api-key-env VLLM_API_KEY \
+  --baseline-config max_num_seqs=1 \
+  --candidate-config max_num_seqs=8 \
+  --cost-model dedicated-hourly \
+  --gpus 1 \
+  --total-hourly-price 0.50 \
+  --cache-policy disabled \
+  --model-revision 0123456789abcdef0123456789abcdef01234567 \
+  --image-digest 'registry.example/vllm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  --gpu 'NVIDIA A100 80GB PCIe' \
+  --gpu-fingerprint 'operator-private-stable-device-id' \
+  --cuda-version 13.0 \
+  --driver-version 580.42 \
+  --server-version 0.27.1 \
+  --engine-flag enable_chunked_prefill=true \
+  --engine-flags-provenance runtime_verified \
+  --p95-slo-ms 5000 \
+  --ttft-slo-ms 1000 \
+  --evidence-source live_inference \
+  --output-dir golden-run-001
+```
+
+The displayed SLO values are examples; replace them with the operator's actual
+thresholds. Omitting both declares a throughput-only objective. Such a result
+may still be decision-eligible, but its summary explicitly says that no latency
+SLO was declared and makes no latency claim.
+
+The plan lists every missing eligibility prerequisite and the aggregate
+six-position request, output-token, elapsed, and spend ceilings. It does not
+read the API-key environment variable, resolve DNS, construct an HTTP client,
+prompt for a transition, create the output directory, or send traffic.
+
+After review, set the key locally and rerun the same command without
+`--dry-run`. Before each position, Throttle prints the required variant and
+waits for an exact confirmation such as `B1 verified`. Reconfigure only
+`max_num_seqs` in another terminal, restart if needed, verify the effective
+runtime flags, then confirm. Throttle never executes a reconfiguration command.
+It refuses an existing output directory, atomically saves every completed
+position, and stops the sequence on the first failed, malformed, partial, or
+underpowered position.
+
+With count-bounded defaults, each position has 201 measured requests plus
+three warm-ups: 204 calls per position and 1,224 for the complete session. The
+default session elapsed ceiling is 5,400 seconds. Safety and billing inputs are
+held byte-for-byte constant across all position manifests; operator transition
+time counts against the outer elapsed/dedicated-cost guard.
+
+The live orchestrator rejects `user-supplied` totals and a pre-filled
+`--billed-active-seconds` value: either would be copied into every position and
+would misstate a six-run session total as six separate run totals. Dedicated
+hourly billing, explicitly acknowledged unknown billing, and serverless rate
+limits without a pre-filled billed duration retain their existing tagged
+semantics. Reconcile the final provider bill in the operator-controlled audit
+record after the run.
+
+Do not count server startup or Throttle's separate warm-ups as measurement.
+
+## Manual/offline compatibility
+
+The original position-specific flow remains available for existing automation
+and for validating six already-saved reports. An individual position uses:
 
 Example position-specific suffix:
 
@@ -105,7 +176,7 @@ Example position-specific suffix:
 ```
 
 The candidate uses the same command except `candidate`, `C1`, `8`, and its
-output name. Repeat for all positions while preserving every other argument.
+output name. Repeat all six positions while preserving every other argument.
 
 ## Validate and compare
 
@@ -137,6 +208,16 @@ The 95% interval may legitimately include zero. In that case the protocol is
 eligible but the result is `inconclusive`; repeat or redesign rather than
 claiming a win. A winning highest tested load remains a search-boundary result,
 not an optimum.
+
+When—and only when—the protocol is eligible and statistically supported,
+`golden.json` adds a structured `decision_summary` and the terminal prints its
+single `Golden recommendation — tested workload only` line. It names
+`max_num_seqs=1` or `8`, reports the candidate-relative throughput delta and
+order-balanced 95% interval, states that the interval excludes zero, and lists
+the declared E2E/TTFT SLO gates that passed. It does not claim latency parity,
+cost savings, an optimum, or generality beyond the pinned workload. Ineligible
+and statistically inconclusive sessions keep `decision_summary: null` and emit
+no recommendation.
 
 ## Evidence boundary
 

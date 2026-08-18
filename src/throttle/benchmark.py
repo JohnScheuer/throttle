@@ -1109,6 +1109,7 @@ async def _native_request(
 class RunBudget:
     config: RunConfig
     started: float = field(default_factory=time.perf_counter)
+    shared_budget: RunBudget | None = None
     requests_started: int = 0
     requests_completed: int = 0
     requests_cancelled: int = 0
@@ -1138,6 +1139,9 @@ class RunBudget:
         if runtime:
             self.set_stop(runtime)
             return False
+        if self.shared_budget is not None and not self.shared_budget.check_runtime():
+            self.set_stop(self.shared_budget.stop_reason or "session_limit")
+            return False
         return self.stop_reason is None
 
     def reserve(self) -> bool:
@@ -1156,6 +1160,9 @@ class RunBudget:
         ):
             self.set_stop("max_total_requested_tokens")
             return False
+        if self.shared_budget is not None and not self.shared_budget.reserve():
+            self.set_stop(self.shared_budget.stop_reason or "session_limit")
+            return False
         self.requests_started += 1
         self.reserved_output_tokens += self.config.max_tokens
         self.in_flight += 1
@@ -1172,10 +1179,16 @@ class RunBudget:
         runtime = self._runtime_limit()
         if runtime:
             self.set_stop(runtime)
+        if self.shared_budget is not None:
+            self.shared_budget.record(result)
+            if self.shared_budget.stop_reason is not None:
+                self.set_stop(self.shared_budget.stop_reason)
 
     def record_cancelled(self) -> None:
         self.in_flight = max(0, self.in_flight - 1)
         self.requests_cancelled += 1
+        if self.shared_budget is not None:
+            self.shared_budget.record_cancelled()
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -2159,6 +2172,7 @@ async def run_native(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     progress: RunProgress | None = None,
+    shared_budget: RunBudget | None = None,
 ) -> dict[str, Any]:
     """Run native traffic with continuous hard-limit enforcement."""
 
@@ -2178,7 +2192,7 @@ async def run_native(
     report = _initial_report(config, checked_prompts, checked_warmups)
     progress = progress or RunProgress()
     progress.set(report)
-    budget = RunBudget(config)
+    budget = RunBudget(config, shared_budget=shared_budget)
     endpoint_url = normalize_chat_completions_url(
         config.endpoint.url, allow_insecure_http=config.allow_insecure_http
     )

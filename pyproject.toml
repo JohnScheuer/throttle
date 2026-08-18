@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "throttle-bench"
-version = "0.2.1"
+version = "0.3.0"
 description = "Honest load and cost benchmarking for OpenAI-compatible chat endpoints"
 readme = "README.md"
 license = "MIT"
