@@ -56,7 +56,7 @@ jobs:
         run: |
           python ci/verify_offline_guard.py
           python -m compileall -q -f src tests ci
-          python -m unittest discover -s tests -v
+          python ci/run_tests.py --start-directory tests
 
   package:
     name: Clean wheel and source parity
@@ -96,6 +96,16 @@ jobs:
           fi
 
           python ci/verify_wheel.py "${wheels[0]}"
+          tracked_wheel="dist/$(basename "${wheels[0]}")"
+          if [[ ! -f "${tracked_wheel}" ]]; then
+            printf 'reviewed tracked wheel is missing: %s\n' "${tracked_wheel}" >&2
+            exit 1
+          fi
+          python ci/verify_wheel.py "${tracked_wheel}"
+          if ! cmp -s "${wheels[0]}" "${tracked_wheel}"; then
+            printf 'tracked wheel differs from deterministic source build\n' >&2
+            exit 1
+          fi
           printf 'path=%s\n' "${wheels[0]}" >> "${GITHUB_OUTPUT}"
 
       - name: Install and test only the built wheel in a clean environment
@@ -108,6 +118,7 @@ jobs:
             -r ci/requirements-runtime.lock
           "${clean_env}/bin/python" -m pip install --no-deps "${{ steps.wheel.outputs.path }}"
           "${clean_env}/bin/python" -m pip check
+          "${clean_env}/bin/throttle" --version
 
           cd "${RUNNER_TEMP}"
           PYTHONPATH="${GITHUB_WORKSPACE}/ci/offline_guard" \
@@ -116,5 +127,5 @@ jobs:
           PYTHONPATH="${GITHUB_WORKSPACE}/ci/offline_guard" \
             "${clean_env}/bin/python" "${GITHUB_WORKSPACE}/ci/verify_offline_guard.py"
           PYTHONPATH="${GITHUB_WORKSPACE}/ci/offline_guard" \
-            "${clean_env}/bin/python" -m unittest discover \
-            -s "${GITHUB_WORKSPACE}/tests" -v
+            "${clean_env}/bin/python" "${GITHUB_WORKSPACE}/ci/run_tests.py" \
+            --start-directory "${GITHUB_WORKSPACE}/tests"
