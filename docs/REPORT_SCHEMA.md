@@ -86,6 +86,13 @@ version. Workload hashes reveal equality and may confirm a guessed low-entropy
 workload; they are not encryption. `throttle plan` is terminal-only and
 intentionally displays the destination before any traffic.
 
+Artifact references use a bounded non-secret label with an optional immutable
+`@sha256:<64 lowercase hex>` suffix. Generated and loaded reports reject URLs,
+credential-like labels, absolute/traversal paths, and control characters before
+runtime evidence can be compared. Safe mutable labels and non-SHA-256 digest
+references remain structurally readable for descriptive manifest 1.0
+comparisons, but never satisfy the immutable decision-grade pin.
+
 Schema 1.0 validation JSON under `validation/` is historical smoke evidence.
 It is not auto-upgraded and `throttle compare` rejects it with
 `legacy_schema_not_decision_grade`.

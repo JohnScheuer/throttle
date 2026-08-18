@@ -26,22 +26,20 @@ Results describe only the declared workload and manifest.
 
 ### Quick Start
 
-Clone the repository and install the v0.2.0 wheel:
+Clone the repository and install the reviewed v0.2.1 wheel:
 
 ```sh
 git clone https://github.com/KushagraKanaujia/throttle.git
 cd throttle
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./dist/throttle_bench-0.2.0-py3-none-any.whl
+python -m pip install ./dist/throttle_bench-0.2.1-py3-none-any.whl
 throttle --version
 ```
 
-Or install the same wheel directly from the GitHub release:
-
-```sh
-python -m pip install https://github.com/KushagraKanaujia/throttle/releases/download/v0.2.0/throttle_bench-0.2.0-py3-none-any.whl
-```
+The tracked v0.2.1 wheel contains the platform-neutral manifest implementation
+and is reviewed against the source in this checkout. The older tagged v0.2.0
+release predates the accelerator flags documented below.
 
 Run a zero-traffic plan before setting an API key or sending any load. Replace
 the model and HTTPS URL with the operator-approved staging destination:
@@ -191,7 +189,9 @@ controls to a pinned Apple Silicon run:
 The software-environment digest must identify retained immutable evidence such
 as a canonical dependency lock, installed-package manifest, or native binary
 closure. Throttle validates the declaration and comparisons; it does not build
-or independently inspect that environment.
+or independently inspect that environment. Use a non-secret label followed by
+`@sha256:<64 lowercase hex>` (or a bare SHA-256 digest); URLs, credentials,
+absolute paths, traversal segments, and control characters are rejected.
 
 Use `--block-seconds 20` instead of `--requests-per-block` for duration-bounded
 blocks. The achieved duration—not merely the configured value—controls the

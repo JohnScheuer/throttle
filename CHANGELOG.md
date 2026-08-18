@@ -2,7 +2,7 @@
 
 All notable changes to Throttle will be documented in this file.
 
-## Unreleased
+## [0.2.1] - 2026-08-17
 
 ### Added
 - Platform-aware accelerator provenance for CUDA, Metal, ROCm, and CPU runs
@@ -12,6 +12,8 @@ All notable changes to Throttle will be documented in this file.
 ### Changed
 - Runtime manifest 1.1 supports non-CUDA comparisons while preserving manifest
   1.0 CUDA report compatibility and CUDA's existing image/driver requirements
+- Generated and loaded runtime metadata now share one fail-closed sanitizer;
+  manifest 1.1 legacy GPU aliases must reconcile with accelerator fields
 
 ## [0.2.0] - 2026-08-17
 
