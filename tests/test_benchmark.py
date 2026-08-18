@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import ipaddress
 import json
 import os
@@ -638,6 +639,60 @@ def _set_nonstream_ttft_unavailable(report: dict[str, object]) -> None:
     condition["diagnostic_metrics"]["ttft_ms"] = copy.deepcopy(aggregate)
 
 
+NON_CUDA_RUNTIME_CASES = (
+    (
+        "rocm",
+        "AMD Instinct MI300X",
+        "ROCm 6.3.1",
+        "Ubuntu 24.04 kernel 6.8.0",
+    ),
+    (
+        "cpu",
+        "AMD EPYC 9654",
+        "oneDNN 3.7.1",
+        "Ubuntu 24.04 kernel 6.8.0",
+    ),
+)
+
+
+def _set_platform_runtime(
+    report: dict[str, object],
+    *,
+    backend: str,
+    accelerator: str,
+    runtime_version: str,
+    host_os_version: str,
+) -> None:
+    manifest = report["manifest"]  # type: ignore[index]
+    manifest["manifest_version"] = "1.1"  # type: ignore[index]
+    runtime = manifest["runtime"]  # type: ignore[index]
+    runtime.update(  # type: ignore[union-attr]
+        image_digest="unknown",
+        gpu=accelerator,
+        gpu_fingerprint_sha256="e" * 64,
+        gpu_fingerprint_supplied=True,
+        cuda_version="unknown",
+        driver_version="unknown",
+        accelerator_backend=backend,
+        accelerator=accelerator,
+        accelerator_fingerprint_sha256="e" * 64,
+        accelerator_fingerprint_supplied=True,
+        accelerator_runtime_version=runtime_version,
+        host_os_version=host_os_version,
+        software_environment_digest=f"{backend}-environment@sha256:" + "f" * 64,
+    )
+
+
+def _set_metal_runtime(report: dict[str, object]) -> None:
+    _set_platform_runtime(
+        report,
+        backend="metal",
+        accelerator="Apple Silicon integrated GPU",
+        runtime_version="MLX 0.32.0",
+        host_os_version="macOS 15.0 build 24A335",
+    )
+
+
 def _golden_sequence(
     completion_tokens_by_position: tuple[int, int, int, int, int, int] = (
         300,
@@ -678,6 +733,40 @@ def _golden_sequence(
             )
         )
     return reports
+
+
+class RunConfigCompatibilityTests(unittest.TestCase):
+    def test_legacy_positional_server_version_slot_is_preserved(self) -> None:
+        config = RunConfig(
+            "smoke",
+            "native",
+            "model-a",
+            EndpointConfig("https://offline-only.example/v1", "private-key"),
+            CostModel(),
+            SafetyLimits(),
+            128,
+            (LoadCondition("closed_loop", 1.0, 1),),
+            1,
+            8,
+            None,
+            1,
+            120.0,
+            None,
+            None,
+            42,
+            True,
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "unknown",
+            "legacy-server-version",
+        )
+
+        self.assertEqual(config.server_version, "legacy-server-version")
+        self.assertEqual(config.accelerator_backend, "cuda")
 
 
 class CostModelTests(unittest.TestCase):
@@ -921,6 +1010,503 @@ class StatisticsAndBoundaryTests(unittest.TestCase):
 
 
 class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cuda_runtime_keeps_the_existing_image_and_driver_contract(
+        self,
+    ) -> None:
+        config = _run_config()
+        report = await run_native(
+            config,
+            PROMPTS,
+            WARMUPS,
+            transport=httpx.MockTransport(lambda _: _completion()),
+        )
+        runtime = report["manifest"]["runtime"]
+        self.assertEqual(runtime["accelerator_backend"], "cuda")
+        self.assertEqual(
+            runtime["accelerator_runtime_version"], config.cuda_version
+        )
+        self.assertEqual(
+            runtime["software_environment_digest"], config.image_digest
+        )
+        self.assertNotIn(
+            "complete_runtime_provenance_required",
+            report["decision_ineligible_reasons"],
+        )
+        self.assertNotIn(
+            "immutable_image_digest_required",
+            report["decision_ineligible_reasons"],
+        )
+
+    async def test_metal_runtime_uses_platform_pins_instead_of_cuda_fields(
+        self,
+    ) -> None:
+        config = replace(
+            _run_config(),
+            accelerator_backend="metal",
+            accelerator_runtime_version="MLX 0.32.0",
+            host_os_version="macOS 15.0 build 24A335",
+            software_environment_digest="python-environment@sha256:" + "f" * 64,
+            image_digest="unknown",
+            gpu="Apple Silicon integrated GPU",
+            gpu_fingerprint="private-apple-device-id",
+            cuda_version="unknown",
+            driver_version="unknown",
+        )
+        report = await run_native(
+            config,
+            PROMPTS,
+            WARMUPS,
+            transport=httpx.MockTransport(lambda _: _completion()),
+        )
+
+        runtime = report["manifest"]["runtime"]
+        self.assertEqual(report["manifest"]["manifest_version"], "1.1")
+        self.assertEqual(runtime["accelerator_backend"], "metal")
+        self.assertEqual(runtime["accelerator"], "Apple Silicon integrated GPU")
+        self.assertEqual(runtime["image_digest"], "unknown")
+        self.assertEqual(runtime["cuda_version"], "unknown")
+        self.assertNotIn(
+            "complete_runtime_provenance_required",
+            report["decision_ineligible_reasons"],
+        )
+        self.assertNotIn(
+            "immutable_image_digest_required",
+            report["decision_ineligible_reasons"],
+        )
+
+    async def test_metal_runtime_requires_an_immutable_environment_digest(
+        self,
+    ) -> None:
+        config = replace(
+            _run_config(),
+            accelerator_backend="metal",
+            accelerator_runtime_version="MLX 0.32.0",
+            host_os_version="macOS 15.0 build 24A335",
+            image_digest="unknown",
+            gpu="Apple Silicon integrated GPU",
+            cuda_version="unknown",
+            driver_version="unknown",
+        )
+        report = await run_native(
+            config,
+            PROMPTS,
+            WARMUPS,
+            transport=httpx.MockTransport(lambda _: _completion()),
+        )
+        self.assertIn(
+            "immutable_software_environment_digest_required",
+            report["decision_ineligible_reasons"],
+        )
+
+    async def test_rocm_and_cpu_native_reports_use_platform_runtime_evidence(
+        self,
+    ) -> None:
+        for backend, accelerator, runtime_version, host_os_version in (
+            NON_CUDA_RUNTIME_CASES
+        ):
+            with self.subTest(backend=backend):
+                config = replace(
+                    _run_config(),
+                    accelerator_backend=backend,  # type: ignore[arg-type]
+                    accelerator_runtime_version=runtime_version,
+                    host_os_version=host_os_version,
+                    software_environment_digest=(
+                        f"{backend}-environment@sha256:" + "f" * 64
+                    ),
+                    image_digest="unknown",
+                    gpu=accelerator,
+                    gpu_fingerprint=f"private-{backend}-device-id",
+                    cuda_version="unknown",
+                    driver_version="unknown",
+                )
+                report = await run_native(
+                    config,
+                    PROMPTS,
+                    WARMUPS,
+                    transport=httpx.MockTransport(lambda _: _completion()),
+                )
+
+                runtime = report["manifest"]["runtime"]
+                self.assertEqual(runtime["accelerator_backend"], backend)
+                self.assertEqual(runtime["accelerator"], accelerator)
+                self.assertEqual(
+                    runtime["accelerator_runtime_version"], runtime_version
+                )
+                self.assertEqual(runtime["host_os_version"], host_os_version)
+                self.assertNotIn(
+                    "complete_runtime_provenance_required",
+                    report["decision_ineligible_reasons"],
+                )
+                self.assertNotIn(
+                    "immutable_software_environment_digest_required",
+                    report["decision_ineligible_reasons"],
+                )
+
+    async def test_hostile_generated_runtime_metadata_is_rejected_without_echo(
+        self,
+    ) -> None:
+        def fail_if_called(_: httpx.Request) -> httpx.Response:
+            raise AssertionError("invalid metadata reached traffic")
+
+        base = replace(
+            _run_config(),
+            accelerator_backend="metal",
+            accelerator_runtime_version="MLX 0.32.0",
+            host_os_version="macOS 15.0 build 24A335",
+            software_environment_digest="metal-environment@sha256:" + "f" * 64,
+            image_digest="unknown",
+            gpu="Apple Silicon integrated GPU",
+            gpu_fingerprint="private-apple-device-id",
+            cuda_version="unknown",
+            driver_version="unknown",
+        )
+        hostile_cases = (
+            ("gpu", "https://private-accelerator.example/credential"),
+            ("accelerator_runtime_version", "Bearer private-runtime-token"),
+            ("accelerator_runtime_version", "token=private-runtime-token"),
+            ("accelerator_runtime_version", "access_token=private-runtime-token"),
+            ("host_os_version", "authorization: private-host-token"),
+            ("host_os_version", "ghp_1234567890abcdef"),
+            ("host_os_version", "github_pat_1234567890abcdef"),
+            ("host_os_version", "AKIA" + "A" * 16),
+            ("host_os_version", "xoxb-1234567890abcdef"),
+            (
+                "accelerator_runtime_version",
+                "runtime ghp_abcdefghijk",
+            ),
+            (
+                "accelerator_runtime_version",
+                "runtime eyJabc.eyJdef.signature",
+            ),
+            (
+                "host_os_version",
+                "device alice:hunter2@private.example",
+            ),
+            (
+                "software_environment_digest",
+                "env-ghp_abcdefghijk@sha256:" + "a" * 64,
+            ),
+            (
+                "software_environment_digest",
+                "env-eyJabc.eyJdef.signature@sha256:" + "a" * 64,
+            ),
+            (
+                "software_environment_digest",
+                "https://private-environment.example/secret@sha256:" + "a" * 64,
+            ),
+            (
+                "software_environment_digest",
+                "user:password@private-registry@sha256:" + "a" * 64,
+            ),
+            (
+                "software_environment_digest",
+                "/Users/example/env@sha256:" + "a" * 64,
+            ),
+            (
+                "software_environment_digest",
+                "private-environment\x1bcontrol@sha256:" + "a" * 64,
+            ),
+            (
+                "software_environment_digest",
+                "user:password@sha256:" + "a" * 64,
+            ),
+            (
+                "software_environment_digest",
+                "file:/Users/example/env@sha256:" + "a" * 64,
+            ),
+        )
+        for field, hostile in hostile_cases:
+            with self.subTest(field=field):
+                config = replace(base, **{field: hostile})
+                with self.assertRaises(ValueError) as raised:
+                    await run_native(
+                        config,
+                        PROMPTS,
+                        WARMUPS,
+                        transport=httpx.MockTransport(fail_if_called),
+                    )
+                self.assertNotIn(hostile, str(raised.exception))
+
+    async def test_saved_metal_runs_can_support_a_decision_grade_comparison(
+        self,
+    ) -> None:
+        baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+        candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+        for report in (baseline, candidate):
+            _set_metal_runtime(report)
+
+        comparison = compare_reports(baseline, candidate)
+        self.assertTrue(comparison["compatibility"]["compatible"])
+        self.assertTrue(comparison["decision_eligible"])
+        self.assertEqual(
+            comparison["overall_outcome"], "candidate_higher_throughput"
+        )
+
+        candidate["manifest"]["runtime"][  # type: ignore[index]
+            "accelerator_runtime_version"
+        ] = "MLX 0.32.1"
+        changed_runtime = compare_reports(baseline, candidate)
+        self.assertFalse(changed_runtime["compatibility"]["compatible"])
+        self.assertIn(
+            "manifest_mismatch_runtime_accelerator_runtime_version",
+            changed_runtime["compatibility"]["reasons"],
+        )
+
+    def test_rocm_and_cpu_saved_runs_support_comparison(self) -> None:
+        for backend, accelerator, runtime_version, host_os_version in (
+            NON_CUDA_RUNTIME_CASES
+        ):
+            with self.subTest(backend=backend):
+                baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+                candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+                for report in (baseline, candidate):
+                    _set_platform_runtime(
+                        report,
+                        backend=backend,
+                        accelerator=accelerator,
+                        runtime_version=runtime_version,
+                        host_os_version=host_os_version,
+                    )
+
+                comparison = compare_reports(baseline, candidate)
+                self.assertEqual(comparison["status"], "complete")
+                self.assertTrue(comparison["compatibility"]["compatible"])
+                self.assertTrue(comparison["decision_eligible"])
+                self.assertEqual(
+                    comparison["overall_outcome"],
+                    "candidate_higher_throughput",
+                )
+
+    def test_saved_runtime_alias_mismatch_and_malformed_hashes_fail_closed(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "label_mismatch",
+                "gpu",
+                "contradictory accelerator label",
+                "runtime_aliases_do_not_reconcile",
+            ),
+            (
+                "fingerprint_mismatch",
+                "gpu_fingerprint_sha256",
+                "a" * 64,
+                "runtime_aliases_do_not_reconcile",
+            ),
+            (
+                "supplied_flag_wrong_type",
+                "gpu_fingerprint_supplied",
+                "true",
+                "runtime_aliases_do_not_reconcile",
+            ),
+            (
+                "legacy_fingerprint_malformed",
+                "gpu_fingerprint_sha256",
+                "not-a-digest",
+                "invalid_manifest_digest",
+            ),
+            (
+                "generic_fingerprint_malformed",
+                "accelerator_fingerprint_sha256",
+                "not-a-digest",
+                "invalid_manifest_digest",
+            ),
+        )
+        for name, field, value, reason in cases:
+            with self.subTest(case=name):
+                baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+                candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+                for report in (baseline, candidate):
+                    _set_metal_runtime(report)
+                baseline["manifest"]["runtime"][field] = value  # type: ignore[index]
+
+                comparison = compare_reports(baseline, candidate)
+                self.assertEqual(comparison["status"], "incompatible")
+                self.assertFalse(comparison["compatibility"]["compatible"])
+                self.assertFalse(comparison["decision_eligible"])
+                self.assertIn(
+                    f"baseline_{reason}", comparison["compatibility"]["reasons"]
+                )
+
+    def test_saved_hostile_runtime_metadata_fails_closed_without_echo(self) -> None:
+        hostile_cases = (
+            (
+                ("gpu", "accelerator"),
+                "https://private-accelerator.example/credential",
+            ),
+            (("accelerator_runtime_version",), "Bearer private-runtime-token"),
+            (("accelerator_runtime_version",), "token=private-runtime-token"),
+            (("accelerator_runtime_version",), "access_token=private-runtime-token"),
+            (("host_os_version",), "authorization: private-host-token"),
+            (("host_os_version",), "ghp_1234567890abcdef"),
+            (("host_os_version",), "github_pat_1234567890abcdef"),
+            (("host_os_version",), "AKIA" + "A" * 16),
+            (("host_os_version",), "xoxb-1234567890abcdef"),
+            (("accelerator_runtime_version",), "runtime ghp_abcdefghijk"),
+            (
+                ("accelerator_runtime_version",),
+                "runtime eyJabc.eyJdef.signature",
+            ),
+            (("host_os_version",), "device alice:hunter2@private.example"),
+            (
+                ("software_environment_digest",),
+                "env-ghp_abcdefghijk@sha256:" + "a" * 64,
+            ),
+            (
+                ("software_environment_digest",),
+                "env-eyJabc.eyJdef.signature@sha256:" + "a" * 64,
+            ),
+            (
+                ("software_environment_digest",),
+                "https://private-environment.example/secret@sha256:" + "a" * 64,
+            ),
+            (
+                ("software_environment_digest",),
+                "user:password@private-registry@sha256:" + "a" * 64,
+            ),
+            (
+                ("software_environment_digest",),
+                "/Users/example/env@sha256:" + "a" * 64,
+            ),
+            (
+                ("software_environment_digest",),
+                "private-environment\x1bcontrol@sha256:" + "a" * 64,
+            ),
+            (
+                ("software_environment_digest",),
+                "user:password@sha256:" + "a" * 64,
+            ),
+            (
+                ("software_environment_digest",),
+                "file:/Users/example/env@sha256:" + "a" * 64,
+            ),
+        )
+        for fields, hostile in hostile_cases:
+            with self.subTest(fields=fields):
+                baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+                candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+                for report in (baseline, candidate):
+                    _set_metal_runtime(report)
+                runtime = baseline["manifest"]["runtime"]  # type: ignore[index]
+                for field in fields:
+                    runtime[field] = hostile  # type: ignore[index]
+
+                comparison = compare_reports(baseline, candidate)
+                self.assertEqual(comparison["status"], "incompatible")
+                self.assertFalse(comparison["compatibility"]["compatible"])
+                self.assertIn(
+                    "baseline_unsafe_runtime_metadata",
+                    comparison["compatibility"]["reasons"],
+                )
+                self.assertNotIn(hostile, json.dumps(comparison, sort_keys=True))
+
+    def test_saved_unknown_fingerprint_hash_cannot_be_forged_as_supplied(
+        self,
+    ) -> None:
+        baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+        candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+        for report in (baseline, candidate):
+            _set_metal_runtime(report)
+        forged = hashlib.sha256(b"unknown").hexdigest()
+        runtime = baseline["manifest"]["runtime"]  # type: ignore[index]
+        runtime["gpu_fingerprint_sha256"] = forged  # type: ignore[index]
+        runtime["accelerator_fingerprint_sha256"] = forged  # type: ignore[index]
+        runtime["gpu_fingerprint_supplied"] = True  # type: ignore[index]
+        runtime["accelerator_fingerprint_supplied"] = True  # type: ignore[index]
+
+        comparison = compare_reports(baseline, candidate)
+        self.assertEqual(comparison["status"], "incompatible")
+        self.assertFalse(comparison["compatibility"]["compatible"])
+        self.assertFalse(comparison["decision_eligible"])
+        self.assertIn(
+            "baseline_accelerator_fingerprint_not_supplied",
+            comparison["compatibility"]["reasons"],
+        )
+        self.assertNotIn(forged, json.dumps(comparison, sort_keys=True))
+
+    def test_legacy_mutable_image_remains_descriptively_comparable(self) -> None:
+        baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+        candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+        for report in (baseline, candidate):
+            report["manifest"]["runtime"]["image_digest"] = (  # type: ignore[index]
+                "example/image:latest"
+            )
+
+        comparison = compare_reports(baseline, candidate)
+        self.assertEqual(comparison["status"], "complete")
+        self.assertTrue(comparison["compatibility"]["compatible"])
+        self.assertFalse(comparison["decision_eligible"])
+        self.assertEqual(comparison["decision_state"], "inconclusive")
+        self.assertIsNone(comparison["overall_outcome"])
+        self.assertEqual(
+            comparison["descriptive_statistical_outcome"],
+            "candidate_higher_throughput",
+        )
+        self.assertIn(
+            "immutable_image_digest_required",
+            comparison["decision_ineligible_reasons"],
+        )
+
+    def test_legacy_oci_and_non_sha256_references_keep_compatibility(self) -> None:
+        cases = (
+            ("ubuntu:24.04@sha256:" + "b" * 64, True),
+            ("example/image@sha512:" + "b" * 128, False),
+        )
+        for image_reference, decision_eligible in cases:
+            with self.subTest(image_reference=image_reference[:32]):
+                baseline = _saved_report(
+                    (10.0, 10.0, 10.0), flag_value="1"
+                )
+                candidate = _saved_report(
+                    (12.0, 12.0, 12.0), flag_value="8"
+                )
+                for report in (baseline, candidate):
+                    report["manifest"]["runtime"][  # type: ignore[index]
+                        "image_digest"
+                    ] = image_reference
+
+                comparison = compare_reports(baseline, candidate)
+                self.assertEqual(comparison["status"], "complete")
+                self.assertTrue(comparison["compatibility"]["compatible"])
+                self.assertEqual(
+                    comparison["decision_eligible"], decision_eligible
+                )
+                if not decision_eligible:
+                    self.assertIn(
+                        "immutable_image_digest_required",
+                        comparison["decision_ineligible_reasons"],
+                    )
+
+    def test_mixed_runtime_manifest_versions_are_explicitly_incompatible(
+        self,
+    ) -> None:
+        baseline = _saved_report((10.0, 10.0, 10.0), flag_value="1")
+        candidate = _saved_report((12.0, 12.0, 12.0), flag_value="8")
+        candidate_manifest = candidate["manifest"]  # type: ignore[index]
+        candidate_manifest["manifest_version"] = "1.1"  # type: ignore[index]
+        runtime = candidate_manifest["runtime"]  # type: ignore[index]
+        runtime.update(  # type: ignore[union-attr]
+            accelerator_backend="cuda",
+            accelerator=runtime["gpu"],  # type: ignore[index]
+            accelerator_fingerprint_sha256=runtime[  # type: ignore[index]
+                "gpu_fingerprint_sha256"
+            ],
+            accelerator_fingerprint_supplied=runtime[  # type: ignore[index]
+                "gpu_fingerprint_supplied"
+            ],
+            accelerator_runtime_version=runtime["cuda_version"],  # type: ignore[index]
+            host_os_version="unknown",
+            software_environment_digest=runtime["image_digest"],  # type: ignore[index]
+        )
+
+        comparison = compare_reports(baseline, candidate)
+        self.assertEqual(comparison["status"], "incompatible")
+        self.assertFalse(comparison["compatibility"]["compatible"])
+        self.assertIn(
+            "manifest_mismatch_manifest_version",
+            comparison["compatibility"]["reasons"],
+        )
+
     async def test_open_loop_uses_rate_shape_and_respects_in_flight_ceiling(
         self,
     ) -> None:
@@ -1662,6 +2248,62 @@ class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GoldenProtocolTests(unittest.TestCase):
+    def test_metal_runs_can_pass_the_golden_runtime_gate(self) -> None:
+        reports = _golden_sequence()
+        for report in reports:
+            _set_metal_runtime(report)
+        result = validate_golden_sequence(reports)
+        self.assertTrue(result["golden_protocol_eligible"])
+        self.assertEqual(result["eligibility_reasons"], [])
+
+    def test_rocm_and_cpu_runs_can_pass_the_golden_runtime_gate(self) -> None:
+        for backend, accelerator, runtime_version, host_os_version in (
+            NON_CUDA_RUNTIME_CASES
+        ):
+            with self.subTest(backend=backend):
+                reports = _golden_sequence()
+                for report in reports:
+                    _set_platform_runtime(
+                        report,
+                        backend=backend,
+                        accelerator=accelerator,
+                        runtime_version=runtime_version,
+                        host_os_version=host_os_version,
+                    )
+                result = validate_golden_sequence(reports)
+                self.assertTrue(result["golden_protocol_eligible"])
+                self.assertEqual(result["eligibility_reasons"], [])
+
+    def test_golden_runtime_alias_mismatch_and_malformed_legacy_hash_fail_closed(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "alias_mismatch",
+                "gpu",
+                "contradictory accelerator label",
+                "run_1_runtime_aliases_do_not_reconcile",
+            ),
+            (
+                "malformed_legacy_fingerprint",
+                "gpu_fingerprint_sha256",
+                "not-a-digest",
+                "run_1_invalid_manifest_digest",
+            ),
+        )
+        for name, field, value, reason in cases:
+            with self.subTest(case=name):
+                reports = _golden_sequence()
+                for report in reports:
+                    _set_metal_runtime(report)
+                reports[0]["manifest"]["runtime"][field] = value  # type: ignore[index]
+
+                result = validate_golden_sequence(reports)
+                self.assertEqual(result["status"], "ineligible")
+                self.assertFalse(result["golden_protocol_eligible"])
+                self.assertFalse(result["decision_eligible"])
+                self.assertIn(reason, result["eligibility_reasons"])
+
     def test_six_sequential_live_runs_pass_the_golden_gate(self) -> None:
         result = validate_golden_sequence(_golden_sequence())
         self.assertEqual(result["status"], "complete")

@@ -19,6 +19,7 @@ CostKind = Literal[
 TrafficKind = Literal["closed_loop", "open_loop"]
 RunMode = Literal["smoke", "benchmark"]
 BackendKind = Literal["native", "guidellm"]
+AcceleratorBackend = Literal["cuda", "metal", "rocm", "cpu"]
 OPEN_LOOP_RATE_RELATIVE_TOLERANCE = 0.05
 OPEN_LOOP_SCHEDULER_LAG_INTERVAL_TOLERANCE = 1.0
 
@@ -326,6 +327,11 @@ class RunConfig:
     allow_insecure_http: bool = False
     evidence_source: str = "unverified_endpoint"
     guidellm_gaps_acknowledged: bool = False
+    # Appended to preserve the positional shape of the pre-manifest-1.1 API.
+    accelerator_backend: AcceleratorBackend = "cuda"
+    accelerator_runtime_version: str = "unknown"
+    host_os_version: str = "unknown"
+    software_environment_digest: str = "unknown"
 
     def planned_request_count(self) -> int | None:
         if self.requests_per_block is None:
