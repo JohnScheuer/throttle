@@ -318,10 +318,6 @@ class RunConfig:
     gpu_fingerprint: str = "unknown"
     cuda_version: str = "unknown"
     driver_version: str = "unknown"
-    accelerator_backend: AcceleratorBackend = "cuda"
-    accelerator_runtime_version: str = "unknown"
-    host_os_version: str = "unknown"
-    software_environment_digest: str = "unknown"
     server_version: str = "unknown"
     engine_flags: tuple[tuple[str, str], ...] = ()
     engine_flags_provenance: str = "operator_attested"
@@ -331,6 +327,11 @@ class RunConfig:
     allow_insecure_http: bool = False
     evidence_source: str = "unverified_endpoint"
     guidellm_gaps_acknowledged: bool = False
+    # Appended to preserve the positional shape of the pre-manifest-1.1 API.
+    accelerator_backend: AcceleratorBackend = "cuda"
+    accelerator_runtime_version: str = "unknown"
+    host_os_version: str = "unknown"
+    software_environment_digest: str = "unknown"
 
     def planned_request_count(self) -> int | None:
         if self.requests_per_block is None:

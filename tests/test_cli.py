@@ -196,6 +196,38 @@ class ParserAndPlanTests(unittest.TestCase):
         self.assertEqual(config.cuda_version, "unknown")
         self.assertEqual(config.image_digest, "unknown")
 
+    def test_plan_with_unknown_server_never_claims_runtime_evidence_complete(
+        self,
+    ) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = main(
+                [
+                    "plan",
+                    "--model",
+                    "model-a",
+                    "--url",
+                    PRIVATE_ENDPOINT,
+                    "--accelerator-backend",
+                    "metal",
+                    "--accelerator",
+                    "Apple Silicon integrated GPU",
+                    "--accelerator-fingerprint",
+                    "private-apple-device-id",
+                    "--accelerator-runtime-version",
+                    "MLX 0.32.0",
+                    "--host-os-version",
+                    "macOS 15.0 build 24A335",
+                    "--software-environment-digest",
+                    "metal-environment@sha256:" + "f" * 64,
+                ]
+            )
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, EXIT_OK)
+        self.assertNotIn("Runtime evidence: complete", output.splitlines())
+        self.assertIn("complete_runtime_provenance_required", output)
+
     def test_plan_needs_no_key_sends_no_traffic_and_shows_27_calls(self) -> None:
         argv = [
             "plan",

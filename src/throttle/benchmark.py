@@ -38,6 +38,8 @@ from .provenance import (
     ACCELERATOR_BACKENDS,
     CURRENT_MANIFEST_VERSION,
     build_runtime_manifest,
+    is_safe_artifact_reference,
+    is_safe_public_metadata,
     runtime_provenance_reasons,
 )
 from .statistics import (
@@ -311,25 +313,8 @@ def _validate_engine_flags(flags: tuple[tuple[str, str], ...]) -> None:
 
 
 def _validate_public_metadata(name: str, value: str, *, max_length: int = 256) -> None:
-    if (
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
-        or len(value) > max_length
-    ):
-        raise ValueError(
-            f"{name} must be non-empty text no longer than {max_length} characters"
-        )
-    if value.lower() == "unknown" and value != "unknown":
-        raise ValueError(f"{name} must use the canonical 'unknown' sentinel")
-    lowered = value.lower()
-    if any(
-        marker in lowered
-        for marker in ("://", "bearer ", "authorization:", "api_key=", "api-key=")
-    ):
-        raise ValueError(f"{name} may contain a URL or credential")
-    if any(ord(character) < 32 for character in value):
-        raise ValueError(f"{name} must not contain control characters")
+    if not is_safe_public_metadata(value, max_length=max_length):
+        raise ValueError(f"{name} contains unsafe or invalid public metadata")
 
 
 def validate_config(config: RunConfig, *, for_traffic: bool = True) -> None:
@@ -473,6 +458,12 @@ def validate_config(config: RunConfig, *, for_traffic: bool = True) -> None:
         ("sequence_position", config.sequence_position),
     ):
         _validate_public_metadata(name, value)
+    for name, value in (
+        ("image_digest", config.image_digest),
+        ("software_environment_digest", config.software_environment_digest),
+    ):
+        if not is_safe_artifact_reference(value):
+            raise ValueError(f"{name} must be a safe artifact reference")
     _validate_engine_flags(config.engine_flags)
 
     planned = config.planned_request_count()
@@ -511,6 +502,12 @@ def build_plan(
     planned = config.planned_request_count()
     planned_tokens = config.planned_requested_output_tokens()
     runtime_manifest = build_runtime_manifest(config)
+    runtime_reasons = runtime_provenance_reasons(
+        runtime_manifest, CURRENT_MANIFEST_VERSION
+    )
+    if config.server_version == "unknown":
+        runtime_reasons.append("complete_runtime_provenance_required")
+    runtime_reasons = list(dict.fromkeys(runtime_reasons))
     return {
         "mode": config.mode,
         "backend": config.backend,
@@ -536,9 +533,7 @@ def build_plan(
         "cost_model": config.cost.public_dict(config.limits.max_elapsed_seconds),
         "destination": destination,
         "runtime": runtime_manifest,
-        "runtime_provenance_reasons": runtime_provenance_reasons(
-            runtime_manifest, CURRENT_MANIFEST_VERSION
-        ),
+        "runtime_provenance_reasons": runtime_reasons,
         "workload": {
             "measured_prompt_count": len(prompts),
             "warmup_prompt_count": len(warmup_prompts),

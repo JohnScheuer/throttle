@@ -23,6 +23,7 @@ from .provenance import (
     LEGACY_RUNTIME_CONTROLLED_PATHS,
     PLATFORM_RUNTIME_CONTROLLED_PATHS,
     SUPPORTED_MANIFEST_VERSIONS,
+    is_safe_public_metadata,
     runtime_preflight_reason,
     runtime_provenance_reasons,
 )
@@ -381,9 +382,8 @@ def _preflight_reason(report: Mapping[str, Any]) -> str | None:
         _path(report, "manifest", "workload", "cache_policy"),
     )
     if any(
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
+        not is_safe_public_metadata(value)
+        or not isinstance(value, str)
         or value.lower() == "unknown"
         for value in required_text
     ):
