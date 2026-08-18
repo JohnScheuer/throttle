@@ -2,7 +2,7 @@
 
 All notable changes to Throttle will be documented in this file.
 
-## [0.3.0] - 2026-08-17
+## [0.3.0] - 2026-08-18
 
 ### Added
 - One-command, operator-mediated `throttle golden` orchestration for the
@@ -12,6 +12,9 @@ All notable changes to Throttle will be documented in this file.
   protocol and statistical eligibility gate passes
 - Warning-strict Python 3.11-3.14 CI, process-wide offline-network guards, and
   clean-wheel/source-byte package verification
+- Deterministic adversarial boundary coverage for Unicode spoofing, credentials,
+  paths, digests, duplicate JSON keys, cyclic/deep structures, and payload
+  non-reflection
 
 ### Changed
 - Multi-load benchmark sweeps now warn before key resolution or traffic that
@@ -20,6 +23,17 @@ All notable changes to Throttle will be documented in this file.
   900 seconds, and Golden sessions use an explicit 5,400-second session ceiling
 - Golden live preflight is platform-neutral across CUDA, Metal, ROCm, and CPU
   while preserving the stricter CUDA image/runtime requirements
+- Saved and in-memory reports now share bounded depth, node, numeric, and string
+  validation; Golden run fingerprints cover only validated evidence consumed by
+  the decision gate
+
+### Security
+- Runtime and engine metadata reject normalized Unicode lookalikes,
+  credential/userinfo shapes, URLs, absolute or traversal paths, and unsafe
+  control characters without reflecting rejected values
+- Report parsing rejects duplicate keys, non-finite or oversized numbers,
+  non-JSON containers, cycles, and over-limit trees before comparison or Golden
+  aggregation
 
 ## [0.2.1] - 2026-08-17
 

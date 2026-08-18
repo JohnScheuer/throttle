@@ -282,14 +282,14 @@ def _validate_engine_flags(flags: tuple[tuple[str, str], ...]) -> None:
     seen: set[str] = set()
     for name, value in flags:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name):
-            raise ValueError(
-                "engine flag names may contain only letters, numbers, '_' and '-'"
-            )
+            raise ValueError("invalid_engine_flag_name")
         normalized_name = name.replace("_", "-").lower()
-        if any(marker in normalized_name for marker in forbidden_name_markers):
-            raise ValueError(f"engine flag {name!r} is unsafe to persist")
+        if not is_safe_public_metadata(name, max_length=128) or any(
+            marker in normalized_name for marker in forbidden_name_markers
+        ):
+            raise ValueError("unsafe_engine_flag_name")
         if normalized_name in seen:
-            raise ValueError(f"duplicate engine flag: {name}")
+            raise ValueError("duplicate_engine_flag_name")
         seen.add(normalized_name)
         if (
             not isinstance(value, str)
@@ -297,19 +297,9 @@ def _validate_engine_flags(flags: tuple[tuple[str, str], ...]) -> None:
             or value != value.strip()
             or len(value) > 256
         ):
-            raise ValueError(f"engine flag {name!r} has an invalid value")
-        value_lower = value.lower()
-        if any(
-            marker in value_lower
-            for marker in (
-                "://",
-                "bearer ",
-                "authorization:",
-                "api_key",
-                "api-key",
-            )
-        ):
-            raise ValueError(f"engine flag {name!r} may contain a secret or URL")
+            raise ValueError("invalid_engine_flag_value")
+        if not is_safe_public_metadata(value):
+            raise ValueError("unsafe_engine_flag_value")
 
 
 def _validate_public_metadata(name: str, value: str, *, max_length: int = 256) -> None:

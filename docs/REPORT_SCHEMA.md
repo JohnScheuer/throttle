@@ -24,6 +24,13 @@ ineligible or inconclusive result. A stopped orchestration writes
 `artifact_type: throttle_golden_session` with completed-position names and a
 fixed sanitized stop reason, never a recommendation.
 
+Golden artifacts label `run_fingerprint_basis` as
+`validated_consumed_evidence_projection_v1`. Each `run_fingerprints` entry
+hashes only the bounded, schema-validated evidence consumed by report and
+Golden validation. Safe forward-extension fields are deliberately omitted so
+the digest cannot become an oracle for ignored payloads; a structurally or
+semantically invalid source report receives a null fingerprint.
+
 A supported `decision_summary` contains a fixed workload-scoped label, the
 winning variant and `max_num_seqs` value, the candidate-relative throughput
 delta, its order-balanced 95% interval/method, `ci_excludes_zero: true`, the
@@ -102,6 +109,13 @@ credential-like labels, absolute/traversal paths, and control characters before
 runtime evidence can be compared. Safe mutable labels and non-SHA-256 digest
 references remain structurally readable for descriptive manifest 1.0
 comparisons, but never satisfy the immutable decision-grade pin.
+
+Saved and in-memory report boundaries are iterative and explicit: depth is
+limited to 64 edges, total JSON nodes to 100,000, aggregate UTF-8 key/value text
+to 20 MB, individual values to 16 KiB, and keys to 1 KiB. Duplicate keys,
+non-finite or unsafe-magnitude numbers, cycles, custom containers, unsafe
+Unicode categories, and NFKC-normalized credential/path lookalikes fail with
+fixed non-reflective reason codes.
 
 Schema 1.0 validation JSON under `validation/` is historical smoke evidence.
 It is not auto-upgraded and `throttle compare` rejects it with
