@@ -46,11 +46,12 @@ successful optimization claim.
    representativeness. They also reveal equality and can confirm a guessed
    low-entropy workload; hashing is not encryption. The operator must choose
    approved prompts and an appropriate cache policy.
-10. **Python compatibility evidence is local.** The full offline suite passes
-    on isolated Python 3.11 and 3.13 interpreters as well as the workspace's
-    3.14 interpreter. The actual optional GuideLLM 0.7.3 package and console
-    command were additionally installed and checked on Python 3.13; no hosted
-    CI matrix is included yet.
+10. **Python compatibility is continuously checked, but platform evidence is
+    still bounded.** Hosted CI runs warning-strict, offline-guarded source and
+    clean-wheel tests on Python 3.11 through 3.14. The actual optional GuideLLM
+    0.7.3 package and console command were additionally installed and checked
+    on Python 3.13. CI does not replace live accelerator-specific endpoint
+    validation on every supported operating system.
 11. **Native multi-load order is not counterbalanced.** Conditions currently
     execute condition-major and use deterministic condition/block seeds. A
     multi-load best-tested value is therefore always descriptive/inconclusive,
@@ -59,6 +60,21 @@ successful optimization claim.
     and the six-position golden protocol remain the decision paths. Removing
     this gate requires a block-major counterbalanced scheduler that reuses the
     same per-block prompt schedule across conditions and records that schedule.
+12. **The one-command golden runner is count-bounded and operator-mediated.**
+    It safely orchestrates the default 3 × 67 request positions, but does not
+    yet run duration-bounded positions; those remain available through six
+    manual benchmark reports plus offline validation. Throttle times the
+    operator confirmations and stops further client traffic at its session
+    ceiling, but it cannot stop or bill-discover the provider resource. Keep a
+    provider-side budget/auto-stop active during every transition.
+13. **Sanitization is a boundary, not a secret detector.** Generated and loaded
+    metadata reject the credential, URL, path, Unicode-spoofing, and structural
+    shapes covered by the versioned test corpus, but no finite pattern set can
+    prove arbitrary text is non-secret. Operators must never place credentials,
+    endpoint details, private paths, prompts, or responses in provenance or
+    engine-flag metadata. The Golden consumed-evidence fingerprint projection is
+    versioned and must be updated whenever a future schema adds new decision
+    evidence.
 
 Deferred by design: automatic engine reconfiguration, provisioning,
 autoscaling, GPU selection, spot management, cache systems, production proxying,
