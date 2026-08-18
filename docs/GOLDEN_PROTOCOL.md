@@ -31,15 +31,19 @@ credit; vLLM V1 already enables it by default when possible.
 
 Before traffic, record and independently retain evidence for:
 
-- image name plus `@sha256:<64 hex>` digest;
 - model repository commit (full 40- or 64-hex revision, never `main`);
-- GPU label and one stable private fingerprint (only its SHA-256 is reported);
-- CUDA, driver, server/vLLM, and Throttle versions;
+- accelerator backend/label and one stable private fingerprint (only its
+  SHA-256 is reported);
+- accelerator runtime, server, and Throttle versions;
+- one immutable software-environment digest;
+- for CUDA, the image name plus `@sha256:<64 hex>` digest and the CUDA/driver
+  versions;
+- for direct-host Metal, ROCm, or CPU, the host OS version;
 - runtime-verified effective engine flags;
 - model, `temperature=0`, fixed `max_tokens`, no stop tokens, streaming mode,
   request timeout, workload hash/order/seed, load shape, SLOs, and safety caps;
 - an explicit cache policy; and
-- the same physical GPU for all six positions.
+- the same physical accelerator for all six positions.
 
 Warm-ups must use the separate warm-up JSONL, share no canonical prompt with
 the measured workload, and are excluded from measurements.

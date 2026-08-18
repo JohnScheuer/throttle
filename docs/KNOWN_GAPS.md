@@ -23,8 +23,10 @@ successful optimization claim.
    boundary; Windows is rejected before traffic.
 4. **Runtime provenance is attested.** Throttle validates shape, consistency,
    exact pins, and hashes, but cannot independently prove that an operator's
-   GPU, image, model commit, cache state, or effective flags are truthful. Keep
-   external audit evidence.
+   accelerator, software environment, model commit, cache state, or effective
+   flags are truthful. Keep external audit evidence. CUDA image digests and
+   direct-host software-environment digests are operator-supplied identities,
+   not remotely inspected environments.
 5. **Intervals are deliberately conservative and small-sample.** Request
    percentiles use bounded deterministic bootstrap diagnostics; decisions use
    repeated blocks. The six-run golden result has only two order-balanced phase

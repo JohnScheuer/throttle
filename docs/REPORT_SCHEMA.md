@@ -20,6 +20,13 @@ Comparison artifacts use `artifact_type: throttle_comparison`. Six-position
 golden artifacts use `artifact_type: throttle_golden_live_comparison` and add
 protocol eligibility/order-balanced contrasts.
 
+New run artifacts use runtime manifest `1.1`. It retains the manifest `1.0`
+CUDA keys for compatibility and adds an accelerator backend, generic
+accelerator identity/fingerprint, accelerator runtime version, host OS version,
+and immutable software-environment digest. Saved manifest `1.0` CUDA reports
+remain readable and comparable with other `1.0` reports; different manifest
+versions are never treated as the same controlled runtime.
+
 ## Decision gate
 
 `decision_eligible` is derived, not a caller assertion. A normal comparison
@@ -67,13 +74,24 @@ Persisted artifacts do not contain:
 - API keys, authorization headers, or inherited proxy values;
 - prompts/messages or generated content;
 - raw HTTP bodies, GuideLLM output, server exception strings, or temp paths; or
-- raw GPU fingerprints.
+- raw accelerator fingerprints.
 
-The manifest keeps canonical SHA-256 workload fingerprints, a hashed GPU
-fingerprint, validated non-secret runtime labels, engine-flag names/values, and
-aggregate numeric samples. Workload hashes reveal equality and may confirm a
-guessed low-entropy workload; they are not encryption. `throttle plan` is
-terminal-only and intentionally displays the destination before any traffic.
+The manifest keeps canonical SHA-256 workload fingerprints, a hashed
+accelerator fingerprint, validated non-secret runtime labels, engine-flag
+names/values, and aggregate numeric samples. CUDA decision-grade reports
+require the existing immutable image, CUDA, and driver evidence. Metal, ROCm,
+and CPU reports instead require a host OS version and immutable
+software-environment digest; all platforms require an accelerator runtime
+version. Workload hashes reveal equality and may confirm a guessed low-entropy
+workload; they are not encryption. `throttle plan` is terminal-only and
+intentionally displays the destination before any traffic.
+
+Artifact references use a bounded non-secret label with an optional immutable
+`@sha256:<64 lowercase hex>` suffix. Generated and loaded reports reject URLs,
+credential-like labels, absolute/traversal paths, and control characters before
+runtime evidence can be compared. Safe mutable labels and non-SHA-256 digest
+references remain structurally readable for descriptive manifest 1.0
+comparisons, but never satisfy the immutable decision-grade pin.
 
 Schema 1.0 validation JSON under `validation/` is historical smoke evidence.
 It is not auto-upgraded and `throttle compare` rejects it with
