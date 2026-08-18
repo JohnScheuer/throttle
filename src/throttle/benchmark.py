@@ -282,14 +282,14 @@ def _validate_engine_flags(flags: tuple[tuple[str, str], ...]) -> None:
     seen: set[str] = set()
     for name, value in flags:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name):
-            raise ValueError(
-                "engine flag names may contain only letters, numbers, '_' and '-'"
-            )
+            raise ValueError("invalid_engine_flag_name")
         normalized_name = name.replace("_", "-").lower()
-        if any(marker in normalized_name for marker in forbidden_name_markers):
-            raise ValueError(f"engine flag {name!r} is unsafe to persist")
+        if not is_safe_public_metadata(name, max_length=128) or any(
+            marker in normalized_name for marker in forbidden_name_markers
+        ):
+            raise ValueError("unsafe_engine_flag_name")
         if normalized_name in seen:
-            raise ValueError(f"duplicate engine flag: {name}")
+            raise ValueError("duplicate_engine_flag_name")
         seen.add(normalized_name)
         if (
             not isinstance(value, str)
@@ -297,19 +297,9 @@ def _validate_engine_flags(flags: tuple[tuple[str, str], ...]) -> None:
             or value != value.strip()
             or len(value) > 256
         ):
-            raise ValueError(f"engine flag {name!r} has an invalid value")
-        value_lower = value.lower()
-        if any(
-            marker in value_lower
-            for marker in (
-                "://",
-                "bearer ",
-                "authorization:",
-                "api_key",
-                "api-key",
-            )
-        ):
-            raise ValueError(f"engine flag {name!r} may contain a secret or URL")
+            raise ValueError("invalid_engine_flag_value")
+        if not is_safe_public_metadata(value):
+            raise ValueError("unsafe_engine_flag_value")
 
 
 def _validate_public_metadata(name: str, value: str, *, max_length: int = 256) -> None:
@@ -1109,6 +1099,7 @@ async def _native_request(
 class RunBudget:
     config: RunConfig
     started: float = field(default_factory=time.perf_counter)
+    shared_budget: RunBudget | None = None
     requests_started: int = 0
     requests_completed: int = 0
     requests_cancelled: int = 0
@@ -1138,6 +1129,9 @@ class RunBudget:
         if runtime:
             self.set_stop(runtime)
             return False
+        if self.shared_budget is not None and not self.shared_budget.check_runtime():
+            self.set_stop(self.shared_budget.stop_reason or "session_limit")
+            return False
         return self.stop_reason is None
 
     def reserve(self) -> bool:
@@ -1156,6 +1150,9 @@ class RunBudget:
         ):
             self.set_stop("max_total_requested_tokens")
             return False
+        if self.shared_budget is not None and not self.shared_budget.reserve():
+            self.set_stop(self.shared_budget.stop_reason or "session_limit")
+            return False
         self.requests_started += 1
         self.reserved_output_tokens += self.config.max_tokens
         self.in_flight += 1
@@ -1172,10 +1169,16 @@ class RunBudget:
         runtime = self._runtime_limit()
         if runtime:
             self.set_stop(runtime)
+        if self.shared_budget is not None:
+            self.shared_budget.record(result)
+            if self.shared_budget.stop_reason is not None:
+                self.set_stop(self.shared_budget.stop_reason)
 
     def record_cancelled(self) -> None:
         self.in_flight = max(0, self.in_flight - 1)
         self.requests_cancelled += 1
+        if self.shared_budget is not None:
+            self.shared_budget.record_cancelled()
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -1239,6 +1242,28 @@ async def _execute_reserved(
         raise
     budget.record(result)
     return result
+
+
+async def _cancel_reserved_tasks(
+    tasks: set[asyncio.Task[RequestResult]], budget: RunBudget
+) -> None:
+    """Cancel open-loop tasks and settle reservations that never started."""
+
+    cancelled_tasks = tuple(tasks)
+    for task in cancelled_tasks:
+        task.cancel()
+    await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
+    # A task cancelled before its first event-loop turn cannot enter
+    # _execute_reserved's CancelledError handler. All tasks owned by this block
+    # are terminal here, so any remaining local in-flight reservations belong
+    # to cancelled tasks that still need conservative cancellation accounting.
+    unaccounted = min(
+        budget.in_flight,
+        sum(task.cancelled() for task in cancelled_tasks),
+    )
+    for _ in range(unaccounted):
+        budget.record_cancelled()
 
 
 def _prompt_order(prompts: Prompts, seed: int) -> list[int]:
@@ -1397,18 +1422,15 @@ async def _run_open_block(
         # it before cancelling only the requests that are genuinely still live.
         harvest()
         if budget.stop_reason and tasks:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await _cancel_reserved_tasks(tasks, budget)
             tasks.clear()
         elif tasks:
             completed = await asyncio.gather(*tasks)
             results.extend(completed)
             tasks.clear()
     except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await _cancel_reserved_tasks(tasks, budget)
+        tasks.clear()
         raise
     wall = time.perf_counter() - started
     target_complete = (
@@ -2159,6 +2181,7 @@ async def run_native(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     progress: RunProgress | None = None,
+    shared_budget: RunBudget | None = None,
 ) -> dict[str, Any]:
     """Run native traffic with continuous hard-limit enforcement."""
 
@@ -2178,7 +2201,7 @@ async def run_native(
     report = _initial_report(config, checked_prompts, checked_warmups)
     progress = progress or RunProgress()
     progress.set(report)
-    budget = RunBudget(config)
+    budget = RunBudget(config, shared_budget=shared_budget)
     endpoint_url = normalize_chat_completions_url(
         config.endpoint.url, allow_insecure_http=config.allow_insecure_http
     )

@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,9 @@ from throttle.benchmark import (
     ARTIFACT_TYPE,
     BlockOutcome,
     RequestResult,
+    RunBudget,
     SCHEMA_VERSION,
+    _block_report,
     _best_tested,
     canonical_workload_hash,
     run_native,
@@ -702,6 +705,9 @@ def _golden_sequence(
         300,
         300,
     ),
+    *,
+    baseline_block_rates: tuple[float, float, float] = (10.0, 10.0, 10.0),
+    candidate_block_rates: tuple[float, float, float] = (12.0, 12.0, 12.0),
 ) -> list[dict[str, object]]:
     variants = (
         "baseline",
@@ -722,7 +728,7 @@ def _golden_sequence(
         baseline = variant == "baseline"
         reports.append(
             _saved_report(
-                (10.0, 10.0, 10.0) if baseline else (12.0, 12.0, 12.0),
+                baseline_block_rates if baseline else candidate_block_rates,
                 completion_tokens=completion_tokens,
                 flag_value="1" if baseline else "8",
                 evidence_source="live_inference",
@@ -1010,6 +1016,93 @@ class StatisticsAndBoundaryTests(unittest.TestCase):
 
 
 class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_budget_enforces_cumulative_limits_across_native_runs(
+        self,
+    ) -> None:
+        async def execute(
+            config: RunConfig,
+            shared_budget: RunBudget,
+            handler: object,
+        ) -> dict[str, object]:
+            return await run_native(
+                config,
+                PROMPTS,
+                WARMUPS,
+                transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
+                shared_budget=shared_budget,
+            )
+
+        for name, limits, expected_reason in (
+            (
+                "requests",
+                replace(_limits(), max_requests=2),
+                "max_requests",
+            ),
+            (
+                "tokens",
+                replace(
+                    _limits(),
+                    max_requests=10,
+                    max_total_requested_tokens=16,
+                ),
+                "max_total_requested_tokens",
+            ),
+        ):
+            with self.subTest(limit=name):
+                config = replace(_run_config(), limits=limits)
+                shared_budget = RunBudget(config)
+                calls = 0
+
+                def success(_: httpx.Request) -> httpx.Response:
+                    nonlocal calls
+                    calls += 1
+                    return _completion()
+
+                first = await execute(config, shared_budget, success)
+                second = await execute(config, shared_budget, success)
+                blocked = await execute(config, shared_budget, success)
+
+                self.assertEqual(first["status"], "complete")
+                self.assertEqual(second["status"], "complete")
+                self.assertNotEqual(blocked["status"], "complete")
+                self.assertEqual(blocked["stop_reason"], expected_reason)
+                self.assertEqual(calls, 2)
+                totals = shared_budget.public_dict()
+                self.assertEqual(totals["requests_started"], 2)
+                self.assertEqual(totals["requests_completed"], 2)
+                self.assertEqual(totals["reserved_output_tokens"], 16)
+                self.assertEqual(totals["errors"], 0)
+
+        error_config = replace(
+            _run_config(),
+            limits=replace(
+                _limits(),
+                max_requests=10,
+                max_total_requested_tokens=80,
+                max_errors=1,
+            ),
+        )
+        error_budget = RunBudget(error_config)
+        error_calls = 0
+
+        def fail(_: httpx.Request) -> httpx.Response:
+            nonlocal error_calls
+            error_calls += 1
+            return httpx.Response(500, json={"error": "deliberate test failure"})
+
+        failed = await execute(error_config, error_budget, fail)
+        blocked_after_error = await execute(error_config, error_budget, fail)
+
+        self.assertNotEqual(failed["status"], "complete")
+        self.assertEqual(failed["stop_reason"], "max_errors")
+        self.assertNotEqual(blocked_after_error["status"], "complete")
+        self.assertEqual(blocked_after_error["stop_reason"], "max_errors")
+        self.assertEqual(error_calls, 1)
+        error_totals = error_budget.public_dict()
+        self.assertEqual(error_totals["requests_started"], 1)
+        self.assertEqual(error_totals["requests_completed"], 1)
+        self.assertEqual(error_totals["errors"], 1)
+
     async def test_cuda_runtime_keeps_the_existing_image_and_driver_contract(
         self,
     ) -> None:
@@ -1515,10 +1608,10 @@ class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
             return _completion()
 
         config = _run_config(
-            conditions=(LoadCondition("open_loop", 100.0, 2),),
-            # Eight launch intervals are long enough to test the real asyncio
-            # scheduler without turning a ±1 ms, three-request timing sample
-            # into a flaky assertion on Python 3.14.
+            conditions=(LoadCondition("open_loop", 100.0, 8),),
+            # Keep enough in-flight capacity to test transport scheduling
+            # without making validity depend on a sub-100 ms host-clock sample.
+            # Target-rate reconciliation is tested deterministically below.
             requests_per_block=8,
         )
         report = await run_native(
@@ -1533,13 +1626,115 @@ class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(condition["target_offered_request_rate"], 100.0)
         self.assertIsNotNone(condition["achieved_offered_request_rate"])
         self.assertIsNotNone(condition["offered_rate_relative_error"])
-        self.assertTrue(condition["blocks"][0]["open_loop_target_achieved"])
         self.assertEqual(
             condition["metrics"]["e2e_latency_ms"]["p95_repeated_block_ci"]["method"],
             "student_t_blocks",
         )
-        self.assertLessEqual(report["run_totals"]["peak_in_flight"], 2)
+        self.assertLessEqual(report["run_totals"]["peak_in_flight"], 8)
         self.assertEqual(report["best_tested"]["field"], "best_tested_request_rate")
+
+    def test_open_loop_exact_offered_rate_is_reconciled_deterministically(
+        self,
+    ) -> None:
+        config = _run_config(
+            conditions=(LoadCondition("open_loop", 100.0, 8),),
+            requests_per_block=8,
+        )
+        results = [
+            RequestResult(
+                status_code=200,
+                e2e_seconds=0.01,
+                completion_tokens=1,
+                prompt_tokens=1,
+                finish_reason="stop",
+            )
+            for _ in range(8)
+        ]
+        report = _block_report(
+            BlockOutcome(
+                results=results,
+                wall_seconds=0.08,
+                complete=True,
+                scheduler_lag_seconds=[0.0] * 8,
+                offered_requests=8,
+                peak_in_flight=8,
+                target_offered_request_rate=100.0,
+                launch_window_seconds=0.07,
+            ),
+            config,
+            index=0,
+            seed=1,
+        )
+
+        self.assertAlmostEqual(report["achieved_offered_request_rate"], 100.0)
+        self.assertAlmostEqual(report["offered_rate_relative_error"], 0.0)
+        self.assertEqual(report["scheduler_lag_interval_ratio_p95"], 0.0)
+        self.assertTrue(report["open_loop_target_achieved"])
+
+    async def test_open_loop_prestart_backpressure_reconciles_cancellation(
+        self,
+    ) -> None:
+        async def handler(_: httpx.Request) -> httpx.Response:
+            return _completion()
+
+        config = _run_config(
+            conditions=(LoadCondition("open_loop", 100.0, 2),),
+            requests_per_block=8,
+        )
+        shared_budget = RunBudget(config)
+        real_create_task = asyncio.create_task
+        real_perf_counter = time.perf_counter
+        clock_offset = 0.0
+        task_count = 0
+
+        def perf_counter() -> float:
+            return real_perf_counter() + clock_offset
+
+        def create_task(coro: Any) -> asyncio.Task[Any]:
+            nonlocal clock_offset, task_count
+            task = real_create_task(coro)
+            task_count += 1
+            if task_count == 1:
+                # Model host preemption before the first reserved request gets
+                # an event-loop turn. Three arrivals are then due at once.
+                clock_offset = 0.035
+            return task
+
+        with (
+            patch(
+                "throttle.benchmark.time.perf_counter",
+                side_effect=perf_counter,
+            ),
+            patch(
+                "throttle.benchmark.asyncio.create_task",
+                side_effect=create_task,
+            ),
+        ):
+            report = await run_native(
+                config,
+                PROMPTS,
+                WARMUPS,
+                transport=httpx.MockTransport(handler),
+                shared_budget=shared_budget,
+            )
+
+        condition = report["conditions"][0]
+        self.assertEqual(report["status"], "stopped")
+        self.assertEqual(report["stop_reason"], "open_loop_backpressure")
+        self.assertFalse(report["decision_eligible"])
+        self.assertEqual(condition["request_counts"]["valid"], 0)
+        self.assertEqual(condition["blocks"][0]["offered_requests"], 2)
+        self.assertIn(
+            "open_loop_backpressure",
+            condition["blocks"][0]["invalid_reasons"],
+        )
+        self.assertEqual(report["run_totals"]["requests_started"], 2)
+        self.assertEqual(report["run_totals"]["requests_completed"], 0)
+        self.assertEqual(report["run_totals"]["requests_cancelled"], 2)
+        self.assertEqual(report["run_totals"]["requests_in_flight"], 0)
+        self.assertEqual(report["run_totals"]["peak_in_flight"], 2)
+        self.assertEqual(shared_budget.requests_cancelled, 2)
+        self.assertEqual(shared_budget.in_flight, 0)
 
     async def test_open_loop_missed_offered_rate_is_not_decision_grade(self) -> None:
         config = _run_config(
@@ -2274,6 +2469,36 @@ class GoldenProtocolTests(unittest.TestCase):
                 self.assertTrue(result["golden_protocol_eligible"])
                 self.assertEqual(result["eligibility_reasons"], [])
 
+    def test_golden_rejects_platform_runtime_drift_between_positions(self) -> None:
+        reports = _golden_sequence()
+        for report in reports:
+            _set_metal_runtime(report)
+        _set_platform_runtime(
+            reports[3],
+            backend="cpu",
+            accelerator="AMD EPYC 9654",
+            runtime_version="oneDNN 3.7.1",
+            host_os_version="Ubuntu 24.04 kernel 6.8.0",
+        )
+
+        result = validate_golden_sequence(reports)
+
+        self.assertEqual(result["status"], "ineligible")
+        self.assertFalse(result["golden_protocol_eligible"])
+        self.assertFalse(result["decision_eligible"])
+        self.assertIn(
+            "uncontrolled_or_missing_runtime_accelerator_backend",
+            result["eligibility_reasons"],
+        )
+        self.assertIn(
+            "uncontrolled_or_missing_runtime_accelerator",
+            result["eligibility_reasons"],
+        )
+        self.assertIn(
+            "uncontrolled_or_missing_runtime_software_environment_digest",
+            result["eligibility_reasons"],
+        )
+
     def test_golden_runtime_alias_mismatch_and_malformed_legacy_hash_fail_closed(
         self,
     ) -> None:
@@ -2314,6 +2539,32 @@ class GoldenProtocolTests(unittest.TestCase):
         self.assertEqual(result["optimization_credit"]["changed_flag"], "max_num_seqs")
         self.assertFalse(result["optimization_credit"]["chunked_prefill_credited"])
         self.assertEqual(len(result["run_fingerprints"]), 6)
+        summary = result["decision_summary"]
+        self.assertEqual(summary["winner"], "candidate")
+        self.assertEqual(summary["winner_config"], {"max_num_seqs": 8})
+        self.assertTrue(summary["ci_excludes_zero"])
+        self.assertIn("tested workload only", summary["text"])
+        self.assertIn("candidate throughput was 20.0% higher", summary["text"])
+        self.assertIn("95% CI", summary["text"])
+        self.assertIn("excludes zero", summary["text"])
+        self.assertIn("no latency SLO was declared", summary["text"])
+
+    def test_supported_golden_summary_orients_a_baseline_win_correctly(self) -> None:
+        result = validate_golden_sequence(
+            _golden_sequence(
+                baseline_block_rates=(12.0, 12.0, 12.0),
+                candidate_block_rates=(9.0, 9.0, 9.0),
+            )
+        )
+
+        self.assertTrue(result["decision_eligible"])
+        self.assertEqual(result["overall_outcome"], "baseline_higher_throughput")
+        summary = result["decision_summary"]
+        self.assertEqual(summary["winner"], "baseline")
+        self.assertEqual(summary["winner_config"], {"max_num_seqs": 1})
+        self.assertLess(summary["candidate_throughput_delta_percent"], 0)
+        self.assertIn("candidate throughput was 25.0% lower", summary["text"])
+        self.assertNotIn("25.0% higher", summary["text"])
 
     def test_golden_gate_recomputes_source_order_and_nonoverlap(self) -> None:
         reports = _golden_sequence()
@@ -2332,6 +2583,22 @@ class GoldenProtocolTests(unittest.TestCase):
             result["eligibility_reasons"],
         )
         self.assertIn("runs_overlap_or_are_out_of_order", result["eligibility_reasons"])
+
+    def test_supported_golden_summary_names_only_declared_slo_gates(self) -> None:
+        reports = _golden_sequence()
+        for report in reports:
+            report["manifest"]["traffic"]["p95_slo_ms"] = 100.0  # type: ignore[index]
+            report["manifest"]["traffic"]["ttft_slo_ms"] = 50.0  # type: ignore[index]
+
+        result = validate_golden_sequence(reports)
+
+        self.assertTrue(result["decision_eligible"])
+        summary = result["decision_summary"]
+        self.assertEqual(summary["declared_slo_gates_passed"], ["E2E", "TTFT"])
+        self.assertIn(
+            "all declared E2E and TTFT SLO gates passed", summary["text"]
+        )
+        self.assertNotIn("latency parity", summary["text"])
 
     def test_golden_rejects_false_or_missing_disjoint_warmup_evidence(self) -> None:
         for evidence in (False, "missing"):
@@ -2361,6 +2628,7 @@ class GoldenProtocolTests(unittest.TestCase):
         self.assertFalse(result["decision_eligible"])
         self.assertEqual(result["decision_state"], "inconclusive")
         self.assertIsNone(result["overall_outcome"])
+        self.assertIsNone(result["decision_summary"])
         condition = result["conditions"][0]
         self.assertEqual(condition["completion_token_relative_difference"], 0.0)
         self.assertGreater(

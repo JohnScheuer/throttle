@@ -26,6 +26,7 @@ from .provenance import (
     is_safe_public_metadata,
     runtime_preflight_reason,
     runtime_provenance_reasons,
+    validated_public_metadata_size,
 )
 from .statistics import (
     paired_relative_delta_interval_95,
@@ -35,6 +36,11 @@ from .statistics import (
 
 COMPARISON_ARTIFACT_TYPE = "throttle_comparison"
 MAX_REPORT_BYTES = 20_000_000
+MAX_REPORT_DEPTH = 64
+MAX_REPORT_NODES = 100_000
+MAX_REPORT_KEY_LENGTH = 1_024
+MAX_REPORT_STRING_LENGTH = 16_384
+MAX_REPORT_STRING_BYTES = MAX_REPORT_BYTES
 OUTPUT_TOKEN_TOLERANCE = 0.05
 MAX_SAFE_NUMERIC_MAGNITUDE = 9_007_199_254_740_991
 
@@ -54,6 +60,136 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError("duplicate JSON object key")
         output[key] = value
     return output
+
+
+def _parse_json_int(value: str) -> int:
+    if len(value.removeprefix("-")) > 16:
+        raise ComparisonInputError("report_structure_oversize_number")
+    parsed = int(value)
+    if abs(parsed) > MAX_SAFE_NUMERIC_MAGNITUDE:
+        raise ComparisonInputError("report_structure_oversize_number")
+    return parsed
+
+
+def _parse_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ComparisonInputError("report_structure_nonfinite_number")
+    if abs(parsed) > MAX_SAFE_NUMERIC_MAGNITUDE:
+        raise ComparisonInputError("report_structure_oversize_number")
+    return parsed
+
+
+def _utf8_size(value: str) -> int:
+    """Return encoded size without allocating an attacker-sized byte string."""
+
+    size = 0
+    for character in value:
+        codepoint = ord(character)
+        if codepoint <= 0x7F:
+            size += 1
+        elif codepoint <= 0x7FF:
+            size += 2
+        elif codepoint <= 0xFFFF:
+            size += 3
+        else:
+            size += 4
+    return size
+
+
+def validate_report_structure(
+    value: object, *, validate_strings: bool = True
+) -> str | None:
+    """Validate a bounded JSON tree iteratively and return a fixed reason code.
+
+    The root is depth zero and counts as one node. Dictionary keys count as
+    nodes as well as their values. Exact ``dict`` and ``list`` instances are
+    required so custom containers cannot execute code inside the trust boundary.
+    """
+
+    stack: list[tuple[object, int, bool]] = [(value, 0, False)]
+    active_containers: set[int] = set()
+    nodes = 0
+    string_bytes = 0
+    try:
+        while stack:
+            current, depth, leaving = stack.pop()
+            if leaving:
+                active_containers.remove(id(current))
+                continue
+
+            nodes += 1
+            if nodes > MAX_REPORT_NODES:
+                return "report_structure_too_large"
+            if depth > MAX_REPORT_DEPTH:
+                return "report_structure_too_deep"
+
+            current_type = type(current)
+            if current is None or current_type is bool:
+                continue
+            if current_type is int:
+                if abs(current) > MAX_SAFE_NUMERIC_MAGNITUDE:
+                    return "report_structure_oversize_number"
+                continue
+            if current_type is float:
+                if not math.isfinite(current):
+                    return "report_structure_nonfinite_number"
+                if abs(current) > MAX_SAFE_NUMERIC_MAGNITUDE:
+                    return "report_structure_oversize_number"
+                continue
+            if current_type is str:
+                if validate_strings:
+                    work_size = validated_public_metadata_size(
+                        current, max_length=MAX_REPORT_STRING_LENGTH
+                    )
+                    if work_size is None:
+                        return "report_structure_unsafe_string"
+                else:
+                    work_size = _utf8_size(current)
+                string_bytes += work_size
+                if string_bytes > MAX_REPORT_STRING_BYTES:
+                    return "report_structure_too_large"
+                continue
+            if current_type not in {dict, list}:
+                return "report_structure_non_json_type"
+
+            identity = id(current)
+            if identity in active_containers:
+                return "report_structure_cycle"
+            active_containers.add(identity)
+            stack.append((current, depth, True))
+
+            if current_type is list:
+                if nodes + len(current) > MAX_REPORT_NODES:
+                    return "report_structure_too_large"
+                stack.extend(
+                    (item, depth + 1, False) for item in reversed(current)
+                )
+                continue
+
+            if nodes + len(current) * 2 > MAX_REPORT_NODES:
+                return "report_structure_too_large"
+            for key, item in reversed(list(current.items())):
+                if type(key) is not str:
+                    return "report_structure_non_json_type"
+                if validate_strings:
+                    work_size = validated_public_metadata_size(
+                        key, max_length=MAX_REPORT_KEY_LENGTH
+                    )
+                    if work_size is None:
+                        return "report_structure_unsafe_string"
+                else:
+                    work_size = _utf8_size(key)
+                string_bytes += work_size
+                if string_bytes > MAX_REPORT_STRING_BYTES:
+                    return "report_structure_too_large"
+                nodes += 1
+                if nodes > MAX_REPORT_NODES:
+                    return "report_structure_too_large"
+                stack.append((item, depth + 1, False))
+    except RecursionError:
+        return "report_structure_too_deep"
+    return None
 
 
 def load_report(path: str | Path) -> dict[str, Any]:
@@ -77,6 +213,8 @@ def load_report(path: str | Path) -> dict[str, Any]:
             rendered,
             parse_constant=_reject_json_constant,
             object_pairs_hook=_unique_json_object,
+            parse_int=_parse_json_int,
+            parse_float=_parse_json_float,
         )
     except ComparisonInputError:
         raise
@@ -87,11 +225,16 @@ def load_report(path: str | Path) -> dict[str, Any]:
         ValueError,
         RecursionError,
     ) as exc:
+        if isinstance(exc, RecursionError):
+            raise ComparisonInputError("report_structure_too_deep") from exc
         raise ComparisonInputError(
             "saved report is unreadable or not valid JSON"
         ) from exc
     if not isinstance(parsed, dict):
         raise ComparisonInputError("saved report must contain a JSON object")
+    structure_reason = validate_report_structure(parsed)
+    if structure_reason is not None:
+        raise ComparisonInputError(structure_reason)
     return parsed
 
 
@@ -148,28 +291,15 @@ def _normalized_engine_flags(value: object) -> dict[str, str] | None:
         if (
             not isinstance(raw_name, str)
             or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", raw_name)
+            or not is_safe_public_metadata(raw_name, max_length=128)
             or any(
                 marker in raw_name.replace("_", "-").lower()
                 for marker in forbidden_name_markers
             )
-            or not isinstance(raw_value, str)
-            or not raw_value
-            or raw_value != raw_value.strip()
-            or len(raw_value) > 256
+            or not is_safe_public_metadata(raw_value)
         ):
             return None
-        lowered_value = raw_value.lower()
-        if any(
-            marker in lowered_value
-            for marker in (
-                "://",
-                "bearer ",
-                "authorization:",
-                "api_key",
-                "api-key",
-            )
-        ):
-            return None
+        assert isinstance(raw_value, str)
         name = raw_name.replace("_", "-").lower()
         if name in normalized:
             return None
@@ -988,10 +1118,20 @@ def _preflight_reason(report: Mapping[str, Any]) -> str | None:
 
 
 def _safe_preflight_reason(report: Mapping[str, Any]) -> str | None:
+    structure_reason = validate_report_structure(report, validate_strings=False)
+    if structure_reason is not None:
+        return structure_reason
+    if type(report) is not dict:
+        return "report_structure_non_json_type"
     try:
-        return _preflight_reason(report)
+        preflight_reason = _preflight_reason(report)
+    except RecursionError:
+        return "report_structure_too_deep"
     except (ArithmeticError, TypeError, ValueError):
         return "malformed_numeric_or_structural_evidence"
+    if preflight_reason is not None:
+        return preflight_reason
+    return validate_report_structure(report)
 
 
 _CONTROLLED_MANIFEST_PATHS: tuple[tuple[str, ...], ...] = (
