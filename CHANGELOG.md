@@ -2,6 +2,25 @@
 
 All notable changes to Throttle will be documented in this file.
 
+## [0.3.0] - 2026-08-17
+
+### Added
+- One-command, operator-mediated `throttle golden` orchestration for the
+  B1/C1/B2/C2/B3/C3 counterbalanced protocol, including a zero-traffic dry run
+  and sanitized partial-session evidence
+- A workload-scoped Golden decision summary that is emitted only when every
+  protocol and statistical eligibility gate passes
+- Warning-strict Python 3.11-3.14 CI, process-wide offline-network guards, and
+  clean-wheel/source-byte package verification
+
+### Changed
+- Multi-load benchmark sweeps now warn before key resolution or traffic that
+  their condition-major results are exploratory and cannot be decision-eligible
+- Smoke sessions default to a 120-second ceiling, sustained benchmarks retain
+  900 seconds, and Golden sessions use an explicit 5,400-second session ceiling
+- Golden live preflight is platform-neutral across CUDA, Metal, ROCm, and CPU
+  while preserving the stricter CUDA image/runtime requirements
+
 ## [0.2.1] - 2026-08-17
 
 ### Added

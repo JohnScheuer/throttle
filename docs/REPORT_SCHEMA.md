@@ -18,7 +18,17 @@ stop_reason          fixed sanitized code or null
 
 Comparison artifacts use `artifact_type: throttle_comparison`. Six-position
 golden artifacts use `artifact_type: throttle_golden_live_comparison` and add
-protocol eligibility/order-balanced contrasts.
+protocol eligibility/order-balanced contrasts. Supported, decision-eligible
+golden artifacts additionally include `decision_summary`; it is null for every
+ineligible or inconclusive result. A stopped orchestration writes
+`artifact_type: throttle_golden_session` with completed-position names and a
+fixed sanitized stop reason, never a recommendation.
+
+A supported `decision_summary` contains a fixed workload-scoped label, the
+winning variant and `max_num_seqs` value, the candidate-relative throughput
+delta, its order-balanced 95% interval/method, `ci_excludes_zero: true`, the
+declared SLO gates that passed, and the exact terminal summary text. It never
+contains a savings, optimum, or universal-performance claim.
 
 New run artifacts use runtime manifest `1.1`. It retains the manifest `1.0`
 CUDA keys for compatibility and adds an accelerator backend, generic

@@ -7,57 +7,105 @@ OpenAI-compatible chat-completions servers. It provisions nothing, changes
 nothing on the server, and never claims universal optimization or projected
 savings.
 
-## Features
+Throttle has five explicit workflows:
 
-Version 0.2 provides four operational modes:
-
-- **`throttle plan`** - Zero-traffic dry run showing destination, request/token limits, duration, cost bounds, and privacy implications
-- **`throttle smoke`** - Quick connectivity check with 27 calls across concurrency levels 1/4/8 (non-decision-grade)
-- **`throttle benchmark`** - Sustained load testing with repeated blocks using closed-loop concurrency or open-loop request rates
-- **`throttle compare`** - Offline comparison of saved runs with statistical confidence intervals
+- `throttle plan` sends zero traffic and shows the destination, request/token
+  ceilings, duration, cost bound, and privacy implications.
+- `throttle smoke` is a short connectivity/load-shape check. Its default is 27
+  calls: concurrency 1/4/8 × (8 measured + 1 separate warm-up). It is always
+  non-decision-grade.
+- `throttle benchmark` runs sustained, repeated blocks using closed-loop
+  concurrency or open-loop request rates. A multi-load sweep is exploratory:
+  its current condition-major order is not counterbalanced, so it cannot reach
+  `decision_eligible: true` even when every request succeeds.
+- `throttle golden` orchestrates the counterbalanced
+  B1/C1/B2/C2/B3/C3 protocol for a controlled baseline/candidate comparison.
+  This is the path for a decision-eligible configuration result.
+- `throttle compare` compares saved reports offline. Two inputs perform a
+  normal saved-run comparison; six ordered inputs validate the golden
+  B1/C1/B2/C2/B3/C3 protocol.
 
 Results describe only the declared workload and manifest.
 
-## Installation
+## Choose the right path first
 
-### Requirements
-- Python 3.11 or higher
-- An OpenAI-compatible inference endpoint
+Use a sweep to learn the shape of one server, and use the golden protocol to
+make a configuration decision. They answer different questions:
 
-### Quick Start
+| Goal | Command | Can reach `decision_eligible: true`? |
+| --- | --- | --- |
+| Check connectivity and response validity | `throttle smoke` | No |
+| Explore concurrency or request-rate levels | `throttle benchmark --concurrency 1 2 4 8 ...` | No |
+| Decide between one controlled baseline and candidate | `throttle golden ...` | Yes, if every protocol and evidence gate passes |
 
-Clone the repository and install the reviewed v0.2.1 wheel:
+A concurrency sweep is intentionally descriptive. It is useful for finding a
+region worth testing, but its load levels run in condition-major order and do
+not counterbalance time drift. Do not spend money on a sweep expecting its
+single-run report to become decision-eligible. Use `throttle golden --help`
+when the question is whether one verified server configuration beat another.
+
+## Try it safely
+
+Throttle requires Python 3.11+. Clone the public repository and install the
+reviewed v0.3.0 wheel:
 
 ```sh
 git clone https://github.com/KushagraKanaujia/throttle.git
 cd throttle
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./dist/throttle_bench-0.2.1-py3-none-any.whl
+python -m pip install ./dist/throttle_bench-0.3.0-py3-none-any.whl
 throttle --version
 ```
 
-The tracked v0.2.1 wheel contains the platform-neutral manifest implementation
-and is reviewed against the source in this checkout. The older tagged v0.2.0
-release predates the accelerator flags documented below.
-
-Run a zero-traffic plan before setting an API key or sending any load. Replace
-the model and HTTPS URL with the operator-approved staging destination:
+To install directly from the checked-out source instead:
 
 ```sh
-throttle plan \
-  --run-mode smoke \
-  --model YOUR_MODEL_ID \
-  --url https://inference.example/v1 \
-  --api-key-env VLLM_API_KEY \
-  --cost-model unknown
+python -m pip install .
 ```
 
+### Real staging endpoint: plan, then smoke
+
+This is the exact successful flow used against a real Qwen/vLLM GPU endpoint,
+with the private hostname and credential replaced. The `$0.53` rate is only an
+example—replace it with the operator's actual whole-instance hourly price.
+
+```bash
+# Zero traffic; the key does not need to exist yet.
+throttle plan \
+  --run-mode smoke \
+  --model Qwen/Qwen3-8B \
+  --url https://YOUR_APPROVED_STAGING_HOST/v1 \
+  --api-key-env VLLM_API_KEY \
+  --cost-model dedicated-hourly \
+  --gpus 1 \
+  --total-hourly-price 0.53
+
+# Populate the key without putting its value in shell history.
+read -rsp "Endpoint API key: " VLLM_API_KEY
+export VLLM_API_KEY
+printf '\n'
+
+throttle smoke \
+  --model Qwen/Qwen3-8B \
+  --url https://YOUR_APPROVED_STAGING_HOST/v1 \
+  --api-key-env VLLM_API_KEY \
+  --cost-model dedicated-hourly \
+  --gpus 1 \
+  --total-hourly-price 0.53 \
+  --output smoke.json
+
+unset VLLM_API_KEY
+```
+
+Smoke defaults to a 120-second whole-run ceiling; benchmark remains 900
+seconds. An explicit `--max-elapsed-seconds` always overrides the mode default.
+
 `plan` does not read `VLLM_API_KEY`, resolve DNS, construct an HTTP client, or
-send traffic. With unknown billing it deliberately reports that traffic is
-blocked until the operator explicitly acknowledges the unavailable spend
-calculation. Review the destination, request/token/time limits, cost model, and
-privacy warning before proceeding.
+send traffic. Review the destination, request/token/time limits, cost model,
+and privacy warning before proceeding. With unknown billing it deliberately
+blocks traffic until the operator explicitly acknowledges that the spend
+calculation is unavailable.
 
 For source development instead of the pre-built wheel, use
 `python -m pip install -e .` inside the clone.
@@ -119,7 +167,13 @@ Plain HTTP is accepted only for exact loopback hosts (`localhost`, `127/8`,
 use `trust_env=False` and do not follow redirects, so inherited proxy variables
 cannot silently receive a bearer key.
 
-## Decision-grade benchmark mode
+## Sustained benchmark evidence
+
+`throttle benchmark --concurrency 1 2 4 8 ...` collects strong repeated-block
+evidence at each load, but the sweep itself is exploratory and cannot reach
+`decision_eligible: true` because its condition order is not counterbalanced.
+Use its results to choose a treatment/load for `throttle golden`, not as the
+final configuration decision.
 
 The count-bounded defaults use three blocks of 67 valid requests per condition
 (201 measured requests), plus three separate warm-ups. A condition becomes
@@ -140,7 +194,7 @@ CUDA keeps the additional immutable container-image, CUDA, and driver
 requirements. Those fixed reasons are written under
 `decision_ineligible_reasons` instead of being hidden.
 
-Example pinned native run:
+Example pinned exploratory sweep:
 
 ```sh
 throttle benchmark \
@@ -170,7 +224,7 @@ throttle benchmark \
   --cost-model dedicated-hourly \
   --gpus 1 \
   --total-hourly-price 1.39 \
-  --output B1.json
+  --output exploratory-sweep.json
 ```
 
 Direct-host Metal, ROCm, and CPU runs use platform-neutral provenance instead
@@ -364,15 +418,76 @@ The controlled treatment implemented by the protocol is
 `max_num_seqs=1` versus `8`. Each golden position contains exactly one
 condition, `--concurrency 8`, so the workload actually exercises the treatment;
 lower exploratory load levels belong in separate reports. Everything else must
-remain pinned. On one GPU, run six non-overlapping native benchmarks in this
-exact order:
+remain pinned.
+
+`throttle golden` owns the complete B1/C1/B2/C2/B3/C3 measurement session and
+the final validation. It does **not** change server configuration: before each
+position it pauses, tells the operator which verified configuration is needed,
+and requires an exact confirmation. The operator changes/restarts the staging
+server in a separate terminal, verifies the effective runtime flag, and then
+lets Throttle continue.
+
+First inspect the complete six-run request/token/time/spend envelope without a
+key, DNS lookup, HTTP client, output directory, or traffic:
+
+```sh
+throttle golden --dry-run \
+  --model Qwen/Qwen3-8B \
+  --url https://inference.example/v1 \
+  --api-key-env VLLM_API_KEY \
+  --baseline-config max_num_seqs=1 \
+  --candidate-config max_num_seqs=8 \
+  --cost-model dedicated-hourly \
+  --gpus 1 \
+  --total-hourly-price 0.50 \
+  --cache-policy disabled \
+  --model-revision 0123456789abcdef0123456789abcdef01234567 \
+  --image-digest 'registry.example/vllm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  --gpu 'NVIDIA A100 80GB PCIe' \
+  --gpu-fingerprint 'operator-private-stable-device-id' \
+  --cuda-version 13.0 \
+  --driver-version 580.42 \
+  --server-version 0.27.1 \
+  --engine-flag enable_chunked_prefill=true \
+  --engine-flags-provenance runtime_verified \
+  --p95-slo-ms 5000 \
+  --ttft-slo-ms 1000 \
+  --evidence-source live_inference \
+  --output-dir golden-run-001
+```
+
+Replace those SLO examples with the operator's actual thresholds. A
+throughput-only golden decision is permitted when no latency SLO is declared,
+but the artifact says so explicitly and makes no latency claim.
+
+Remove `--dry-run` after reviewing the plan and setting the key locally. With
+the default 3 × 67 measured requests and three warm-ups, the command plans 204
+calls per position, 1,224 calls total, and 156,672 requested output tokens. The
+cumulative request, token, elapsed, error, and spend limits apply to the whole
+session; per-request size/token limits and the in-flight ceiling apply at every
+position. The default elapsed ceiling is 5,400 seconds. Choose a new output
+directory for every attempt—Throttle refuses to overwrite prior evidence.
+
+The v0.3 live orchestrator is deliberately count-bounded: it requires at least
+three blocks and 200 measured requests per position (the default 3 × 67 gives
+201). Duration-bounded golden evidence can still be produced with six manual
+`benchmark --block-seconds ...` reports and validated offline with `compare`.
+For session billing, use dedicated hourly, acknowledged unknown billing, or
+serverless rate limits without a pre-filled `--billed-active-seconds` total.
+`user-supplied` run totals and pre-filled serverless billed seconds are rejected
+because one value cannot truthfully describe all six position reports; attach
+the final provider total to the external audit record after the session.
+
+The command runs six non-overlapping native benchmarks in this exact order:
 
 ```text
 B1 → C1 → B2, then C2 → B3 → C3
 ```
 
 Each position itself uses at least three blocks and meets the 200-valid-request
-or 60-second floor per condition. Then validate and aggregate offline:
+floor. It writes `B1.json` through `C3.json`, then validates and writes
+`golden.json` automatically. The older offline form remains available for
+already-saved artifacts:
 
 ```sh
 throttle compare B1.json C1.json B2.json C2.json B3.json C3.json \
@@ -388,11 +503,19 @@ contrasts and retains the 5% completion-token guard across every position; a
 declared SLO must also hold in all six runs. See
 [the full protocol](docs/GOLDEN_PROTOCOL.md).
 
-Throttle never provisions or reconfigures the GPU/server. In this repository no
+Only when that complete gate passes and the order-balanced 95% interval
+excludes zero, the golden artifact and terminal add one clearly labelled,
+workload-scoped recommendation line naming the winning configuration and its
+candidate-relative throughput delta. It says which declared E2E/TTFT SLO gates
+passed; it never upgrades SLO compliance into a “latency parity” claim. An
+ineligible or inconclusive run has `decision_summary: null` and prints no
+recommendation.
+
+Throttle never provisions or reconfigures the accelerator/server. In this repository no
 server credentials or endpoint identifiers are retained. A sanitized completed
 six-position run is included under
 [`validation/golden-live-20260817`](validation/golden-live-20260817) as protocol
-evidence. It measures only its pinned model, GPU, workload, and test window; it
+evidence. It measures only its pinned model, accelerator, workload, and test window; it
 is not a universal performance, savings, or production recommendation.
 
 ## Report privacy and exit codes

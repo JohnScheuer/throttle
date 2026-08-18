@@ -7,16 +7,21 @@ import asyncio
 import json
 import math
 import os
+import queue
 import re
 import sys
+import threading
+import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from . import __version__
 from .benchmark import (
     ARTIFACT_TYPE,
     SCHEMA_VERSION,
+    RunBudget,
     RunProgress,
     build_plan,
     load_prompts,
@@ -24,12 +29,19 @@ from .benchmark import (
     validate_config,
 )
 from .compare import ComparisonInputError, compare_reports, load_report
-from .golden import validate_golden_sequence
+from .golden import (
+    GOLDEN_POSITIONS,
+    GOLDEN_SESSION_ARTIFACT_TYPE,
+    build_golden_plan,
+    golden_position_config,
+    validate_golden_sequence,
+)
 from .models import CostModel, EndpointConfig, LoadCondition, RunConfig, SafetyLimits
 from .provenance import ACCELERATOR_BACKENDS
 
 DEFAULT_OUTPUT = Path("throttle-report.json")
 DEFAULT_COMPARE_OUTPUT = Path("throttle-comparison.json")
+DEFAULT_GOLDEN_OUTPUT_DIR = Path("throttle-golden")
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 EXIT_OK = 0
@@ -37,6 +49,12 @@ EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_INCONCLUSIVE = 3
 EXIT_CANCELLED = 130
+
+EXPLORATORY_SWEEP_WARNING = (
+    "NOTE: this {kind} sweep is exploratory only and cannot reach "
+    "decision_eligible: true because its load order is not counterbalanced. "
+    "Use `throttle golden --help` for a decision-grade run."
+)
 
 
 def _positive_int(value: str) -> int:
@@ -154,7 +172,14 @@ def _add_safety_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-total-requested-tokens", type=_positive_int, default=2_000_000
     )
-    parser.add_argument("--max-elapsed-seconds", type=_positive_float, default=900.0)
+    parser.add_argument(
+        "--max-elapsed-seconds",
+        type=_positive_float,
+        help=(
+            "whole-run ceiling (default: 120 for smoke, 900 for benchmark, "
+            "5400 for the six-position golden session)"
+        ),
+    )
     parser.add_argument("--max-errors", type=_positive_int, default=1)
     parser.add_argument("--max-concurrency", type=_positive_int, default=64)
     parser.add_argument("--max-response-bytes", type=_positive_int, default=2_000_000)
@@ -260,10 +285,57 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
 
     benchmark = subparsers.add_parser(
-        "benchmark", help="run sustained repeated measurement blocks"
+        "benchmark",
+        help="run sustained exploratory evidence blocks (sweeps are not counterbalanced)",
     )
     _add_run_options(benchmark)
     benchmark.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+
+    golden = subparsers.add_parser(
+        "golden",
+        help="orchestrate the six-position counterbalanced decision protocol",
+        description=(
+            "Run B1/C1/B2/C2/B3/C3 against one endpoint/accelerator. Throttle pauses "
+            "for the operator to apply and verify each server configuration; it "
+            "never reconfigures the server itself."
+        ),
+        epilog=(
+            "Start with the same arguments plus --dry-run to inspect all six "
+            "positions and session ceilings without reading the API key or sending "
+            "traffic. See the Golden live protocol section in the project README "
+            "for the complete pinned example."
+        ),
+    )
+    _add_run_options(golden)
+    golden.add_argument(
+        "--baseline-config",
+        "--baseline-engine-flag",
+        dest="baseline_config",
+        required=True,
+        metavar="NAME=VALUE",
+        help="verified baseline treatment; currently exactly max_num_seqs=1",
+    )
+    golden.add_argument(
+        "--candidate-config",
+        "--candidate-engine-flag",
+        dest="candidate_config",
+        required=True,
+        metavar="NAME=VALUE",
+        help="verified candidate treatment; currently exactly max_num_seqs=8",
+    )
+    golden.add_argument(
+        "--dry-run",
+        "--plan",
+        dest="dry_run",
+        action="store_true",
+        help="show all six positions and session ceilings without reading a key or sending traffic",
+    )
+    golden.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_GOLDEN_OUTPUT_DIR,
+        help="new directory for B1.json through C3.json and golden.json",
+    )
 
     compare = subparsers.add_parser(
         "compare", help="compare two saved benchmark reports without network traffic"
@@ -366,7 +438,26 @@ def _resolve_key(parser: argparse.ArgumentParser, env_name: str) -> str:
 
 
 def _run_mode(args: argparse.Namespace) -> str:
-    return args.run_mode if args.command == "plan" else args.command
+    if args.command == "plan":
+        return args.run_mode
+    if args.command == "golden":
+        return "benchmark"
+    return args.command
+
+
+def _warn_if_exploratory_sweep(args: argparse.Namespace) -> None:
+    """Warn before config validation, key resolution, or benchmark traffic."""
+
+    if _run_mode(args) != "benchmark":
+        return
+    requested_levels = args.request_rate or args.concurrency or [1, 4, 8]
+    if len(requested_levels) > 1:
+        kind = "multi-request-rate" if args.request_rate else "multi-concurrency"
+        print(
+            EXPLORATORY_SWEEP_WARNING.format(kind=kind),
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _build_config(
@@ -397,7 +488,7 @@ def _build_config(
             for rate in args.request_rate
         )
     else:
-        concurrency = args.concurrency or [1, 4, 8]
+        concurrency = args.concurrency or ([8] if args.command == "golden" else [1, 4, 8])
         conditions = tuple(
             LoadCondition("closed_loop", float(level), level) for level in concurrency
         )
@@ -405,7 +496,15 @@ def _build_config(
         max_requests=args.max_requests,
         max_tokens_per_request=args.max_tokens_per_request,
         max_total_requested_tokens=args.max_total_requested_tokens,
-        max_elapsed_seconds=args.max_elapsed_seconds,
+        max_elapsed_seconds=(
+            args.max_elapsed_seconds
+            if args.max_elapsed_seconds is not None
+            else 5_400.0
+            if args.command == "golden"
+            else 120.0
+            if mode == "smoke"
+            else 900.0
+        ),
         max_errors=args.max_errors,
         max_concurrency=args.max_concurrency,
         max_response_bytes=args.max_response_bytes,
@@ -465,6 +564,18 @@ def _build_config(
 
 
 def _atomic_write(report: Mapping[str, Any], output: Path) -> None:
+    committed = _atomic_write_guarded(report, output, lambda: True)
+    if not committed:  # pragma: no cover - the unconditional guard is fixed true
+        raise RuntimeError("atomic_write_commit_guard_failed")
+
+
+def _atomic_write_guarded(
+    report: Mapping[str, Any],
+    output: Path,
+    commit_guard: Callable[[], bool],
+) -> bool:
+    """Stage and fsync JSON, then publish it only if the final guard still passes."""
+
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
@@ -477,8 +588,11 @@ def _atomic_write(report: Mapping[str, Any], output: Path) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        if not commit_guard():
+            return False
         os.replace(temporary, output)
-        os.chmod(output, 0o600)
+        return True
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -652,10 +766,16 @@ def _print_comparison(report: Mapping[str, Any], output: Path) -> None:
     print(f"Sanitized JSON comparison: {output}")
 
 
-def _print_golden(report: Mapping[str, Any], output: Path) -> None:
-    print(
-        "Throttle golden protocol validation (six sequential saved runs; no traffic sent)"
-    )
+def _print_golden(
+    report: Mapping[str, Any], output: Path, *, live_session: bool = False
+) -> None:
+    if live_session:
+        print("Throttle golden live result (six sequential measurements completed)")
+    else:
+        print(
+            "Throttle golden protocol validation "
+            "(six saved reports analyzed; no traffic sent)"
+        )
     print(f"Protocol eligible: {'yes' if report['golden_protocol_eligible'] else 'NO'}")
     if report["eligibility_reasons"]:
         print("Reasons: " + ", ".join(report["eligibility_reasons"]))
@@ -667,8 +787,203 @@ def _print_golden(report: Mapping[str, Any], output: Path) -> None:
             f"(95% CI {_metric(interval.get('low'))}% to {_metric(interval.get('high'))}%)"
         )
     print(f"Outcome: {report.get('overall_outcome') or 'inconclusive'}")
+    summary = report.get("decision_summary")
+    if report.get("decision_eligible") is True and isinstance(summary, Mapping):
+        print(str(summary["text"]))
     print(report["disclaimer"])
     print(f"Sanitized golden artifact: {output}")
+
+
+def _golden_config_flags(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    baseline = _engine_flags(parser, [args.baseline_config])[0]
+    candidate = _engine_flags(parser, [args.candidate_config])[0]
+    return baseline, candidate
+
+
+def _print_golden_plan(plan: Mapping[str, Any], output_dir: Path) -> None:
+    print("Throttle golden plan — ZERO TRAFFIC SENT")
+    print("Sequence: " + " → ".join(item["position"] for item in plan["positions"]))
+    print("Treatment: baseline max_num_seqs=1; candidate max_num_seqs=8")
+    print("Load: closed-loop concurrency 8 at every position")
+    measurement = plan["measurement"]
+    block_shape = (
+        f"{measurement['blocks_per_position']} blocks × "
+        f"{measurement['requests_per_block']} measured requests"
+        if measurement["requests_per_block"] is not None
+        else f"{measurement['blocks_per_position']} duration-bounded blocks"
+    )
+    print(
+        f"Per position: {block_shape}; "
+        f"{measurement['warmup_requests_per_position']} separate warm-ups; "
+        f"max {measurement['max_tokens_per_request']} output tokens/request"
+    )
+    if plan["session_requests"] is None:
+        print("Requests: duration-bounded; exact session count unavailable")
+        print("Requested output tokens: governed by the hard session token ceiling")
+    else:
+        print(
+            f"Requests: {plan['per_position_requests']} per position; "
+            f"{plan['session_requests']} across all six positions"
+        )
+        print(
+            f"Requested output tokens: {plan['per_position_requested_output_tokens']} "
+            f"per position; {plan['session_requested_output_tokens']} session ceiling"
+        )
+    print(
+        f"Whole-session elapsed ceiling: "
+        f"{float(plan['session_duration_limit_seconds']):.2f}s"
+    )
+    limits = plan["limits"]
+    print(
+        "Safety: "
+        f"max requests {limits['max_requests']}; errors {limits['max_errors']}; "
+        f"in-flight {limits['max_concurrency']}; response bytes "
+        f"{limits['max_response_bytes']}; request timeout "
+        f"{float(measurement['request_timeout_seconds']):.2f}s"
+    )
+    estimate = plan["session_estimated_cost_upper_bound"]
+    print(
+        "Whole-session estimated cost ceiling: unavailable for this billing model"
+        if estimate is None
+        else f"Whole-session estimated cost ceiling: ${float(estimate):.6f} USD"
+    )
+    if plan["spend_limit_enforceable"]:
+        print(
+            f"Whole-session max estimated spend: "
+            f"${float(plan['session_max_estimated_spend']):.6f} USD"
+        )
+    else:
+        print(
+            "Whole-session spend guard: NOT ENFORCEABLE for this billing model; "
+            "use a provider-side cap or auto-stop."
+        )
+    print(f"Destination: {plan['destination']['normalized_url']}")
+    print(f"Artifacts: {output_dir}/B1.json … C3.json and {output_dir}/golden.json")
+    print(
+        "Operator boundary: Throttle never reconfigures or restarts the server. "
+        "It pauses before every position for the operator to apply and verify the "
+        "required config."
+    )
+    print(
+        "Session guard: transition and inference time share the displayed client "
+        "deadline. Throttle cannot stop provider resources, so keep an independent "
+        "provider-side budget/auto-stop active."
+    )
+    print(
+        "Privacy: saved artifacts omit endpoint URLs, credentials, prompts, responses, "
+        "and the raw accelerator fingerprint."
+    )
+    reasons = plan["preflight_reasons"]
+    print(
+        "Decision-grade preflight: READY"
+        if not reasons
+        else "Decision-grade preflight: BLOCKED — " + ", ".join(reasons)
+    )
+
+
+def _golden_session_artifact(
+    *,
+    status: str,
+    reason: str,
+    completed_positions: Sequence[str],
+    saved_positions: Sequence[str],
+    elapsed_seconds: float,
+    estimated_cost: float | None,
+    run_totals: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    session_totals = dict(run_totals or {})
+    session_totals["elapsed_seconds"] = elapsed_seconds
+    session_totals["estimated_cost"] = estimated_cost
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": GOLDEN_SESSION_ARTIFACT_TYPE,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "golden_protocol_eligible": False,
+        "decision_eligible": False,
+        "decision_state": "inconclusive",
+        "stop_reason": reason,
+        "completed_positions": list(completed_positions),
+        "saved_positions": list(saved_positions),
+        "session_totals": session_totals,
+        "decision_summary": None,
+        "disclaimer": (
+            "This partial golden session is not decision-grade and cannot support a "
+            "configuration recommendation."
+        ),
+    }
+
+
+def _timed_operator_input(prompt: str, timeout_seconds: float) -> str:
+    """Read one confirmation while keeping the outer golden deadline enforceable."""
+
+    if timeout_seconds <= 0:
+        raise TimeoutError("golden_session_limit")
+    replies: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def read() -> None:
+        try:
+            replies.put((True, input(prompt)))
+        except BaseException as exc:  # forwarded to the main thread below
+            replies.put((False, exc))
+
+    reader = threading.Thread(target=read, name="throttle-golden-input", daemon=True)
+    reader.start()
+    try:
+        succeeded, value = replies.get(timeout=timeout_seconds)
+    except queue.Empty as exc:
+        raise TimeoutError("golden_session_limit") from exc
+    if not succeeded:
+        if isinstance(value, BaseException):
+            raise value
+        raise RuntimeError("operator_input_failed")
+    return str(value)
+
+
+def _golden_runtime_remaining(config: RunConfig, started: float) -> float:
+    elapsed = max(0.0, time.perf_counter() - started)
+    remaining = config.limits.max_elapsed_seconds - elapsed
+    spend_rate = config.cost.elapsed_estimate(1.0)
+    if spend_rate is not None and spend_rate > 0:
+        spent = config.cost.elapsed_estimate(elapsed) or 0.0
+        remaining = min(
+            remaining,
+            (config.limits.max_estimated_spend - spent) / spend_rate,
+        )
+    return remaining
+
+
+def _position_is_usable_for_golden(report: Mapping[str, Any]) -> bool:
+    conditions = report.get("conditions", [])
+    return bool(
+        report.get("status") == "complete"
+        and len(conditions) == 1
+        and conditions[0].get("valid") is True
+        and conditions[0].get("decision_grade") is True
+        and report.get("run_totals", {}).get("errors") == 0
+    )
+
+
+async def _run_golden_position(
+    config: RunConfig,
+    prompts: object,
+    warmup_prompts: object,
+    progress: RunProgress,
+    timeout_seconds: float,
+    session_budget: RunBudget,
+) -> dict[str, Any]:
+    return await asyncio.wait_for(
+        run_native(
+            config,
+            prompts,
+            warmup_prompts,
+            progress=progress,
+            shared_budget=session_budget,
+        ),  # type: ignore[arg-type]
+        timeout=timeout_seconds,
+    )
 
 
 def _failure_report(mode: str, code: str) -> dict[str, Any]:
@@ -785,9 +1100,234 @@ def _handle_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> in
     return EXIT_OK
 
 
+def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    baseline_flag, candidate_flag = _golden_config_flags(parser, args)
+    base, prompts, warmup_prompts = _build_config(parser, args, resolve_key=False)
+    plan = build_golden_plan(
+        base,
+        prompts,
+        warmup_prompts,
+        baseline_flag=baseline_flag,
+        candidate_flag=candidate_flag,
+    )
+    _print_golden_plan(plan, args.output_dir)
+    if args.dry_run:
+        return EXIT_OK
+    if plan["preflight_reasons"]:
+        print(
+            "Golden run blocked before key resolution or traffic; fix every preflight reason.",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    display_output_dir = args.output_dir.expanduser()
+    output_dir = display_output_dir.resolve()
+    if output_dir.exists():
+        print(
+            "Golden output directory already exists; choose a new --output-dir so "
+            "prior evidence is never overwritten.",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    # Resolve only the credential after the operator approves the plan. Reuse the
+    # exact preflighted config and immutable prompt tuples so a file change cannot
+    # swap the measured workload between plan and traffic.
+    api_key = _resolve_key(parser, args.api_key_env)
+    base = replace(
+        base,
+        endpoint=EndpointConfig(url=base.endpoint.url, api_key=api_key),
+    )
+    validate_config(base, for_traffic=True)
+    completed_reports: list[dict[str, Any]] = []
+    completed_positions: list[str] = []
+    saved_positions: list[str] = []
+    session_started = time.perf_counter()
+    session_budget = RunBudget(base, started=session_started)
+    aggregate_path = output_dir / "golden.json"
+    display_aggregate_path = display_output_dir / "golden.json"
+
+    def persist_session_failure(status: str, reason: str) -> int:
+        elapsed = max(0.0, time.perf_counter() - session_started)
+        artifact = _golden_session_artifact(
+            status=status,
+            reason=reason,
+            completed_positions=completed_positions,
+            saved_positions=saved_positions,
+            elapsed_seconds=elapsed,
+            estimated_cost=base.cost.elapsed_estimate(elapsed),
+            run_totals=session_budget.public_dict(),
+        )
+        print(f"Golden session stopped: {reason}.", file=sys.stderr)
+        try:
+            _atomic_write(artifact, aggregate_path)
+        except (OSError, TypeError, ValueError, OverflowError):
+            print(
+                "Sanitized partial session artifact could not be written; no "
+                "decision-grade result was produced.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Sanitized partial session artifact: {display_aggregate_path}",
+                file=sys.stderr,
+            )
+        return EXIT_CANCELLED if status == "cancelled" else EXIT_FAILED
+
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(output_dir, mode=0o700)
+        initial = _golden_session_artifact(
+            status="partial",
+            reason="awaiting_first_position",
+            completed_positions=(),
+            saved_positions=(),
+            elapsed_seconds=0.0,
+            estimated_cost=base.cost.elapsed_estimate(0.0),
+            run_totals=session_budget.public_dict(),
+        )
+        _atomic_write(initial, aggregate_path)
+    except FileExistsError:
+        print(
+            "Golden output directory was created concurrently; choose a new "
+            "--output-dir.",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    except (OSError, TypeError, ValueError, OverflowError):
+        print(
+            "Golden output directory could not be reserved and verified before "
+            "traffic; no requests were sent.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+
+    try:
+        for position, variant, max_num_seqs in GOLDEN_POSITIONS:
+            expected = f"{position} verified"
+            print()
+            print(
+                f"Position {position} — operator action required: apply {variant} config "
+                f"max_num_seqs={max_num_seqs}, restart if needed, and verify the "
+                "effective runtime value."
+            )
+            remaining = _golden_runtime_remaining(base, session_started)
+            if remaining <= 0:
+                return persist_session_failure("stopped", "golden_session_limit")
+            try:
+                confirmation = _timed_operator_input(
+                    f'Type "{expected}" to run this position: ', remaining
+                )
+            except TimeoutError:
+                return persist_session_failure("stopped", "golden_session_limit")
+            if confirmation.strip() != expected:
+                return persist_session_failure(
+                    "stopped", f"operator_confirmation_failed_{position}"
+                )
+            remaining = _golden_runtime_remaining(base, session_started)
+            if remaining <= 0:
+                return persist_session_failure("stopped", "golden_session_limit")
+            position_config = golden_position_config(
+                base,
+                position=position,
+                variant=variant,
+                max_num_seqs=max_num_seqs,
+            )
+            progress = RunProgress()
+            try:
+                report = asyncio.run(
+                    _run_golden_position(
+                        position_config,
+                        prompts,
+                        warmup_prompts,
+                        progress,
+                        remaining,
+                        session_budget,
+                    )
+                )
+            except TimeoutError:
+                report = progress.snapshot() or _failure_report(
+                    "benchmark", "golden_session_limit"
+                )
+                report["status"] = "stopped"
+                report["decision_eligible"] = False
+                report["stop_reason"] = "golden_session_limit"
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                report = progress.snapshot()
+                if report is not None:
+                    report["status"] = "cancelled"
+                    report["decision_eligible"] = False
+                    report["stop_reason"] = "cancelled_by_user"
+                    try:
+                        _atomic_write(report, output_dir / f"{position}.json")
+                    except (OSError, TypeError, ValueError, OverflowError):
+                        pass
+                    else:
+                        saved_positions.append(position)
+                return persist_session_failure("cancelled", "cancelled_by_user")
+            except Exception:
+                report = progress.snapshot() or _failure_report(
+                    "benchmark", "execution_failed"
+                )
+                report["status"] = "failed"
+                report["decision_eligible"] = False
+                report["stop_reason"] = "execution_failed"
+
+            position_path = output_dir / f"{position}.json"
+            display_position_path = display_output_dir / f"{position}.json"
+            try:
+                _atomic_write(report, position_path)
+            except (OSError, TypeError, ValueError, OverflowError):
+                return persist_session_failure(
+                    "stopped", f"position_{position}_report_write_failed"
+                )
+            saved_positions.append(position)
+            _print_run(report, display_position_path)
+            if not _position_is_usable_for_golden(report):
+                return persist_session_failure(
+                    "stopped", f"position_{position}_not_decision_grade"
+                )
+            completed_reports.append(report)
+            completed_positions.append(position)
+            if _golden_runtime_remaining(base, session_started) <= 0:
+                return persist_session_failure("stopped", "golden_session_limit")
+    except (KeyboardInterrupt, EOFError):
+        return persist_session_failure("cancelled", "cancelled_by_user")
+    except Exception:
+        return persist_session_failure("stopped", "golden_orchestration_failed")
+
+    try:
+        result = validate_golden_sequence(completed_reports)
+        if _golden_runtime_remaining(base, session_started) <= 0:
+            return persist_session_failure("stopped", "golden_session_limit")
+        elapsed = max(0.0, time.perf_counter() - session_started)
+        result["session_totals"] = {
+            **session_budget.public_dict(),
+            "elapsed_seconds": elapsed,
+            "estimated_cost": base.cost.elapsed_estimate(elapsed),
+            "completed_positions": completed_positions,
+        }
+        committed = _atomic_write_guarded(
+            result,
+            aggregate_path,
+            lambda: _golden_runtime_remaining(base, session_started) > 0,
+        )
+        if not committed:
+            return persist_session_failure("stopped", "golden_session_limit")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        return persist_session_failure("cancelled", "cancelled_by_user")
+    except Exception:
+        return persist_session_failure("stopped", "golden_validation_or_write_failed")
+    _print_golden(result, display_aggregate_path, live_session=True)
+    if not result["golden_protocol_eligible"]:
+        return EXIT_USAGE
+    return EXIT_OK if result["decision_eligible"] else EXIT_INCONCLUSIVE
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command in {"plan", "smoke", "benchmark"}:
+        _warn_if_exploratory_sweep(args)
     if args.command == "plan":
         config, prompts, warmup_prompts = _build_config(parser, args, resolve_key=False)
         plan = build_plan(config, prompts, warmup_prompts)
@@ -795,6 +1335,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_OK
     if args.command in {"smoke", "benchmark"}:
         return _handle_run(parser, args)
+    if args.command == "golden":
+        return _handle_golden(parser, args)
     if args.command == "compare":
         try:
             if len(args.reports) not in {2, 6}:
