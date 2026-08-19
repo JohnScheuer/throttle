@@ -79,16 +79,22 @@ successful optimization claim.
     engine-flag metadata. The Golden consumed-evidence fingerprint projection is
     versioned and must be updated whenever a future schema adds new decision
     evidence.
-14. **The experimental agent chain is deliberately disconnected.** The server
-    metrics collector, suggestion-only bottleneck analyzer, and independent
-    safety validator are importable internal components only. The validator
-    replays the current reviewed policy, binds an analysis to one metrics
-    window and explicit context, and emits a detached projection with all
-    eligibility, action, Golden-bypass, CLI-integration, and report-integration
-    flags locked false. It does not make exporter metrics request-scoped, prove
-    traffic isolation, prove scheduler saturation, run Golden, or authorize a
-    configuration change. Its detached projection includes only evidence used
-    by the analyzer; exposing other collector diagnostics later requires a new
+14. **The experimental agent chain has one isolated opt-in presenter.** The
+    server metrics collector, suggestion-only bottleneck analyzer, and
+    independent safety validator are reachable only through
+    `throttle experimental-tuning`; no default, benchmark, comparison, or
+    Golden path invokes them. The command writes an ordinary non-decision-grade
+    smoke report and a separate fixed envelope whose SHA-256 binds the detached
+    projection to that sanitized report. Every eligibility, action,
+    Golden-bypass, CLI-self-authorization, and report-integration flag remains
+    locked false. The digest proves file-content equality, not authorship. The
+    path does not make process-wide exporter metrics request-scoped, prove the
+    operator's same-deployment or traffic-isolation attestations, prove
+    scheduler saturation, run Golden, sign the two files, or authorize a
+    configuration change. Raw exporter snapshots and labels are intentionally
+    discarded, so the derived server signals cannot be independently
+    recomputed from the saved files. The projection includes only evidence used
+    by the analyzer; exposing other collector diagnostics requires a newly
     reviewed allowlist. Like any in-process Python API, it is a validation
     boundary for data, not a sandbox against code that can modify module
     internals.

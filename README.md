@@ -7,7 +7,7 @@ OpenAI-compatible chat-completions servers. It provisions nothing, changes
 nothing on the server, and never claims universal optimization or projected
 savings.
 
-Throttle has five explicit workflows:
+Throttle has six explicit workflows:
 
 - `throttle plan` sends zero traffic and shows the destination, request/token
   ceilings, duration, cost bound, and privacy implications.
@@ -18,6 +18,9 @@ Throttle has five explicit workflows:
   concurrency or open-loop request rates. A multi-load sweep is exploratory:
   its current condition-major order is not counterbalanced, so it cannot reach
   `decision_eligible: true` even when every request succeeds.
+- `throttle experimental-tuning` is an explicit, suggestion-only smoke run
+  that samples a configured vLLM Prometheus exporter. It never applies a
+  setting and cannot change decision or Golden eligibility.
 - `throttle golden` orchestrates the counterbalanced
   B1/C1/B2/C2/B3/C3 protocol for a controlled baseline/candidate comparison.
   This is the path for a decision-eligible configuration result.
@@ -36,6 +39,7 @@ make a configuration decision. They answer different questions:
 | --- | --- | --- |
 | Check connectivity and response validity | `throttle smoke` | No |
 | Explore concurrency or request-rate levels | `throttle benchmark --concurrency 1 2 4 8 ...` | No |
+| Generate one safety-audited candidate test value | `throttle experimental-tuning ...` | No |
 | Decide between one controlled baseline and candidate | `throttle golden ...` | Yes, if every protocol and evidence gate passes |
 
 A concurrency sweep is intentionally descriptive. It is useful for finding a
@@ -532,6 +536,91 @@ six-position 1-versus-8 run is included under
 evidence. It measures only its pinned model, accelerator, workload, and test window; it
 is not a universal performance, savings, or production recommendation.
 
+## Experimental suggestion-only tuning
+
+`throttle experimental-tuning` is a separate, explicitly opt-in path for one
+vLLM deployment. Existing `plan`, `smoke`, `benchmark`, `compare`, and `golden`
+behavior is unchanged. The command runs one ordinary native smoke workload
+while reading a separately supplied Prometheus URL, then passes the bounded
+metrics window and exploratory analysis through the independent safety
+boundary. It never changes the server. Throttle has no automatic telemetry or
+phone-home behavior; only this command reads the exporter, and only after the
+operator supplies `--metrics-url`.
+
+```sh
+throttle experimental-tuning \
+  --model Qwen/Qwen3-8B \
+  --url https://inference.example/v1 \
+  --metrics-url https://inference.example/metrics \
+  --api-key-env VLLM_API_KEY \
+  --concurrency 16 \
+  --engine-flag max_num_seqs=8 \
+  --engine-flag max_num_batched_tokens=2048 \
+  --engine-flags-provenance runtime_verified \
+  --attest-same-deployment-exclusive-metrics \
+  --cost-model dedicated-hourly \
+  --gpus 1 \
+  --total-hourly-price 0.50 \
+  --output experimental-smoke.json \
+  --experimental-output experimental-tuning.json
+```
+
+The command requires exactly one closed-loop concurrency and the two effective
+runtime flags shown above. It defaults to 201 measured requests plus three
+warm-ups so a normal run can clear the analyzer's minimum evidence count, but
+passing that floor does not make the evidence decision-grade. The default
+900-second limit applies to the traffic run; bounded exporter scrapes, safety
+analysis, and artifact writes add processing overhead outside that limit. Use
+`--attest-same-deployment-exclusive-metrics` only when the exporter belongs to
+the inference deployment under test and no unrelated inference traffic reaches
+it during the sampled window. If either fact is unknown, omit the flag; the
+result will fail closed as insufficient evidence instead of guessing. Exporter
+metrics are process-wide, and neither part of the attestation is independently
+proven.
+
+The metrics URL is never inferred from the inference URL. It must be explicit;
+the collector sends no authorization header or cookies, ignores ambient
+proxies, follows no redirects, permits plaintext only on exact loopback hosts,
+and retains neither the URL nor raw metric labels/body. This means an exporter
+that requires credentials is intentionally unsupported by this experimental
+path.
+
+Two mode-0600 artifacts remain separate:
+
+- `experimental-smoke.json` is an ordinary schema-2.0 `mode: smoke` report. Its
+  `decision_eligible` and condition `decision_grade` fields are false, and it
+  contains no experimental tuning fields.
+- `experimental-tuning.json` is a fixed experimental envelope containing the
+  detached safety-validated projection and a canonical SHA-256 binding to the
+  ordinary report. Inside that projection, decision eligibility, auto-apply,
+  configuration changes, Golden execution, Golden eligibility, and every
+  gate-bypass field are hard-locked false.
+
+Both parent directories must already exist and both output files must be new;
+the experimental command refuses to overwrite prior evidence. The report hash
+is an equality/linkability check, not a signature. It covers only the already
+sanitized ordinary artifact and does not add raw prompts, responses, endpoint
+details, or exporter labels.
+
+If collection or validation fails before a complete ordinary report exists,
+Throttle writes only a fixed sanitized failure artifact and no experimental
+envelope. It deliberately does not preserve unvalidated stage-owned partial
+fields.
+
+An emitted value is labelled as a candidate for another test, never a
+recommendation or guaranteed outcome. It changes only `max_num_seqs` by one
+bounded 25% search step. Before any configuration decision, the operator must
+run the separate six-position counterbalanced Golden protocol at the recorded
+offered concurrency. Reaching that client concurrency proves sufficient
+offered demand; it does not prove direct server-scheduler saturation.
+
+The deterministic evidence under
+[`validation/experimental-tuning-vllm-docs`](validation/experimental-tuning-vllm-docs)
+checks the full offline request/exporter/collector/analyzer/safety/serialization
+path against metric names and labels pinned to an official vLLM release. It is
+software compatibility evidence, not a live GPU benchmark, measured savings,
+or proof that the suggested value improves a deployment.
+
 ## Report privacy and exit codes
 
 Reports contain hashes and aggregate numeric evidence, not endpoint URLs,
@@ -546,6 +635,12 @@ enter a manifest; accelerator fingerprints are stored only as SHA-256.
 - `3`: valid but statistically/qualification-inconclusive benchmark or compare.
 - `130`: user cancellation with sanitized partial report.
 
+For `experimental-tuning`, `0` means a safety-audited candidate test value was
+available; `3` means the run was valid but evidence was insufficient or no
+clear signal existed. Neither exit code means a configuration decision. Stage
+failure returns `1`, usage/preflight failure returns `2`, and cancellation
+returns `130`.
+
 ## Test
 
 The suite is offline-only and blocks non-loopback DNS/socket use:
@@ -557,7 +652,9 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
 It covers modes, URL/proxy safety, response validation, streaming termination,
 hard stops, partial reports, cost separation, open/closed-loop scheduling,
 confidence and boundary logic, manifest tampering, saved comparisons, the
-GuideLLM subprocess boundary, and the six-run golden gate.
+GuideLLM subprocess boundary, the six-run golden gate, and the opt-in
+collector/analyzer/safety chain. Default commands are tested with collector
+bombs so they cannot accidentally start experimental metric collection.
 
 ## Explicitly deferred
 
