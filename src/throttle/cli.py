@@ -9,9 +9,12 @@ import math
 import os
 import queue
 import re
+import stat
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +31,20 @@ from .benchmark import (
     run_native,
     validate_config,
 )
-from .compare import ComparisonInputError, compare_reports, load_report
+from .compare import (
+    ComparisonInputError,
+    compare_reports,
+    load_report,
+)
+from .experimental_tuning import (
+    ExperimentalTuningError,
+    prepare_metrics_collector,
+    run_experimental_tuning,
+    validated_experimental_envelope,
+    validated_experimental_report,
+    validate_experimental_config,
+    validate_experimental_run_report,
+)
 from .golden import (
     GOLDEN_SESSION_ARTIFACT_TYPE,
     GoldenTreatmentError,
@@ -44,6 +60,7 @@ from .provenance import ACCELERATOR_BACKENDS
 DEFAULT_OUTPUT = Path("throttle-report.json")
 DEFAULT_COMPARE_OUTPUT = Path("throttle-comparison.json")
 DEFAULT_GOLDEN_OUTPUT_DIR = Path("throttle-golden")
+DEFAULT_EXPERIMENTAL_OUTPUT = Path("throttle-experimental-tuning.json")
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 EXIT_OK = 0
@@ -293,6 +310,61 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_options(benchmark)
     benchmark.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
 
+    experimental = subparsers.add_parser(
+        "experimental-tuning",
+        help="run an opt-in, suggestion-only server-metrics analysis",
+        description=(
+            "Same inference deployment; no unrelated inference traffic. Both "
+            "facts are operator-attested, not independently proven. Run one "
+            "native closed-loop smoke workload while polling one explicit vLLM "
+            "metrics exporter. Output is suggestion-only: it never changes "
+            "configuration, decision eligibility, or Golden eligibility."
+        ),
+        epilog=(
+            "Defaults: one smoke block with 201 measured requests, 3 separate "
+            "warm-ups, and a 900-second traffic-run ceiling, plus bounded "
+            "exporter-scrape and processing overhead. Supply exactly one "
+            "--concurrency and runtime-effective max_num_seqs and "
+            "max_num_batched_tokens engine flags."
+        ),
+    )
+    _add_run_options(experimental)
+    experimental.add_argument(
+        "--metrics-url",
+        required=True,
+        help=(
+            "explicit vLLM Prometheus endpoint; no credentials, redirects, "
+            "ambient proxies, or non-loopback plaintext are allowed"
+        ),
+    )
+    experimental.add_argument(
+        "--attest-same-deployment-exclusive-metrics",
+        action="store_true",
+        help=(
+            "attest that this exporter belongs to the same inference "
+            "deployment and that no unrelated inference traffic reaches it "
+            "during the sampled window; neither fact is independently proven"
+        ),
+    )
+    experimental.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        help=(
+            "ordinary schema-2.0 non-decision-grade smoke report; parent "
+            "directory must already exist and the create-only file must not exist"
+        ),
+    )
+    experimental.add_argument(
+        "--experimental-output",
+        type=Path,
+        default=DEFAULT_EXPERIMENTAL_OUTPUT,
+        help=(
+            "separate bound safety-validation envelope; parent directory "
+            "must already exist and the create-only file must not exist"
+        ),
+    )
+
     golden = subparsers.add_parser(
         "golden",
         help="orchestrate the six-position counterbalanced decision protocol",
@@ -450,6 +522,8 @@ def _run_mode(args: argparse.Namespace) -> str:
         return args.run_mode
     if args.command == "golden":
         return "benchmark"
+    if args.command == "experimental-tuning":
+        return "smoke"
     return args.command
 
 
@@ -479,6 +553,7 @@ def _build_config(
     tuple[tuple[dict[str, str], ...], ...],
 ]:
     mode = _run_mode(args)
+    experimental = args.command == "experimental-tuning"
     if args.backend == "guidellm" and args.guidellm_prompt_tokens is None:
         _parser_error(parser, "--backend guidellm requires --guidellm-prompt-tokens")
     if args.warmup_requests is not None and args.warmup_requests < 0:
@@ -486,10 +561,10 @@ def _build_config(
     blocks = args.blocks if args.blocks is not None else (1 if mode == "smoke" else 3)
     requests_per_block = args.requests_per_block
     if requests_per_block is None and args.block_seconds is None:
-        requests_per_block = 8 if mode == "smoke" else 67
+        requests_per_block = 201 if experimental else 8 if mode == "smoke" else 67
     warmups = args.warmup_requests
     if warmups is None:
-        warmups = 1 if mode == "smoke" else 3
+        warmups = 3 if experimental else 1 if mode == "smoke" else 3
     if args.request_rate:
         conditions = tuple(
             LoadCondition("open_loop", float(rate), args.open_loop_max_in_flight)
@@ -509,6 +584,8 @@ def _build_config(
             if args.max_elapsed_seconds is not None
             else 5_400.0
             if args.command == "golden"
+            else 900.0
+            if experimental
             else 120.0
             if mode == "smoke"
             else 900.0
@@ -571,10 +648,125 @@ def _build_config(
     return config, prompts, warmup_prompts
 
 
+def _copy_prompt_workload(
+    prompts: Sequence[Sequence[Mapping[str, str]]],
+) -> tuple[tuple[dict[str, str], ...], ...]:
+    """Detach a workload so a called stage cannot redefine CLI evidence."""
+
+    return tuple(
+        tuple(
+            {"role": message["role"], "content": message["content"]}
+            for message in messages
+        )
+        for messages in prompts
+    )
+
+
 def _atomic_write(report: Mapping[str, Any], output: Path) -> None:
     committed = _atomic_write_guarded(report, output, lambda: True)
     if not committed:  # pragma: no cover - the unconditional guard is fixed true
         raise RuntimeError("atomic_write_commit_guard_failed")
+
+
+def _atomic_write_new(report: Mapping[str, Any], output: Path) -> None:
+    """Atomically create a mode-0600 artifact without replacing evidence."""
+
+    output = output.expanduser().resolve()
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".throttle-experimental-",
+        suffix=".tmp",
+        dir=output.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(report, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.link(temporary, output)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _preflight_new_artifact_path(path: Path) -> Path:
+    """Validate one absent target and probe its existing parent safely."""
+
+    requested = path.expanduser()
+    if os.path.lexists(requested):
+        raise FileExistsError("experimental_output_already_exists")
+    expanded = requested.resolve(strict=False)
+    if os.path.lexists(expanded):
+        raise FileExistsError("experimental_output_already_exists")
+    parent_metadata = os.lstat(expanded.parent)
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise NotADirectoryError("experimental_output_parent_not_directory")
+    name_max = os.pathconf(expanded.parent, "PC_NAME_MAX")
+    if (
+        not expanded.name
+        or (name_max >= 0 and len(os.fsencode(expanded.name)) > name_max)
+    ):
+        raise OSError("experimental_output_name_too_long")
+
+    descriptor: int | None = None
+    temporary: Path | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".throttle-experimental-preflight-",
+            suffix=".tmp",
+            dir=expanded.parent,
+        )
+        temporary = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        created_identity = (metadata.st_dev, metadata.st_ino)
+        os.close(descriptor)
+        descriptor = None
+        current = os.lstat(temporary)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != created_identity
+        ):
+            raise OSError("experimental_output_probe_replaced")
+        os.unlink(temporary)
+        created_identity = None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created_identity is not None and temporary is not None:
+            try:
+                current = os.lstat(temporary)
+            except FileNotFoundError:
+                pass
+            else:
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and (current.st_dev, current.st_ino) == created_identity
+                ):
+                    os.unlink(temporary)
+    if os.path.lexists(expanded):
+        raise FileExistsError("experimental_output_already_exists")
+    return expanded
+
+
+def _experimental_output_paths_may_alias(left: Path, right: Path) -> bool:
+    """Conservatively catch common case-insensitive APFS leaf aliases."""
+
+    try:
+        same_parent = os.path.samefile(left.parent, right.parent)
+    except OSError:
+        return True
+    return same_parent and unicodedata.normalize("NFKC", left.name).casefold() == (
+        unicodedata.normalize("NFKC", right.name).casefold()
+    )
 
 
 def _atomic_write_guarded(
@@ -743,6 +935,49 @@ def _print_run(report: Mapping[str, Any], output: Path) -> None:
     )
     print(report["disclaimer"])
     print(f"Sanitized JSON report: {output}")
+
+
+def _print_experimental_tuning(
+    projection: Mapping[str, object],
+    output: Path,
+) -> None:
+    analysis = projection["analysis"]
+    assert isinstance(analysis, dict)
+    print("Throttle EXPERIMENTAL TUNING — SUGGESTION ONLY")
+    print("Safety boundary: passed")
+    print(
+        "Evidence scope: same-deployment matching and traffic isolation are "
+        "operator-attested, not independently proven; this does not prove "
+        "scheduler saturation or savings."
+    )
+    analysis_status = projection["analysis_status"]
+    print(f"Analysis status: {analysis_status}")
+    suggestion = analysis.get("suggestion")
+    if isinstance(suggestion, dict):
+        print(
+            "Candidate test only: max_num_seqs "
+            f"{suggestion['current_value']} -> "
+            f"{suggestion['candidate_test_value']}."
+        )
+        print(f"Hypothesis: {suggestion['hypothesis']}")
+        print(f"Risk: {suggestion['risk']}")
+    else:
+        reasons = (
+            analysis.get("quality_reasons")
+            if analysis_status == "insufficient_evidence"
+            else analysis.get("no_suggestion_reasons")
+        )
+        if isinstance(reasons, list) and reasons:
+            print("Suggestion unavailable: " + ", ".join(reasons))
+    print(
+        "Hard locks: decision eligible=false; auto-apply=false; "
+        "Golden performed=false; Golden eligible=false; changes applied=false."
+    )
+    print(
+        "Authorization boundary: this artifact cannot authorize its own CLI, "
+        "standard-report, Golden, or configuration path."
+    )
+    print(f"Sanitized experimental artifact: {output}")
 
 
 def _print_comparison(report: Mapping[str, Any], output: Path) -> None:
@@ -1082,6 +1317,272 @@ def _run_guidellm_backend(
     )
 
 
+def _write_experimental_failure(
+    args: argparse.Namespace,
+    *,
+    progress: RunProgress,
+    config: RunConfig,
+    prompts: Sequence[Sequence[Mapping[str, str]]],
+    warmup_prompts: Sequence[Sequence[Mapping[str, str]]],
+    cancelled: bool,
+) -> int:
+    code = "cancelled_by_user" if cancelled else "execution_failed"
+    report = progress.snapshot()
+    if type(report) is dict and report.get("status") == "complete":
+        try:
+            validate_experimental_run_report(
+                report,
+                config,
+                prompts=prompts,
+                warmup_prompts=warmup_prompts,
+            )
+        except Exception:
+            report = None
+    else:
+        report = None
+    if report is None:
+        report = _failure_report("smoke", code)
+        if cancelled:
+            report["status"] = "cancelled"
+    elif report.get("status") != "complete":
+        report["status"] = "cancelled" if cancelled else "failed"
+        report["decision_eligible"] = False
+        report["stop_reason"] = code
+    try:
+        _atomic_write_new(report, args.output)
+    except (OSError, TypeError, ValueError, OverflowError):
+        message = (
+            "Cancelled; sanitized smoke artifact could not be written."
+            if cancelled
+            else "Experimental tuning failed; sanitized smoke artifact could not "
+            "be written."
+        )
+        print(message, file=sys.stderr)
+        return EXIT_CANCELLED if cancelled else EXIT_FAILED
+    message = (
+        f"Cancelled; sanitized smoke artifact written to {args.output}."
+        if cancelled
+        else (
+            "Experimental tuning failed safely; sanitized smoke artifact written "
+            f"to {args.output}. No new experimental artifact was written."
+        )
+    )
+    print(message, file=sys.stderr)
+    return EXIT_CANCELLED if cancelled else EXIT_FAILED
+
+
+def _handle_experimental_tuning(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> int:
+    if args.backend != "native":
+        _parser_error(parser, "experimental_requires_native_backend")
+    if (
+        args.request_rate is not None
+        or args.concurrency is None
+        or len(args.concurrency) != 1
+    ):
+        _parser_error(
+            parser,
+            "experimental_requires_single_closed_loop_condition",
+        )
+    if args.blocks is not None and args.blocks != 1:
+        _parser_error(parser, "experimental_requires_one_block")
+    try:
+        ordinary_output = _preflight_new_artifact_path(args.output)
+        experimental_output = _preflight_new_artifact_path(
+            args.experimental_output
+        )
+    except FileExistsError:
+        _parser_error(parser, "experimental_output_already_exists")
+    except (OSError, RuntimeError):
+        _parser_error(parser, "experimental_output_path_invalid")
+    if _experimental_output_paths_may_alias(
+        ordinary_output, experimental_output
+    ):
+        _parser_error(parser, "experimental_outputs_must_be_separate")
+    args.output = ordinary_output
+    args.experimental_output = experimental_output
+
+    try:
+        collector = prepare_metrics_collector(args.metrics_url)
+    except ExperimentalTuningError as exc:
+        _parser_error(parser, exc.code)
+        raise AssertionError("argparse.error must terminate")  # pragma: no cover
+
+    config, prompts, warmup_prompts = _build_config(
+        parser,
+        args,
+        resolve_key=False,
+    )
+    try:
+        validate_experimental_config(config)
+    except ExperimentalTuningError as exc:
+        _parser_error(parser, exc.code)
+        raise AssertionError("argparse.error must terminate")  # pragma: no cover
+
+    evidence_prompts = _copy_prompt_workload(prompts)
+    evidence_warmup_prompts = _copy_prompt_workload(warmup_prompts)
+    runner_prompts = _copy_prompt_workload(prompts)
+    runner_warmup_prompts = _copy_prompt_workload(warmup_prompts)
+
+    pre_key_config = replace(
+        config,
+        endpoint=EndpointConfig(
+            url=config.endpoint.url,
+            api_key="experimental-preflight-only",
+        ),
+    )
+    try:
+        validate_config(pre_key_config, for_traffic=True)
+    except (ValueError, RuntimeError) as exc:
+        _parser_error(parser, str(exc))
+
+    api_key = _resolve_key(parser, args.api_key_env)
+    config = replace(
+        config,
+        endpoint=EndpointConfig(url=config.endpoint.url, api_key=api_key),
+    )
+    try:
+        validate_config(config, for_traffic=True)
+    except (ValueError, RuntimeError) as exc:
+        _parser_error(parser, str(exc))
+
+    progress = RunProgress()
+    traffic_scope = (
+        "operator_attested_exclusive"
+        if args.attest_same_deployment_exclusive_metrics
+        else "unconfirmed"
+    )
+    try:
+        outcome = asyncio.run(
+            run_experimental_tuning(
+                config,
+                runner_prompts,
+                runner_warmup_prompts,
+                collector=collector,
+                traffic_scope=traffic_scope,
+                progress=progress,
+                run_traffic=run_native,
+            )
+        )
+        ordinary_report = validated_experimental_report(
+            outcome,
+            config,
+            prompts=evidence_prompts,
+            warmup_prompts=evidence_warmup_prompts,
+        )
+        validated_experimental_envelope(
+            outcome,
+            config,
+            ordinary_report,
+            prompts=evidence_prompts,
+            warmup_prompts=evidence_warmup_prompts,
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        return _write_experimental_failure(
+            args,
+            progress=progress,
+            config=config,
+            prompts=evidence_prompts,
+            warmup_prompts=evidence_warmup_prompts,
+            cancelled=True,
+        )
+    except ExperimentalTuningError as exc:
+        print(f"Experimental safety stop: {exc.code}.", file=sys.stderr)
+        return _write_experimental_failure(
+            args,
+            progress=progress,
+            config=config,
+            prompts=evidence_prompts,
+            warmup_prompts=evidence_warmup_prompts,
+            cancelled=False,
+        )
+    except Exception:
+        print(
+            "Experimental safety stop: experimental_internal_failure.",
+            file=sys.stderr,
+        )
+        return _write_experimental_failure(
+            args,
+            progress=progress,
+            config=config,
+            prompts=evidence_prompts,
+            warmup_prompts=evidence_warmup_prompts,
+            cancelled=False,
+        )
+
+    try:
+        _atomic_write_new(ordinary_report, args.output)
+    except (OSError, TypeError, ValueError, OverflowError):
+        print(
+            "Experimental measurement finished but the smoke report could not "
+            "be written; no experimental artifact was written.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+    try:
+        envelope = validated_experimental_envelope(
+            outcome,
+            config,
+            ordinary_report,
+            prompts=evidence_prompts,
+            warmup_prompts=evidence_warmup_prompts,
+        )
+        _atomic_write_new(envelope, args.experimental_output)
+    except (
+        ExperimentalTuningError,
+        OSError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        print(
+            "The smoke report was written, but the audited experimental artifact "
+            "could not be written.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+
+    try:
+        envelope = validated_experimental_envelope(
+            outcome,
+            config,
+            ordinary_report,
+            prompts=evidence_prompts,
+            warmup_prompts=evidence_warmup_prompts,
+        )
+        projection = envelope["safety_projection"]
+        if type(projection) is not dict:
+            raise TypeError("invalid experimental projection")
+        _print_run(ordinary_report, args.output)
+        _print_experimental_tuning(
+            projection,
+            args.experimental_output,
+        )
+    except (
+        ExperimentalTuningError,
+        KeyError,
+        TypeError,
+        ValueError,
+        ArithmeticError,
+    ):
+        print(
+            "Audited artifacts were written, but terminal rendering failed safely.",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+    if ordinary_report.get("status") != "complete" or any(
+        not condition.get("valid")
+        for condition in ordinary_report.get("conditions", [])
+    ):
+        return EXIT_FAILED
+    return (
+        EXIT_OK
+        if projection.get("analysis_status") == "suggestion_available"
+        else EXIT_INCONCLUSIVE
+    )
+
+
 def _handle_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     config, prompts, warmup_prompts = _build_config(parser, args, resolve_key=True)
     progress = RunProgress()
@@ -1401,6 +1902,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_OK
     if args.command in {"smoke", "benchmark"}:
         return _handle_run(parser, args)
+    if args.command == "experimental-tuning":
+        return _handle_experimental_tuning(parser, args)
     if args.command == "golden":
         return _handle_golden(parser, args)
     if args.command == "compare":
