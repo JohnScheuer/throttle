@@ -30,6 +30,14 @@ Throttle has six explicit workflows:
 
 Results describe only the declared workload and manifest.
 
+## Proven Results
+
+Throttle has one decision-eligible result: a six-position counterbalanced Golden protocol run on Qwen2.5-0.5B-Instruct with vLLM 0.16.0 on an A100 80GB GPU. Changing `max_num_seqs` from 1 to 8 produced a measured **+189.5% to +246.2%** throughput increase (95% CI) at closed-loop concurrency 8. This result passed all protocol gates and is `decision_eligible: true`.
+
+Throttle has also been tested against four open-source inference engines (vLLM, SGLang, Ollama, LMDeploy) to validate cross-stack compatibility.
+
+**See [RESULTS.md](RESULTS.md) for the full validated evidence**, including exact numbers, hardware details, protocol audit, and limitations. All claims trace to specific JSON artifacts in `validation/`.
+
 ## Choose the right path first
 
 Use a sweep to learn the shape of one server, and use the golden protocol to
