@@ -16,20 +16,31 @@ validates the gate and comparison mechanics independently.
 
 ## Controlled question
 
-Test one change the workload can exercise:
+Test one change the workload can exercise. Both values must be distinct,
+canonical positive integers: ASCII decimal digits without a sign, whitespace,
+or leading zero, in the range 1 through 2,147,483,647.
 
 ```text
-baseline:  max_num_seqs=1
-candidate: max_num_seqs=8
+baseline:  max_num_seqs=8
+candidate: max_num_seqs=10
 ```
 
-Each golden position tests exactly one condition: closed-loop concurrency 8.
-Lower concurrency levels are useful exploratory controls, but they cannot
-exercise the whole 1-versus-8 treatment and therefore belong in separate
-benchmark reports, not the six golden positions. `256` versus `2048` at
-concurrency 8 is rejected as unexercised. Chunked
-prefill must have the same effective state on both variants and receives no
-credit; vLLM V1 already enables it by default when possible.
+Each golden position tests exactly one closed-loop condition. Its declared
+client concurrency must be at least `max(baseline, candidate)`, and every
+position must actually reach that declared level. Use the analyzer's original
+offered concurrency when it is higher; the example pair above can therefore be
+tested at concurrency 16. If no concurrency is supplied, the one-command flow
+defaults to the larger treatment value. Lower concurrency levels are useful
+exploratory controls, but they cannot exercise the whole treatment and belong
+in separate benchmark reports. `256` versus `2048` at concurrency 8 is rejected
+as unexercised. Chunked prefill must have the same effective state on both
+variants and receives no credit; vLLM V1 already enables it by default when
+possible.
+
+This exercise check is deliberately client-scoped. Reaching the declared
+concurrency proves sufficient offered demand; it does not prove direct
+server-scheduler saturation or that `max_num_seqs` sequences were scheduled at
+the same instant.
 
 ## Immutable/common controls
 
@@ -85,12 +96,12 @@ The six reports must not overlap. Use exactly these manifest values:
 
 | Position | `--variant` | `--sequence-position` | `max_num_seqs` |
 | --- | --- | --- | --- |
-| B1 | baseline | B1 | 1 |
-| C1 | candidate | C1 | 8 |
-| B2 | baseline | B2 | 1 |
-| C2 | candidate | C2 | 8 |
-| B3 | baseline | B3 | 1 |
-| C3 | candidate | C3 | 8 |
+| B1 | baseline | B1 | baseline value |
+| C1 | candidate | C1 | candidate value |
+| B2 | baseline | B2 | baseline value |
+| C2 | candidate | C2 | candidate value |
+| B3 | baseline | B3 | baseline value |
+| C3 | candidate | C3 | candidate value |
 
 ## One-command orchestration
 
@@ -101,8 +112,9 @@ throttle golden --dry-run \
   --model Qwen/Qwen3-8B \
   --url https://inference.example/v1 \
   --api-key-env VLLM_API_KEY \
-  --baseline-config max_num_seqs=1 \
-  --candidate-config max_num_seqs=8 \
+  --baseline-config max_num_seqs=8 \
+  --candidate-config max_num_seqs=10 \
+  --concurrency 16 \
   --cost-model dedicated-hourly \
   --gpus 1 \
   --total-hourly-price 0.50 \
@@ -165,18 +177,20 @@ and for validating six already-saved reports. An individual position uses:
 Example position-specific suffix:
 
 ```sh
---concurrency 8 \
+--concurrency 16 \
 --variant baseline \
 --sequence-position B1 \
---engine-flag max_num_seqs=1 \
+--engine-flag max_num_seqs=8 \
 --engine-flag enable_chunked_prefill=true \
 --engine-flags-provenance runtime_verified \
 --evidence-source live_inference \
 --output B1.json
 ```
 
-The candidate uses the same command except `candidate`, `C1`, `8`, and its
+The candidate uses the same command except `candidate`, `C1`, `10`, and its
 output name. Repeat all six positions while preserving every other argument.
+The offline validator independently infers the two values from the
+runtime-verified effective flags; it does not trust a separate declaration.
 
 ## Validate and compare
 
@@ -211,13 +225,16 @@ not an optimum.
 
 When—and only when—the protocol is eligible and statistically supported,
 `golden.json` adds a structured `decision_summary` and the terminal prints its
-single `Golden recommendation — tested workload only` line. It names
-`max_num_seqs=1` or `8`, reports the candidate-relative throughput delta and
-order-balanced 95% interval, states that the interval excludes zero, and lists
-the declared E2E/TTFT SLO gates that passed. It does not claim latency parity,
-cost savings, an optimum, or generality beyond the pinned workload. Ineligible
-and statistically inconclusive sessions keep `decision_summary: null` and emit
-no recommendation.
+single `Golden recommendation — tested workload only` line. It names the
+inferred winning `max_num_seqs` value, reports the candidate-relative
+throughput delta and order-balanced 95% interval, states that the interval
+excludes zero, and lists the declared E2E/TTFT SLO gates that passed. It does
+not claim latency parity, server saturation, cost savings, an optimum, or
+generality beyond the pinned workload. Every structurally valid complete
+comparison includes a sanitized `treatment` block with the inferred pair and
+common client concurrency, including when the interval is inconclusive.
+Ineligible and statistically inconclusive sessions keep
+`decision_summary: null` and emit no recommendation.
 
 ## Evidence boundary
 
@@ -227,3 +244,6 @@ independently prove operator-supplied hardware/runtime attestations. Keep the
 provider allocation record, image inspection, model commit, effective server
 startup/config output, and billing record in an operator-controlled audit
 bundle. Never paste secrets or raw model content into the Throttle report.
+
+The checked-in `validation/golden-live-20260817` artifact remains a valid
+historical 1-versus-8 instance of this generalized protocol.

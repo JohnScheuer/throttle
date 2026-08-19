@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 from . import __version__
 from .benchmark import SCHEMA_VERSION, build_plan
 from .compare import _condition_map, _path, _safe_preflight_reason
-from .models import LoadCondition, RunConfig
+from .models import RunConfig
 from .provenance import (
     CURRENT_MANIFEST_VERSION,
     LEGACY_RUNTIME_CONTROLLED_PATHS,
@@ -26,20 +26,120 @@ from .statistics import relative_delta_percent, t_interval_95
 GOLDEN_ARTIFACT_TYPE = "throttle_golden_live_comparison"
 GOLDEN_SESSION_ARTIFACT_TYPE = "throttle_golden_session"
 RUN_FINGERPRINT_BASIS = "validated_consumed_evidence_projection_v1"
-GOLDEN_POSITIONS = (
-    ("B1", "baseline", 1),
-    ("C1", "candidate", 8),
-    ("B2", "baseline", 1),
-    ("C2", "candidate", 8),
-    ("B3", "baseline", 1),
-    ("C3", "candidate", 8),
+GOLDEN_SEQUENCE = (
+    ("B1", "baseline"),
+    ("C1", "candidate"),
+    ("B2", "baseline"),
+    ("C2", "candidate"),
+    ("B3", "baseline"),
+    ("C3", "candidate"),
 )
-EXPECTED_VARIANTS = tuple(variant for _, variant, _ in GOLDEN_POSITIONS)
+EXPECTED_VARIANTS = tuple(variant for _, variant in GOLDEN_SEQUENCE)
 IMMUTABLE_REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+CANONICAL_POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
+MAX_GOLDEN_MAX_NUM_SEQS = 2_147_483_647
+
+
+class GoldenTreatmentError(ValueError):
+    """A fixed-code treatment error that never reflects caller input."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 def _normalized_flag_name(name: str) -> str:
     return name.replace("_", "-").lower()
+
+
+def _canonical_positive_integer(value: object) -> int | None:
+    if (
+        type(value) is not str
+        or len(value) > 10
+        or not CANONICAL_POSITIVE_INTEGER.fullmatch(value)
+    ):
+        return None
+    parsed = int(value)
+    if parsed > MAX_GOLDEN_MAX_NUM_SEQS:
+        return None
+    return parsed
+
+
+def parse_golden_treatment_flags(
+    baseline_flag: tuple[str, str], candidate_flag: tuple[str, str]
+) -> tuple[int, int]:
+    """Return one sanitized ``max_num_seqs`` pair or a fixed-code error."""
+
+    if (
+        type(baseline_flag) is not tuple
+        or type(candidate_flag) is not tuple
+        or len(baseline_flag) != 2
+        or len(candidate_flag) != 2
+    ):
+        raise GoldenTreatmentError("golden_treatment_flags_malformed")
+    baseline_name, baseline_raw = baseline_flag
+    candidate_name, candidate_raw = candidate_flag
+    if type(baseline_name) is not str or type(candidate_name) is not str:
+        raise GoldenTreatmentError(
+            "golden_treatment_must_only_change_max_num_seqs"
+        )
+    if type(baseline_raw) is not str or type(candidate_raw) is not str:
+        raise GoldenTreatmentError(
+            "golden_max_num_seqs_values_must_be_canonical_positive_integers"
+        )
+    if (
+        _normalized_flag_name(baseline_name) != "max-num-seqs"
+        or _normalized_flag_name(candidate_name) != "max-num-seqs"
+    ):
+        raise GoldenTreatmentError(
+            "golden_treatment_must_only_change_max_num_seqs"
+        )
+    baseline = _canonical_positive_integer(baseline_raw)
+    candidate = _canonical_positive_integer(candidate_raw)
+    if baseline is None or candidate is None:
+        raise GoldenTreatmentError(
+            "golden_max_num_seqs_values_must_be_canonical_positive_integers"
+        )
+    if baseline == candidate:
+        raise GoldenTreatmentError(
+            "golden_max_num_seqs_values_must_be_distinct"
+        )
+    return baseline, candidate
+
+
+def golden_positions(
+    baseline_max_num_seqs: int, candidate_max_num_seqs: int
+) -> tuple[tuple[str, str, int], ...]:
+    """Materialize the fixed six-position order for one validated treatment pair."""
+
+    if (
+        type(baseline_max_num_seqs) is not int
+        or type(candidate_max_num_seqs) is not int
+        or baseline_max_num_seqs <= 0
+        or candidate_max_num_seqs <= 0
+        or baseline_max_num_seqs > MAX_GOLDEN_MAX_NUM_SEQS
+        or candidate_max_num_seqs > MAX_GOLDEN_MAX_NUM_SEQS
+    ):
+        raise GoldenTreatmentError(
+            "golden_max_num_seqs_values_must_be_canonical_positive_integers"
+        )
+    if baseline_max_num_seqs == candidate_max_num_seqs:
+        raise GoldenTreatmentError(
+            "golden_max_num_seqs_values_must_be_distinct"
+        )
+    values = {
+        "baseline": baseline_max_num_seqs,
+        "candidate": candidate_max_num_seqs,
+    }
+    return tuple(
+        (position, variant, values[variant])
+        for position, variant in GOLDEN_SEQUENCE
+    )
+
+
+# Kept as the historical 1-versus-8 sequence for import compatibility. Live
+# orchestration and planning materialize positions from the requested pair.
+GOLDEN_POSITIONS = golden_positions(1, 8)
 
 
 def golden_position_config(
@@ -47,10 +147,11 @@ def golden_position_config(
 ) -> RunConfig:
     """Build one immutable position config without changing the endpoint."""
 
+    # Preserve the preflighted client load exactly. A reached client
+    # concurrency is demand evidence, not proof of server-scheduler saturation.
     return replace(
         base,
         mode="benchmark",
-        conditions=(LoadCondition("closed_loop", 8.0, 8),),
         variant=variant,
         sequence_position=position,
         engine_flags=base.engine_flags + (("max_num_seqs", str(max_num_seqs)),),
@@ -68,18 +169,40 @@ def golden_preflight_reasons(
     """Return every condition that would make a live golden session ineligible."""
 
     reasons: list[str] = []
+    try:
+        baseline_value, candidate_value = parse_golden_treatment_flags(
+            baseline_flag, candidate_flag
+        )
+    except GoldenTreatmentError as exc:
+        reasons.append(exc.code)
+        baseline_value, candidate_value = 1, 8
     if base.backend != "native":
         reasons.append("golden_requires_native_backend")
     if base.stream is not True:
         reasons.append("golden_requires_streaming")
-    if base.conditions != (LoadCondition("closed_loop", 8.0, 8),):
-        reasons.append("golden_requires_only_closed_loop_concurrency_8")
+    if (
+        len(base.conditions) != 1
+        or base.conditions[0].kind != "closed_loop"
+        or not float(base.conditions[0].value).is_integer()
+        or base.conditions[0].max_in_flight != int(base.conditions[0].value)
+    ):
+        reasons.append("golden_requires_one_closed_loop_concurrency")
+    elif int(base.conditions[0].value) < max(baseline_value, candidate_value):
+        reasons.append("golden_concurrency_must_reach_both_max_num_seqs_values")
     if base.blocks < 3:
         reasons.append("golden_requires_at_least_three_blocks")
     if base.requests_per_block is None:
         reasons.append("golden_orchestrator_requires_count_bounded_blocks")
     elif base.blocks * base.requests_per_block < 200:
         reasons.append("golden_requires_at_least_200_measured_requests_per_position")
+    if (
+        base.requests_per_block is not None
+        and len(base.conditions) == 1
+        and base.conditions[0].kind == "closed_loop"
+        and float(base.conditions[0].value).is_integer()
+        and base.requests_per_block < int(base.conditions[0].value)
+    ):
+        reasons.append("golden_requests_per_block_must_reach_declared_concurrency")
     if base.warmup_requests_per_condition <= 0:
         reasons.append("golden_requires_separate_warmup_requests")
     if base.limits.max_errors != 1:
@@ -102,15 +225,6 @@ def golden_preflight_reasons(
     if base.server_version == "unknown":
         reasons.append("golden_requires_server_version")
 
-    baseline_name, baseline_value = baseline_flag
-    candidate_name, candidate_value = candidate_flag
-    if (
-        _normalized_flag_name(baseline_name) != "max-num-seqs"
-        or _normalized_flag_name(candidate_name) != "max-num-seqs"
-        or baseline_value != "1"
-        or candidate_value != "8"
-    ):
-        reasons.append("golden_treatment_must_be_max_num_seqs_1_vs_8")
     if any(
         _normalized_flag_name(name) == "max-num-seqs"
         for name, _ in base.engine_flags
@@ -140,7 +254,10 @@ def golden_preflight_reasons(
 
     position_plan = build_plan(
         golden_position_config(
-            base, position="B1", variant="baseline", max_num_seqs=1
+            base,
+            position="B1",
+            variant="baseline",
+            max_num_seqs=baseline_value,
         ),
         tuple(tuple(dict(message) for message in prompt) for prompt in prompts),
         tuple(tuple(dict(message) for message in prompt) for prompt in warmup_prompts),
@@ -153,7 +270,7 @@ def golden_preflight_reasons(
     if position_requests is None:
         reasons.append("golden_session_request_count_must_be_exact")
     else:
-        session_requests = int(position_requests) * len(GOLDEN_POSITIONS)
+        session_requests = int(position_requests) * len(GOLDEN_SEQUENCE)
         if session_requests > base.limits.max_requests:
             reasons.append("golden_session_requests_exceed_max_requests")
         session_tokens = session_requests * base.max_tokens
@@ -172,8 +289,15 @@ def build_golden_plan(
 ) -> dict[str, Any]:
     """Build a zero-traffic plan for all six positions."""
 
+    baseline_value, candidate_value = parse_golden_treatment_flags(
+        baseline_flag, candidate_flag
+    )
+    positions = golden_positions(baseline_value, candidate_value)
     position = golden_position_config(
-        base, position="B1", variant="baseline", max_num_seqs=1
+        base,
+        position="B1",
+        variant="baseline",
+        max_num_seqs=baseline_value,
     )
     position_plan = build_plan(
         position,
@@ -182,19 +306,31 @@ def build_golden_plan(
     )
     per_position_requests = position_plan["request_count"]["exact"]
     session_requests = (
-        int(per_position_requests) * len(GOLDEN_POSITIONS)
+        int(per_position_requests) * len(positions)
         if per_position_requests is not None
         else None
     )
     return {
         "traffic_sent": False,
+        "treatment": {
+            "field": "max_num_seqs",
+            "baseline_value": baseline_value,
+            "candidate_value": candidate_value,
+            "closed_loop_concurrency": (
+                int(base.conditions[0].value)
+                if len(base.conditions) == 1
+                and base.conditions[0].kind == "closed_loop"
+                and float(base.conditions[0].value).is_integer()
+                else None
+            ),
+        },
         "positions": [
             {
                 "position": position_name,
                 "variant": variant,
                 "max_num_seqs": max_num_seqs,
             }
-            for position_name, variant, max_num_seqs in GOLDEN_POSITIONS
+            for position_name, variant, max_num_seqs in positions
         ],
         "per_position_requests": per_position_requests,
         "session_requests": session_requests,
@@ -638,8 +774,36 @@ def _flag_map(report: Mapping[str, Any]) -> dict[str, str] | None:
         ) or not is_safe_public_metadata(value):
             return None
         assert isinstance(value, str)
+        if normalized in output:
+            return None
         output[normalized] = value
     return output
+
+
+def _has_normalized_flag_alias_collision(report: Mapping[str, Any]) -> bool:
+    # This diagnostic may run alongside a structural preflight failure. Only
+    # traverse exact JSON-object dictionaries so a forged Mapping cannot
+    # execute custom iteration before the fixed-code early return.
+    if type(report) is not dict:
+        return False
+    manifest = report.get("manifest")
+    if type(manifest) is not dict:
+        return False
+    engine = manifest.get("engine")
+    if type(engine) is not dict:
+        return False
+    raw = engine.get("effective_flags")
+    if type(raw) is not dict:
+        return False
+    seen: set[str] = set()
+    for name in raw:
+        if type(name) is not str:
+            continue
+        normalized = _normalized_flag_name(name)
+        if normalized in seen:
+            return True
+        seen.add(normalized)
+    return False
 
 
 def _present(report: Mapping[str, Any], *path: str) -> bool:
@@ -658,6 +822,131 @@ def _all_equal_present(reports: Sequence[Mapping[str, Any]], *path: str) -> bool
     return all(_path(report, *path) == first for report in reports[1:])
 
 
+def _report_closed_loop_concurrency(report: Mapping[str, Any]) -> int | None:
+    """Return one canonical declared client load without trusting its ID alone."""
+
+    try:
+        mapped = _condition_map(report)
+    except Exception:
+        return None
+    if len(mapped) != 1:
+        return None
+    identifier, condition = next(iter(mapped.items()))
+    descriptor = condition.get("condition")
+    if not isinstance(descriptor, Mapping):
+        return None
+    value = descriptor.get("value")
+    max_in_flight = descriptor.get("max_in_flight")
+    if (
+        type(value) is not int
+        or type(max_in_flight) is not int
+        or value <= 0
+        or value > MAX_GOLDEN_MAX_NUM_SEQS
+        or max_in_flight != value
+        or descriptor.get("kind") != "closed_loop"
+        or descriptor.get("id") != f"closed_loop:{value}"
+        or identifier != f"closed_loop:{value}"
+    ):
+        return None
+    return value
+
+
+def _common_closed_loop_concurrency(
+    reports: Sequence[Mapping[str, Any]],
+) -> int | None:
+    values = tuple(_report_closed_loop_concurrency(report) for report in reports)
+    if not values or values[0] is None or any(value != values[0] for value in values):
+        return None
+    return values[0]
+
+
+def _every_measured_block_attempts_declared_concurrency(
+    reports: Sequence[Mapping[str, Any]], concurrency: int
+) -> bool:
+    """Prove every measured block had enough requests to reach client load N."""
+
+    for report in reports:
+        try:
+            conditions = _condition_map(report)
+        except Exception:
+            return False
+        if len(conditions) != 1:
+            return False
+        condition = next(iter(conditions.values()))
+        blocks = condition.get("blocks")
+        if not isinstance(blocks, list) or not blocks:
+            return False
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                return False
+            attempted = _path(block, "request_counts", "attempted")
+            if type(attempted) is not int or attempted < concurrency:
+                return False
+    return True
+
+
+def _infer_golden_treatment(
+    reports: Sequence[Mapping[str, Any]],
+) -> dict[str, int | str] | None:
+    """Infer a sanitized treatment only from the six saved evidence artifacts."""
+
+    if len(reports) != 6:
+        return None
+    if tuple(
+        _path(report, "manifest", "provenance", "variant")
+        for report in reports
+    ) != EXPECTED_VARIANTS or tuple(
+        _path(report, "manifest", "provenance", "sequence_position")
+        for report in reports
+    ) != tuple(position for position, _ in GOLDEN_SEQUENCE):
+        return None
+    if any(
+        _path(report, "manifest", "engine", "effective_flags_provenance")
+        != "runtime_verified"
+        for report in reports
+    ):
+        return None
+    flags = tuple(_flag_map(report) for report in reports)
+    if any(flag is None for flag in flags):
+        return None
+    assert all(flag is not None for flag in flags)
+    typed_flags = tuple(flag for flag in flags if flag is not None)
+    baseline_flags = tuple(typed_flags[index] for index in (0, 2, 4))
+    candidate_flags = tuple(typed_flags[index] for index in (1, 3, 5))
+    if (
+        any(flag != baseline_flags[0] for flag in baseline_flags[1:])
+        or any(flag != candidate_flags[0] for flag in candidate_flags[1:])
+    ):
+        return None
+    changed = {
+        name
+        for name in set(baseline_flags[0]) | set(candidate_flags[0])
+        if baseline_flags[0].get(name) != candidate_flags[0].get(name)
+    }
+    if changed != {"max-num-seqs"}:
+        return None
+    baseline = _canonical_positive_integer(
+        baseline_flags[0].get("max-num-seqs")
+    )
+    candidate = _canonical_positive_integer(
+        candidate_flags[0].get("max-num-seqs")
+    )
+    concurrency = _common_closed_loop_concurrency(reports)
+    if (
+        baseline is None
+        or candidate is None
+        or baseline == candidate
+        or concurrency is None
+    ):
+        return None
+    return {
+        "field": "max_num_seqs",
+        "baseline_value": baseline,
+        "candidate_value": candidate,
+        "closed_loop_concurrency": concurrency,
+    }
+
+
 def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
     reasons: list[str] = []
     if len(reports) != 6:
@@ -667,7 +956,11 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
         if reason:
             reasons.append(f"run_{index + 1}_{reason}")
     if reasons:
-        return reasons
+        return sorted(set(reasons))
+    if any(_has_normalized_flag_alias_collision(report) for report in reports):
+        reasons.append("engine_flags_malformed")
+    if reasons:
+        return sorted(set(reasons))
     variants = tuple(
         _path(report, "manifest", "provenance", "variant") for report in reports
     )
@@ -679,7 +972,7 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
         _path(report, "manifest", "provenance", "sequence_position")
         for report in reports
     )
-    if positions != tuple(position for position, _, _ in GOLDEN_POSITIONS):
+    if positions != tuple(position for position, _ in GOLDEN_SEQUENCE):
         reasons.append("sequence_position_labels_must_be_B1_C1_B2_C2_B3_C3")
     starts = [_timestamp(report.get("started_at")) for report in reports]
     ends = [_timestamp(report.get("completed_at")) for report in reports]
@@ -780,12 +1073,10 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
             items != condition_sets[0] for items in condition_sets[1:]
         ):
             reasons.append("condition_sets_do_not_match")
-        elif condition_sets[0] != {"closed_loop:8"}:
-            # The controlled 1-versus-8 max_num_seqs treatment is not expected
-            # to affect lower loads. Requiring one exercised level prevents an
-            # honest no-effect control level from vetoing (or being pooled
-            # into) the treatment decision.
-            reasons.append("golden_treatment_requires_only_closed_loop_concurrency_8")
+        elif _common_closed_loop_concurrency(reports) is None:
+            reasons.append(
+                "golden_treatment_requires_one_common_closed_loop_concurrency"
+            )
 
     flags = [_flag_map(report) for report in reports]
     if any(flag is None for flag in flags):
@@ -804,25 +1095,56 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
     }
     if changed != {"max-num-seqs"}:
         reasons.append("golden_treatment_must_only_change_max_num_seqs")
-    try:
-        baseline_limit = int(baseline_flags[0]["max-num-seqs"])
-        candidate_limit = int(candidate_flags[0]["max-num-seqs"])
-    except (KeyError, TypeError, ValueError):
-        reasons.append("max_num_seqs_values_missing")
-    else:
-        if (baseline_limit, candidate_limit) != (1, 8):
-            reasons.append("golden_treatment_requires_max_num_seqs_1_vs_8")
+    baseline_limit = _canonical_positive_integer(
+        baseline_flags[0].get("max-num-seqs")
+    )
+    candidate_limit = _canonical_positive_integer(
+        candidate_flags[0].get("max-num-seqs")
+    )
+    if baseline_limit is None or candidate_limit is None:
+        reasons.append(
+            "golden_treatment_requires_canonical_positive_max_num_seqs_values"
+        )
+    elif baseline_limit == candidate_limit:
+        reasons.append("golden_treatment_requires_distinct_max_num_seqs_values")
+
+    concurrency = _common_closed_loop_concurrency(reports)
+    if concurrency is None:
+        reasons.append(
+            "golden_treatment_requires_one_common_closed_loop_concurrency"
+        )
+    elif baseline_limit is not None and candidate_limit is not None:
+        requests_per_block = _path(
+            reports[0], "manifest", "traffic", "requests_per_block"
+        )
+        if type(requests_per_block) is int and requests_per_block < concurrency:
+            reasons.append(
+                "golden_requests_per_block_must_reach_declared_concurrency"
+            )
+        if concurrency < max(baseline_limit, candidate_limit):
+            reasons.append(
+                "golden_concurrency_must_reach_both_max_num_seqs_values"
+            )
+        if not _every_measured_block_attempts_declared_concurrency(
+            reports, concurrency
+        ):
+            reasons.append(
+                "golden_measured_blocks_must_attempt_declared_concurrency"
+            )
+        # Reaching N is evidence of sufficient offered client demand. It does
+        # not prove that the server scheduler itself saturated at either
+        # max_num_seqs value.
         actually_exercised = all(
             any(
                 isinstance(condition, Mapping)
-                and isinstance(condition.get("observed_peak_in_flight"), int)
-                and condition.get("observed_peak_in_flight") >= 8
+                and type(condition.get("observed_peak_in_flight")) is int
+                and condition.get("observed_peak_in_flight") >= concurrency
                 for condition in report.get("conditions", [])
             )
             for report in reports
         )
         if not actually_exercised:
-            reasons.append("traffic_does_not_exercise_candidate_max_num_seqs")
+            reasons.append("traffic_does_not_reach_declared_closed_loop_concurrency")
     # Chunked prefill may be present, but must be common and receives no credit.
     chunked = [flag.get("enable-chunked-prefill") for flag in flags if flag is not None]
     if any(value != chunked[0] for value in chunked[1:]):
@@ -834,6 +1156,7 @@ def _supported_decision_summary(
     outcome: str,
     condition: Mapping[str, Any],
     reports: Sequence[Mapping[str, Any]],
+    treatment: Mapping[str, int | str],
 ) -> dict[str, Any]:
     interval = condition["throughput_delta_percent_ci"]
     estimate = float(interval["estimate"])
@@ -855,13 +1178,13 @@ def _supported_decision_summary(
 
     if outcome == "candidate_higher_throughput":
         winner = "candidate"
-        winner_value = 8
+        winner_value = int(treatment["candidate_value"])
         comparison = (
             f"candidate throughput was {estimate:.1f}% higher than baseline"
         )
     else:
         winner = "baseline"
-        winner_value = 1
+        winner_value = int(treatment["baseline_value"])
         comparison = (
             f"candidate throughput was {abs(estimate):.1f}% lower than baseline"
         )
@@ -892,6 +1215,7 @@ def validate_golden_sequence(reports: Sequence[Mapping[str, Any]]) -> dict[str, 
     """Validate and compare six B-C-B / C-B-C sequential live reports."""
 
     reasons = _protocol_checks(reports)
+    treatment = None if reasons else _infer_golden_treatment(reports)
     output: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": GOLDEN_ARTIFACT_TYPE,
@@ -905,6 +1229,7 @@ def validate_golden_sequence(reports: Sequence[Mapping[str, Any]]) -> dict[str, 
         "run_fingerprint_basis": RUN_FINGERPRINT_BASIS,
         "run_fingerprints": [_safe_report_fingerprint(report) for report in reports],
         "sequence": list(EXPECTED_VARIANTS),
+        "treatment": treatment,
         "conditions": [],
         "overall_outcome": None,
         "decision_summary": None,
@@ -917,9 +1242,19 @@ def validate_golden_sequence(reports: Sequence[Mapping[str, Any]]) -> dict[str, 
             "runtime-verified provenance. It cannot independently prove operator-supplied "
             "hardware or runtime attestations; retain external audit evidence."
         ),
+        "client_demand_scope": (
+            "Reaching the declared client concurrency proves sufficient offered demand "
+            "for this test; it does not prove direct server-scheduler saturation."
+        ),
         "disclaimer": "This order-balanced live result applies only to the pinned manifest and tested workload; it is not a savings projection or universal causal claim.",
     }
     if reasons:
+        return output
+    if treatment is None:  # defensive: protocol eligibility must imply inference
+        output["status"] = "ineligible"
+        output["golden_protocol_eligible"] = False
+        output["eligibility_reasons"] = ["golden_treatment_could_not_be_inferred"]
+        output["optimization_credit"]["changed_flag"] = None
         return output
     condition_maps = [_condition_map(report) for report in reports]
     identifiers = list(condition_maps[0])
@@ -1068,6 +1403,6 @@ def validate_golden_sequence(reports: Sequence[Mapping[str, Any]]) -> dict[str, 
         output["decision_eligible"] = True
         output["overall_outcome"] = next(iter(outcomes))
         output["decision_summary"] = _supported_decision_summary(
-            output["overall_outcome"], output["conditions"][0], reports
+            output["overall_outcome"], output["conditions"][0], reports, treatment
         )
     return output

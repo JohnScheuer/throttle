@@ -63,10 +63,14 @@ successful optimization claim.
 12. **The one-command golden runner is count-bounded and operator-mediated.**
     It safely orchestrates the default 3 × 67 request positions, but does not
     yet run duration-bounded positions; those remain available through six
-    manual benchmark reports plus offline validation. Throttle times the
-    operator confirmations and stops further client traffic at its session
-    ceiling, but it cannot stop or bill-discover the provider resource. Keep a
-    provider-side budget/auto-stop active during every transition.
+    manual benchmark reports plus offline validation. Arbitrary positive,
+    distinct `max_num_seqs` pairs are accepted only when one common client
+    concurrency is at least the larger value and is reached in every position.
+    That proves offered client demand, not direct server-scheduler saturation
+    or co-timed occupancy at the configured limit. Throttle times the operator
+    confirmations and stops further client traffic at its session ceiling, but
+    it cannot stop or bill-discover the provider resource. Keep a provider-side
+    budget/auto-stop active during every transition.
 13. **Sanitization is a boundary, not a secret detector.** Generated and loaded
     metadata reject the credential, URL, path, Unicode-spoofing, and structural
     shapes covered by the versioned test corpus, but no finite pattern set can

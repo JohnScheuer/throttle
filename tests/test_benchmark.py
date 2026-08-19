@@ -10,6 +10,7 @@ import socket
 import tempfile
 import time
 import unittest
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,7 +36,12 @@ from throttle.compare import (
     compare_reports,
     load_report,
 )
-from throttle.golden import validate_golden_sequence
+from throttle.golden import (
+    GoldenTreatmentError,
+    golden_positions,
+    parse_golden_treatment_flags,
+    validate_golden_sequence,
+)
 from throttle.models import (
     CostModel,
     EndpointConfig,
@@ -213,12 +219,16 @@ def _saved_report(
     sequence_position: str = "B1",
     started_at: str = "2026-08-17T00:00:00+00:00",
     completed_at: str = "2026-08-17T00:00:35+00:00",
+    closed_loop_concurrency: int = 8,
+    observed_peak_in_flight: int | None = None,
 ) -> dict[str, object]:
+    if observed_peak_in_flight is None:
+        observed_peak_in_flight = closed_loop_concurrency
     condition_descriptor = {
-        "id": "closed_loop:8",
+        "id": f"closed_loop:{closed_loop_concurrency}",
         "kind": "closed_loop",
-        "value": 8,
-        "max_in_flight": 8,
+        "value": closed_loop_concurrency,
+        "max_in_flight": closed_loop_concurrency,
     }
     if len(block_rates) != 3 or any(rate <= 0 for rate in block_rates):
         raise ValueError("saved fixture requires three positive block rates")
@@ -344,7 +354,7 @@ def _saved_report(
                 "valid": True,
                 "invalid_reasons": [],
                 "wall_duration_seconds": wall,
-                "observed_peak_in_flight": 8,
+                "observed_peak_in_flight": observed_peak_in_flight,
                 "request_counts": counts(67),
                 "offered_requests": 67,
                 "scheduler_lag_ms": distribution(0.0, 67),
@@ -485,7 +495,7 @@ def _saved_report(
                 "blocks": blocks,
                 "request_counts": counts(201),
                 "measured_wall_seconds": aggregate_wall,
-                "observed_peak_in_flight": 8,
+                "observed_peak_in_flight": observed_peak_in_flight,
                 "target_offered_request_rate": None,
                 "achieved_offered_request_rate": None,
                 "offered_rate_relative_error": None,
@@ -497,8 +507,8 @@ def _saved_report(
         "best_tested": {
             "field": "best_tested_concurrency",
             "available": True,
-            "value": 8,
-            "condition_id": "closed_loop:8",
+            "value": closed_loop_concurrency,
+            "condition_id": f"closed_loop:{closed_loop_concurrency}",
             "block_mean_output_tokens_per_second": block_mean_throughput,
             "block_mean_output_tokens_per_second_ci": condition_metrics[
                 "block_mean_output_tokens_per_second_ci"
@@ -515,7 +525,7 @@ def _saved_report(
             "requests_completed": 204,
             "requests_cancelled": 0,
             "requests_in_flight": 0,
-            "peak_in_flight": 8,
+            "peak_in_flight": observed_peak_in_flight,
             "errors": 0,
             "reserved_output_tokens": 26_112,
             "elapsed_seconds": aggregate_wall,
@@ -708,6 +718,10 @@ def _golden_sequence(
     *,
     baseline_block_rates: tuple[float, float, float] = (10.0, 10.0, 10.0),
     candidate_block_rates: tuple[float, float, float] = (12.0, 12.0, 12.0),
+    baseline_max_num_seqs: int | str = 1,
+    candidate_max_num_seqs: int | str = 8,
+    closed_loop_concurrency: int = 8,
+    observed_peak_in_flight: int | None = None,
 ) -> list[dict[str, object]]:
     variants = (
         "baseline",
@@ -730,12 +744,16 @@ def _golden_sequence(
             _saved_report(
                 baseline_block_rates if baseline else candidate_block_rates,
                 completion_tokens=completion_tokens,
-                flag_value="1" if baseline else "8",
+                flag_value=str(
+                    baseline_max_num_seqs if baseline else candidate_max_num_seqs
+                ),
                 evidence_source="live_inference",
                 variant=variant,
                 sequence_position=position,
                 started_at=started.isoformat(),
                 completed_at=completed.isoformat(),
+                closed_loop_concurrency=closed_loop_concurrency,
+                observed_peak_in_flight=observed_peak_in_flight,
             )
         )
     return reports
@@ -2443,6 +2461,59 @@ class LoadAndComparisonTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GoldenProtocolTests(unittest.TestCase):
+    def test_treatment_parser_and_position_builder_fail_closed_on_forged_types(
+        self,
+    ) -> None:
+        parser_cases = (
+            (None, ("max_num_seqs", "10"), "golden_treatment_flags_malformed"),
+            ((), ("max_num_seqs", "10"), "golden_treatment_flags_malformed"),
+            (
+                ("max_num_seqs", "8", "extra"),
+                ("max_num_seqs", "10"),
+                "golden_treatment_flags_malformed",
+            ),
+            (
+                (True, "8"),
+                ("max_num_seqs", "10"),
+                "golden_treatment_must_only_change_max_num_seqs",
+            ),
+            (
+                ("max_num_seqs", True),
+                ("max_num_seqs", "10"),
+                "golden_max_num_seqs_values_must_be_canonical_positive_integers",
+            ),
+            (
+                ("private-flag-secret", "8"),
+                ("max_num_seqs", "10"),
+                "golden_treatment_must_only_change_max_num_seqs",
+            ),
+            (
+                ("max_num_seqs", "9" * 5_000),
+                ("max_num_seqs", "10"),
+                "golden_max_num_seqs_values_must_be_canonical_positive_integers",
+            ),
+        )
+        for baseline, candidate, expected_code in parser_cases:
+            with self.subTest(expected_code=expected_code):
+                with self.assertRaises(GoldenTreatmentError) as raised:
+                    parse_golden_treatment_flags(baseline, candidate)  # type: ignore[arg-type]
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(str(raised.exception), expected_code)
+                self.assertNotIn("private-flag-secret", str(raised.exception))
+                self.assertNotIn("9" * 5_000, str(raised.exception))
+
+        for pair in ((True, 8), (1.0, 8), ("1", 8), (0, 8), (-1, 8), (1, 1)):
+            with self.subTest(pair=pair):
+                with self.assertRaises(GoldenTreatmentError) as raised:
+                    golden_positions(*pair)  # type: ignore[arg-type]
+                self.assertIn(
+                    raised.exception.code,
+                    {
+                        "golden_max_num_seqs_values_must_be_canonical_positive_integers",
+                        "golden_max_num_seqs_values_must_be_distinct",
+                    },
+                )
+
     def test_metal_runs_can_pass_the_golden_runtime_gate(self) -> None:
         reports = _golden_sequence()
         for report in reports:
@@ -2538,6 +2609,19 @@ class GoldenProtocolTests(unittest.TestCase):
         self.assertEqual(result["overall_outcome"], "candidate_higher_throughput")
         self.assertEqual(result["optimization_credit"]["changed_flag"], "max_num_seqs")
         self.assertFalse(result["optimization_credit"]["chunked_prefill_credited"])
+        self.assertIn(
+            "does not prove direct server-scheduler saturation",
+            result["client_demand_scope"],
+        )
+        self.assertEqual(
+            result["treatment"],
+            {
+                "field": "max_num_seqs",
+                "baseline_value": 1,
+                "candidate_value": 8,
+                "closed_loop_concurrency": 8,
+            },
+        )
         self.assertEqual(len(result["run_fingerprints"]), 6)
         summary = result["decision_summary"]
         self.assertEqual(summary["winner"], "candidate")
@@ -2548,6 +2632,423 @@ class GoldenProtocolTests(unittest.TestCase):
         self.assertIn("95% CI", summary["text"])
         self.assertIn("excludes zero", summary["text"])
         self.assertIn("no latency SLO was declared", summary["text"])
+
+    def test_arbitrary_max_num_seqs_pairs_are_inferred_from_saved_evidence(
+        self,
+    ) -> None:
+        cases = (
+            (8, 10, 10),
+            (8, 10, 16),
+            (8, 6, 8),
+            (10, 8, 12),
+        )
+        for baseline, candidate, load in cases:
+            with self.subTest(
+                baseline=baseline, candidate=candidate, load=load
+            ):
+                result = validate_golden_sequence(
+                    _golden_sequence(
+                        baseline_max_num_seqs=baseline,
+                        candidate_max_num_seqs=candidate,
+                        closed_loop_concurrency=load,
+                    )
+                )
+
+                self.assertTrue(
+                    result["golden_protocol_eligible"],
+                    result["eligibility_reasons"],
+                )
+                self.assertEqual(result["status"], "complete")
+                self.assertEqual(
+                    result["treatment"],
+                    {
+                        "field": "max_num_seqs",
+                        "baseline_value": baseline,
+                        "candidate_value": candidate,
+                        "closed_loop_concurrency": load,
+                    },
+                )
+                self.assertEqual(
+                    result["conditions"][0]["condition_id"],
+                    f"closed_loop:{load}",
+                )
+                self.assertEqual(
+                    result["decision_summary"]["winner_config"],
+                    {"max_num_seqs": candidate},
+                )
+                self.assertIn(
+                    f"candidate max_num_seqs={candidate} won",
+                    result["decision_summary"]["text"],
+                )
+
+    def test_arbitrary_pair_treatment_survives_a_complete_inconclusive_result(
+        self,
+    ) -> None:
+        result = validate_golden_sequence(
+            _golden_sequence(
+                baseline_max_num_seqs=8,
+                candidate_max_num_seqs=10,
+                closed_loop_concurrency=16,
+                baseline_block_rates=(10.0, 10.0, 10.0),
+                candidate_block_rates=(10.0, 10.0, 10.0),
+            )
+        )
+
+        self.assertTrue(result["golden_protocol_eligible"])
+        self.assertFalse(result["decision_eligible"])
+        self.assertEqual(result["decision_state"], "inconclusive")
+        self.assertIsNone(result["decision_summary"])
+        self.assertEqual(
+            result["treatment"],
+            {
+                "field": "max_num_seqs",
+                "baseline_value": 8,
+                "candidate_value": 10,
+                "closed_loop_concurrency": 16,
+            },
+        )
+
+    def test_arbitrary_pair_baseline_winner_uses_inferred_value_and_wording(
+        self,
+    ) -> None:
+        result = validate_golden_sequence(
+            _golden_sequence(
+                baseline_max_num_seqs=10,
+                candidate_max_num_seqs=8,
+                closed_loop_concurrency=12,
+                baseline_block_rates=(12.0, 12.0, 12.0),
+                candidate_block_rates=(9.0, 9.0, 9.0),
+            )
+        )
+
+        self.assertTrue(result["decision_eligible"])
+        summary = result["decision_summary"]
+        self.assertEqual(summary["winner"], "baseline")
+        self.assertEqual(summary["winner_config"], {"max_num_seqs": 10})
+        self.assertIn("baseline max_num_seqs=10 won", summary["text"])
+        self.assertNotIn("max_num_seqs=1 won", summary["text"])
+
+    def test_golden_load_and_observed_peak_must_cover_the_declared_pair(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "load_below_pair",
+                _golden_sequence(
+                    baseline_max_num_seqs=8,
+                    candidate_max_num_seqs=10,
+                    closed_loop_concurrency=9,
+                ),
+            ),
+            (
+                "one_position_did_not_reach_declared_load",
+                _golden_sequence(
+                    baseline_max_num_seqs=8,
+                    candidate_max_num_seqs=10,
+                    closed_loop_concurrency=16,
+                ),
+            ),
+        )
+        cases[1][1][4]["conditions"][0]["observed_peak_in_flight"] = 15  # type: ignore[index]
+        for name, reports in cases:
+            with self.subTest(case=name):
+                result = validate_golden_sequence(reports)
+                self.assertEqual(result["status"], "ineligible")
+                self.assertFalse(result["golden_protocol_eligible"])
+                self.assertFalse(result["decision_eligible"])
+                self.assertTrue(
+                    any(
+                        "concurrency" in reason or "traffic" in reason
+                        for reason in result["eligibility_reasons"]
+                    ),
+                    result["eligibility_reasons"],
+                )
+
+    def test_golden_rejects_noncanonical_or_equal_max_num_seqs_evidence(
+        self,
+    ) -> None:
+        malformed = (
+            "0",
+            "-1",
+            "+8",
+            " 8",
+            "8 ",
+            "08",
+            "8.0",
+            "1e1",
+            "2147483648",
+            "9" * 5_000,
+            "private-treatment-secret",
+        )
+        for value in malformed:
+            with self.subTest(value=value[:32]):
+                result = validate_golden_sequence(
+                    _golden_sequence(
+                        baseline_max_num_seqs=value,
+                        candidate_max_num_seqs=10,
+                        closed_loop_concurrency=16,
+                    )
+                )
+                serialized = json.dumps(result, allow_nan=False)
+                self.assertEqual(result["status"], "ineligible")
+                self.assertFalse(result["golden_protocol_eligible"])
+                self.assertFalse(result["decision_eligible"])
+                if value == "private-treatment-secret" or len(value) > 128:
+                    self.assertNotIn(value, serialized)
+
+        equal = validate_golden_sequence(
+            _golden_sequence(
+                baseline_max_num_seqs=8,
+                candidate_max_num_seqs=8,
+                closed_loop_concurrency=8,
+            )
+        )
+        self.assertEqual(equal["status"], "ineligible")
+        self.assertFalse(equal["golden_protocol_eligible"])
+        self.assertFalse(equal["decision_eligible"])
+
+    def test_duration_bounded_arbitrary_pair_remains_offline_validatable(
+        self,
+    ) -> None:
+        reports = _golden_sequence(
+            baseline_max_num_seqs=8,
+            candidate_max_num_seqs=10,
+            closed_loop_concurrency=16,
+            baseline_block_rates=(3.0, 3.0, 3.0),
+            candidate_block_rates=(3.6, 3.6, 3.6),
+        )
+        origin = datetime(2026, 8, 17, tzinfo=timezone.utc)
+        for index, report in enumerate(reports):
+            traffic = report["manifest"]["traffic"]  # type: ignore[index]
+            traffic["requests_per_block"] = None
+            traffic["block_duration_seconds"] = 20.0
+            started = origin + timedelta(seconds=index * 120)
+            report["started_at"] = started.isoformat()
+            report["completed_at"] = (started + timedelta(seconds=110)).isoformat()
+
+        result = validate_golden_sequence(reports)
+
+        self.assertTrue(
+            result["golden_protocol_eligible"], result["eligibility_reasons"]
+        )
+        self.assertEqual(
+            result["treatment"],
+            {
+                "field": "max_num_seqs",
+                "baseline_value": 8,
+                "candidate_value": 10,
+                "closed_loop_concurrency": 16,
+            },
+        )
+        self.assertTrue(
+            all(
+                report["conditions"][0]["measured_wall_seconds"] >= 60.0  # type: ignore[index]
+                and report["conditions"][0]["observed_peak_in_flight"] == 16  # type: ignore[index]
+                for report in reports
+            )
+        )
+
+    def test_duration_bounded_blocks_must_attempt_declared_concurrency(
+        self,
+    ) -> None:
+        reports = _golden_sequence(
+            baseline_max_num_seqs=8,
+            candidate_max_num_seqs=10,
+            closed_loop_concurrency=16,
+            baseline_block_rates=(3.0, 3.0, 3.0),
+            candidate_block_rates=(3.6, 3.6, 3.6),
+        )
+        origin = datetime(2026, 8, 17, tzinfo=timezone.utc)
+        for index, report in enumerate(reports):
+            traffic = report["manifest"]["traffic"]  # type: ignore[index]
+            traffic["requests_per_block"] = None
+            traffic["block_duration_seconds"] = 20.0
+            started = origin + timedelta(seconds=index * 120)
+            report["started_at"] = started.isoformat()
+            report["completed_at"] = (started + timedelta(seconds=110)).isoformat()
+
+            condition = report["conditions"][0]  # type: ignore[index]
+            request_rates: list[float] = []
+            for block in condition["blocks"]:
+                counts = {
+                    "attempted": 1,
+                    "valid": 1,
+                    "invalid": 0,
+                    "status_counts": {"200": 1},
+                    "error_counts": {},
+                    "finish_reason_counts": {"stop": 1},
+                }
+                wall = float(block["wall_duration_seconds"])
+                request_rate = 1.0 / wall
+                request_rates.append(request_rate)
+                block["request_counts"] = counts
+                block["offered_requests"] = 1
+                for key in ("metrics", "diagnostic_metrics"):
+                    block[key]["valid_response_count"] = 1
+                    block[key]["requests_per_second"] = request_rate
+
+            condition_counts = {
+                "attempted": 3,
+                "valid": 3,
+                "invalid": 0,
+                "status_counts": {"200": 3},
+                "error_counts": {},
+                "finish_reason_counts": {"stop": 3},
+            }
+            measured_wall = float(condition["measured_wall_seconds"])
+            for key in ("metrics", "diagnostic_metrics"):
+                condition[key]["valid_response_count"] = 3
+                condition[key]["requests_per_second"] = 3.0 / measured_wall
+                condition[key]["block_mean_requests_per_second"] = (
+                    sum(request_rates) / len(request_rates)
+                )
+                condition[key]["block_mean_requests_per_second_ci"] = (
+                    t_interval_95(request_rates)
+                )
+            condition["request_counts"] = condition_counts
+            report["run_totals"].update(  # type: ignore[index]
+                requests_started=6,
+                requests_completed=6,
+                reserved_output_tokens=768,
+            )
+
+        result = validate_golden_sequence(reports)
+
+        self.assertEqual(result["status"], "ineligible")
+        self.assertFalse(result["golden_protocol_eligible"])
+        self.assertFalse(result["decision_eligible"])
+        self.assertIsNone(result["decision_summary"])
+        self.assertIsNone(result["treatment"])
+        self.assertIn(
+            "golden_measured_blocks_must_attempt_declared_concurrency",
+            result["eligibility_reasons"],
+        )
+
+    def test_golden_structural_preflight_precedes_custom_mapping_traversal(
+        self,
+    ) -> None:
+        class ExplosiveMapping(Mapping[str, str]):
+            def __getitem__(self, key: str) -> str:
+                del key
+                raise AssertionError("custom mapping was executed")
+
+            def __iter__(self) -> Iterator[str]:
+                raise AssertionError("custom mapping was executed")
+
+            def __len__(self) -> int:
+                raise AssertionError("custom mapping was executed")
+
+        reports = _golden_sequence()
+        reports[0]["manifest"]["engine"][  # type: ignore[index]
+            "effective_flags"
+        ] = ExplosiveMapping()
+
+        result = validate_golden_sequence(reports)
+
+        self.assertEqual(result["status"], "ineligible")
+        self.assertFalse(result["golden_protocol_eligible"])
+        self.assertFalse(result["decision_eligible"])
+        self.assertIsNone(result["decision_summary"])
+        self.assertIsNone(result["treatment"])
+        self.assertIn(
+            "run_1_report_structure_non_json_type",
+            result["eligibility_reasons"],
+        )
+
+    def test_golden_structural_preflight_precedes_forged_key_lookup(self) -> None:
+        class ExplosiveKey(str):
+            def __hash__(self) -> int:
+                return hash(str(self))
+
+            def __eq__(self, other: object) -> bool:
+                del other
+                raise AssertionError("forged key equality was executed")
+
+        reports = [{ExplosiveKey("manifest"): {}} for _ in range(6)]
+
+        result = validate_golden_sequence(reports)
+
+        self.assertEqual(result["status"], "ineligible")
+        self.assertFalse(result["golden_protocol_eligible"])
+        self.assertFalse(result["decision_eligible"])
+        self.assertIsNone(result["decision_summary"])
+        self.assertIsNone(result["treatment"])
+        self.assertEqual(
+            result["eligibility_reasons"],
+            [
+                f"run_{index}_report_structure_non_json_type"
+                for index in range(1, 7)
+            ],
+        )
+
+    def test_golden_rejects_wrong_changed_flag_second_flag_and_repeat_drift(
+        self,
+    ) -> None:
+        wrong_flag = _golden_sequence(
+            baseline_max_num_seqs=8,
+            candidate_max_num_seqs=10,
+            closed_loop_concurrency=16,
+        )
+        for report in wrong_flag:
+            flags = report["manifest"]["engine"]["effective_flags"]  # type: ignore[index]
+            flags["max_num_batched_tokens"] = flags.pop("max_num_seqs")
+
+        second_flag = _golden_sequence(
+            baseline_max_num_seqs=8,
+            candidate_max_num_seqs=10,
+            closed_loop_concurrency=16,
+        )
+        for report in second_flag[1::2]:
+            report["manifest"]["engine"]["effective_flags"][  # type: ignore[index]
+                "tensor_parallel_size"
+            ] = "2"
+
+        repeat_drift = _golden_sequence(
+            baseline_max_num_seqs=8,
+            candidate_max_num_seqs=10,
+            closed_loop_concurrency=16,
+        )
+        repeat_drift[2]["manifest"]["engine"]["effective_flags"][  # type: ignore[index]
+            "max_num_seqs"
+        ] = "9"
+
+        normalized_duplicate = _golden_sequence(
+            baseline_max_num_seqs=8,
+            candidate_max_num_seqs=10,
+            closed_loop_concurrency=16,
+        )
+        normalized_duplicate[0]["manifest"]["engine"]["effective_flags"][  # type: ignore[index]
+            "max-num-seqs"
+        ] = "11"
+
+        for name, reports, reason in (
+            (
+                "wrong_flag",
+                wrong_flag,
+                "golden_treatment_must_only_change_max_num_seqs",
+            ),
+            (
+                "second_flag",
+                second_flag,
+                "golden_treatment_must_only_change_max_num_seqs",
+            ),
+            (
+                "repeat_drift",
+                repeat_drift,
+                "baseline_effective_flags_changed_between_repeats",
+            ),
+            (
+                "normalized_duplicate",
+                normalized_duplicate,
+                "run_1_invalid_engine_flag_manifest",
+            ),
+        ):
+            with self.subTest(case=name):
+                result = validate_golden_sequence(reports)
+                self.assertEqual(result["status"], "ineligible")
+                self.assertFalse(result["golden_protocol_eligible"])
+                self.assertFalse(result["decision_eligible"])
+                self.assertIn(reason, result["eligibility_reasons"])
 
     def test_supported_golden_summary_orients_a_baseline_win_correctly(self) -> None:
         result = validate_golden_sequence(

@@ -24,6 +24,24 @@ ineligible or inconclusive result. A stopped orchestration writes
 `artifact_type: throttle_golden_session` with completed-position names and a
 fixed sanitized stop reason, never a recommendation.
 
+Golden comparison and session artifacts include a sanitized treatment block:
+
+```json
+{
+  "field": "max_num_seqs",
+  "baseline_value": 8,
+  "candidate_value": 10,
+  "closed_loop_concurrency": 16
+}
+```
+
+For a complete comparison, these values are inferred from the six saved
+runtime-verified effective-flag and traffic manifests rather than trusted from
+CLI input. The block remains present for a statistically inconclusive complete
+comparison; malformed evidence may produce `treatment: null`. Reaching the
+recorded client concurrency proves offered demand, not direct server-scheduler
+saturation.
+
 Golden artifacts label `run_fingerprint_basis` as
 `validated_consumed_evidence_projection_v1`. Each `run_fingerprints` entry
 hashes only the bounded, schema-validated evidence consumed by report and
@@ -32,10 +50,11 @@ the digest cannot become an oracle for ignored payloads; a structurally or
 semantically invalid source report receives a null fingerprint.
 
 A supported `decision_summary` contains a fixed workload-scoped label, the
-winning variant and `max_num_seqs` value, the candidate-relative throughput
-delta, its order-balanced 95% interval/method, `ci_excludes_zero: true`, the
-declared SLO gates that passed, and the exact terminal summary text. It never
-contains a savings, optimum, or universal-performance claim.
+winning variant and inferred `max_num_seqs` value, the candidate-relative
+throughput delta, its order-balanced 95% interval/method,
+`ci_excludes_zero: true`, the declared SLO gates that passed, and the exact
+terminal summary text. It never contains a savings, optimum, or
+universal-performance claim.
 
 New run artifacts use runtime manifest `1.1`. It retains the manifest `1.0`
 CUDA keys for compatibility and adds an accelerator backend, generic
