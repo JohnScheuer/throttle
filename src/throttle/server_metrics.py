@@ -63,10 +63,20 @@ _WINDOW_CAVEATS = (
     "Observed gauge maxima are sample maxima, not guaranteed true peaks.",
     "Supplementary metrics never change Throttle decision eligibility.",
     "vLLM request-level TPOT and token-level ITL remain separate.",
-    "vLLM finished-request counts may include abort and error reasons.",
+    "Finished-request outcome counts are label-free classes; abort, error, "
+    "repetition, missing, and unknown reasons are not treated as successful.",
     "vLLM request TPOT may record zero for one-token responses.",
     "A same-label source switch or reset between samples may be undetectable; "
     "pin collection to one exporter instance.",
+)
+
+_REQUESTS_FINISHED_FAMILY = "vllm:request_success_total"
+_ALLOWED_FINISH_REASONS = frozenset({"stop", "length"})
+_DISALLOWED_FINISH_REASONS = frozenset(
+    {"abort", "error", "repetition"}
+)
+_FINISH_REASON_CLASSES = frozenset(
+    {"allowed", "disallowed", "unclassified", "not_applicable"}
 )
 
 _COUNTER_FAMILIES = frozenset(
@@ -103,6 +113,9 @@ _HISTOGRAM_BASES = (
 )
 _HISTOGRAM_SUMS = frozenset(f"{name}_sum" for name in _HISTOGRAM_BASES)
 _HISTOGRAM_COUNTS = frozenset(f"{name}_count" for name in _HISTOGRAM_BASES)
+_HISTOGRAM_OBSERVATION_NAMES = frozenset(
+    {"ttft", "tpot", "itl", "e2e", "queue", "prefill", "decode"}
+)
 _RECOGNIZED_FAMILIES = (
     _COUNTER_FAMILIES | _INTEGER_GAUGES | _KV_GAUGES
     | _HISTOGRAM_SUMS | _HISTOGRAM_COUNTS
@@ -137,10 +150,12 @@ class MetricsCollectionError(ValueError):
 @dataclass(frozen=True)
 class _Series:
     identity: str = field(repr=False)
+    scope_identity: str = field(repr=False)
+    finish_reason_class: str = field(repr=False)
     value: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MetricsSnapshot:
     """An immutable, in-memory snapshot of recognized vLLM series.
 
@@ -203,6 +218,12 @@ class MetricsWindow:
     scope: str = _WINDOW_SCOPE
     decision_effect: str = _WINDOW_DECISION_EFFECT
     caveats: tuple[str, ...] = _WINDOW_CAVEATS
+    histogram_observation_counts: tuple[tuple[str, int], ...] = ()
+    metric_scope_consistent: bool | None = None
+    metric_scope_count: int | None = None
+    allowed_finished_requests: int | None = None
+    disallowed_finished_requests: int | None = None
+    unclassified_finished_requests: int | None = None
 
     def __post_init__(self) -> None:
         _validate_window(self)
@@ -242,6 +263,18 @@ class MetricsWindow:
             ),
             "source_families": list(self.source_families),
             "series_counts": dict(self.series_counts),
+            "histogram_observation_counts": dict(
+                self.histogram_observation_counts
+            ),
+            "metric_scope_consistent": self.metric_scope_consistent,
+            "metric_scope_count": self.metric_scope_count,
+            "allowed_finished_requests": self.allowed_finished_requests,
+            "disallowed_finished_requests": (
+                self.disallowed_finished_requests
+            ),
+            "unclassified_finished_requests": (
+                self.unclassified_finished_requests
+            ),
             "caveats": list(self.caveats),
         }
 
@@ -250,14 +283,58 @@ def _fail(code: str) -> NoReturn:
     raise MetricsCollectionError(code)
 
 
-def _series_identity(labels: Sequence[tuple[str, str]]) -> str:
+def _labels_identity(
+    labels: Sequence[tuple[str, str]], *, domain: bytes
+) -> str:
     digest = hmac.new(_SERIES_ID_KEY, digestmod=hashlib.sha256)
+    digest.update(domain)
     for name, value in labels:
         for part in (name, value):
             encoded = part.encode("utf-8")
             digest.update(struct.pack(">I", len(encoded)))
             digest.update(encoded)
     return digest.hexdigest()
+
+
+def _series_identity(labels: Sequence[tuple[str, str]]) -> str:
+    return _labels_identity(labels, domain=b"series\x00")
+
+
+def _scope_identity(
+    metric_name: str,
+    labels: Sequence[tuple[str, str]],
+) -> str:
+    # vLLM adds finished_reason only to request_success_total.  Every other
+    # label is treated conservatively as exporter/model/engine scope.  Hashes
+    # are process-keyed and never enter the public projection.
+    scope_labels = tuple(
+        item
+        for item in labels
+        if not (
+            metric_name == _REQUESTS_FINISHED_FAMILY
+            and item[0] == "finished_reason"
+        )
+    )
+    return _labels_identity(scope_labels, domain=b"scope\x00")
+
+
+def _finish_reason_class(
+    metric_name: str,
+    labels: Sequence[tuple[str, str]],
+) -> str:
+    if metric_name != _REQUESTS_FINISHED_FAMILY:
+        return "not_applicable"
+    values = tuple(
+        value for name, value in labels if name == "finished_reason"
+    )
+    if len(values) != 1:
+        return "unclassified"
+    reason = values[0]
+    if reason in _ALLOWED_FINISH_REASONS:
+        return "allowed"
+    if reason in _DISALLOWED_FINISH_REASONS:
+        return "disallowed"
+    return "unclassified"
 
 
 def _parse_labels(line: str, position: int) -> tuple[
@@ -416,7 +493,7 @@ def parse_vllm_metrics(body: bytes | str) -> MetricsSnapshot:
         raw_lines.pop()
     if len(raw_lines) > MAX_LINES:
         _fail("metrics_too_many_lines")
-    families: dict[str, dict[str, float]] = {}
+    families: dict[str, dict[str, tuple[str, str, float]]] = {}
     recognized_samples = 0
     for raw_line in raw_lines:
         line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
@@ -439,17 +516,29 @@ def parse_vllm_metrics(body: bytes | str) -> MetricsSnapshot:
             _fail("metrics_too_many_recognized_samples")
         _validate_value(name, value)
         identity = _series_identity(labels)
+        scope_identity = _scope_identity(name, labels)
+        finish_reason_class = _finish_reason_class(name, labels)
         family = families.setdefault(name, {})
         if identity in family:
             _fail("metrics_duplicate_series")
-        family[identity] = value
+        family[identity] = (
+            scope_identity,
+            finish_reason_class,
+            value,
+        )
 
     frozen_families = tuple(
         (
             name,
             tuple(
-                _Series(identity=identity, value=value)
-                for identity, value in sorted(series.items())
+                _Series(
+                    identity=identity,
+                    scope_identity=scope_identity,
+                    finish_reason_class=finish_reason_class,
+                    value=value,
+                )
+                for identity, (scope_identity, finish_reason_class, value)
+                in sorted(series.items())
             ),
         )
         for name, series in sorted(families.items())
@@ -467,7 +556,9 @@ def _selected_alias(
     selected: list[str | None] = []
     for snapshot in snapshots:
         available = [
-            name for name in aliases if snapshot._family(name) is not None
+            name
+            for name in aliases
+            if MetricsSnapshot._family(snapshot, name) is not None
         ]
         selected.append(available[0] if available else None)
     if len(set(selected)) != 1:
@@ -517,6 +608,20 @@ def _validate_snapshot(snapshot: MetricsSnapshot) -> None:
                 type(item) is not _Series
                 or type(item.identity) is not str
                 or re.fullmatch(r"[0-9a-f]{64}", item.identity) is None
+                or type(item.scope_identity) is not str
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", item.scope_identity
+                ) is None
+                or type(item.finish_reason_class) is not str
+                or item.finish_reason_class not in _FINISH_REASON_CLASSES
+                or (
+                    name == _REQUESTS_FINISHED_FAMILY
+                    and item.finish_reason_class == "not_applicable"
+                )
+                or (
+                    name != _REQUESTS_FINISHED_FAMILY
+                    and item.finish_reason_class != "not_applicable"
+                )
                 or type(item.value) is not float
                 or not math.isfinite(item.value)
             ):
@@ -558,6 +663,28 @@ def _validate_window(window: MetricsWindow) -> None:
         or type(window.source_families) is not tuple
         or len(window.source_families) > len(_RECOGNIZED_FAMILIES)
         or type(window.series_counts) is not tuple
+        or type(window.histogram_observation_counts) is not tuple
+        or (
+            window.metric_scope_consistent is not None
+            and type(window.metric_scope_consistent) is not bool
+        )
+        or (
+            window.metric_scope_count is not None
+            and (
+                type(window.metric_scope_count) is not int
+                or not 0
+                <= window.metric_scope_count
+                <= MAX_RECOGNIZED_SAMPLES
+            )
+        )
+        or (
+            (window.metric_scope_consistent is None)
+            != (window.metric_scope_count is None)
+        )
+        or (
+            window.metric_scope_consistent is True
+            and window.metric_scope_count == 0
+        )
     ):
         _fail("metrics_invalid_window")
     if (
@@ -577,6 +704,9 @@ def _validate_window(window: MetricsWindow) -> None:
         window.max_requests_running,
         window.max_requests_waiting,
         window.max_requests_swapped,
+        window.allowed_finished_requests,
+        window.disallowed_finished_requests,
+        window.unclassified_finished_requests,
     )
     if any(
         value is not None
@@ -643,6 +773,58 @@ def _validate_window(window: MetricsWindow) -> None:
         count_names.append(item[0])
     if count_names != sorted(set(count_names)):
         _fail("metrics_invalid_window")
+    if len(window.histogram_observation_counts) > len(
+        _HISTOGRAM_OBSERVATION_NAMES
+    ):
+        _fail("metrics_invalid_window")
+    observation_names: list[str] = []
+    for item in window.histogram_observation_counts:
+        if (
+            type(item) is not tuple
+            or len(item) != 2
+            or type(item[0]) is not str
+            or item[0] not in _HISTOGRAM_OBSERVATION_NAMES
+            or type(item[1]) is not int
+            or not 0 <= item[1] <= MAX_SAFE_NUMERIC_MAGNITUDE
+        ):
+            _fail("metrics_invalid_window")
+        observation_names.append(item[0])
+    if observation_names != sorted(set(observation_names)):
+        _fail("metrics_invalid_window")
+    outcome_counts = (
+        window.allowed_finished_requests,
+        window.disallowed_finished_requests,
+        window.unclassified_finished_requests,
+    )
+    supplied_outcomes = tuple(value is not None for value in outcome_counts)
+    if any(supplied_outcomes):
+        if (
+            not all(supplied_outcomes)
+            or window.requests_finished is None
+            or sum(value for value in outcome_counts if value is not None)
+            != window.requests_finished
+        ):
+            _fail("metrics_invalid_window")
+    elif window.requests_finished is None:
+        return
+
+
+def _metric_scope_summary(
+    snapshot: MetricsSnapshot,
+    sources: set[str],
+) -> tuple[bool, int]:
+    scope_sets: list[frozenset[str]] = []
+    for family_name, series in snapshot._families:
+        if family_name in sources:
+            scope_sets.append(
+                frozenset(item.scope_identity for item in series)
+            )
+    if len(scope_sets) != len(sources) or not scope_sets:
+        return False, len(set().union(*scope_sets)) if scope_sets else 0
+    first = scope_sets[0]
+    return all(item == first for item in scope_sets[1:]), len(
+        set().union(*scope_sets)
+    )
 
 
 def _counter_series_deltas(
@@ -654,14 +836,32 @@ def _counter_series_deltas(
     first: Mapping[str, float] | None = None
     previous: Mapping[str, float] | None = None
     last: Mapping[str, float] | None = None
+    metadata: Mapping[str, tuple[str, str]] | None = None
     for snapshot in snapshots:
-        series = snapshot._family(name)
+        series = MetricsSnapshot._family(snapshot, name)
         if series is None:
             _fail("metrics_series_topology_changed")
         identities = set(series)
         if topology is None:
             topology = identities
         elif identities != topology:
+            _fail("metrics_series_topology_changed")
+        current_metadata: dict[str, tuple[str, str]] = {}
+        for family_name, family_series in snapshot._families:
+            if family_name == name:
+                current_metadata = {
+                    item.identity: (
+                        item.scope_identity,
+                        item.finish_reason_class,
+                    )
+                    for item in family_series
+                }
+                break
+        if set(current_metadata) != identities:
+            _fail("metrics_series_topology_changed")
+        if metadata is None:
+            metadata = MappingProxyType(current_metadata)
+        elif current_metadata != metadata:
             _fail("metrics_series_topology_changed")
         if previous is not None and any(
             series[identity] < value
@@ -683,6 +883,37 @@ def _counter_series_deltas(
     return MappingProxyType(deltas)
 
 
+def _finished_request_outcome_counts(
+    snapshots: Sequence[MetricsSnapshot],
+    name: str | None,
+) -> tuple[int | None, int | None, int | None]:
+    if name is None:
+        return None, None, None
+    deltas = _counter_series_deltas(snapshots, name)
+    if deltas is None:
+        _fail("metrics_series_topology_changed")
+    classes: dict[str, str] = {}
+    for family_name, series in snapshots[0]._families:
+        if family_name == name:
+            classes = {
+                item.identity: item.finish_reason_class for item in series
+            }
+            break
+    if set(classes) != set(deltas):
+        _fail("metrics_series_topology_changed")
+    totals = {"allowed": 0.0, "disallowed": 0.0, "unclassified": 0.0}
+    for identity, delta in deltas.items():
+        outcome_class = classes[identity]
+        if outcome_class not in totals:
+            _fail("metrics_invalid_snapshot")
+        totals[outcome_class] += delta
+    return (
+        _as_int(totals["allowed"]),
+        _as_int(totals["disallowed"]),
+        _as_int(totals["unclassified"]),
+    )
+
+
 def _counter_delta(
     snapshots: Sequence[MetricsSnapshot], name: str | None
 ) -> tuple[float | None, int]:
@@ -695,7 +926,10 @@ def _counter_delta(
 def _plain_family(
     snapshots: Sequence[MetricsSnapshot], name: str
 ) -> str | None:
-    present = [snapshot._family(name) is not None for snapshot in snapshots]
+    present = [
+        MetricsSnapshot._family(snapshot, name) is not None
+        for snapshot in snapshots
+    ]
     if any(present) and not all(present):
         _fail("metrics_alias_or_availability_changed")
     return name if all(present) else None
@@ -708,8 +942,12 @@ def _histogram_base(
 
     pair_presence: list[bool] = []
     for snapshot in snapshots:
-        has_sum = snapshot._family(f"{base}_sum") is not None
-        has_count = snapshot._family(f"{base}_count") is not None
+        has_sum = (
+            MetricsSnapshot._family(snapshot, f"{base}_sum") is not None
+        )
+        has_count = (
+            MetricsSnapshot._family(snapshot, f"{base}_count") is not None
+        )
         if has_sum != has_count:
             _fail("metrics_histogram_pair_incomplete")
         pair_presence.append(has_sum)
@@ -721,13 +959,13 @@ def _histogram_base(
 def _histogram_mean_ms(
     snapshots: Sequence[MetricsSnapshot],
     base: str | None,
-) -> tuple[float | None, tuple[tuple[str, int], ...]]:
+) -> tuple[float | None, tuple[tuple[str, int], ...], int | None]:
     if base is None:
-        return None, ()
+        return None, (), None
     sum_deltas = _counter_series_deltas(snapshots, f"{base}_sum")
     count_deltas = _counter_series_deltas(snapshots, f"{base}_count")
-    sum_start = snapshots[0]._family(f"{base}_sum")
-    count_start = snapshots[0]._family(f"{base}_count")
+    sum_start = MetricsSnapshot._family(snapshots[0], f"{base}_sum")
+    count_start = MetricsSnapshot._family(snapshots[0], f"{base}_count")
     if (
         sum_start is None
         or count_start is None
@@ -742,6 +980,9 @@ def _histogram_mean_ms(
             _fail("metrics_histogram_delta_mismatch")
     sum_delta = sum(sum_deltas.values())
     count_delta = sum(count_deltas.values())
+    if not count_delta.is_integer():
+        _fail("metrics_histogram_delta_mismatch")
+    observation_count = int(count_delta)
     sum_count = len(sum_deltas)
     count_count = len(count_deltas)
     if count_delta == 0:
@@ -756,9 +997,13 @@ def _histogram_mean_ms(
             or mean > MAX_SAFE_NUMERIC_MAGNITUDE
         ):
             _fail("metrics_derived_value_out_of_range")
-    return mean, (
-        (f"{base}_sum", sum_count),
-        (f"{base}_count", count_count),
+    return (
+        mean,
+        (
+            (f"{base}_sum", sum_count),
+            (f"{base}_count", count_count),
+        ),
+        observation_count,
     )
 
 
@@ -771,7 +1016,7 @@ def _gauge_max(
     maximum: float | None = None
     count = 0
     for snapshot in snapshots:
-        series = snapshot._family(name)
+        series = MetricsSnapshot._family(snapshot, name)
         if series is None:
             _fail("metrics_series_topology_changed")
         identities = set(series)
@@ -877,6 +1122,11 @@ def derive_metrics_window(
         all_snapshots, _ALIASES["preemptions"]
     )
     requests_delta = counter("requests_finished", requests_name)
+    (
+        allowed_finished_requests,
+        disallowed_finished_requests,
+        unclassified_finished_requests,
+    ) = _finished_request_outcome_counts(all_snapshots, requests_name)
     output_delta = counter("output_tokens", output_name)
     prompt_delta = counter("prompt_tokens", prompt_name)
     preemption_delta = counter("preemptions", preemption_name)
@@ -889,31 +1139,47 @@ def derive_metrics_window(
         ("decode", "vllm:request_decode_time_seconds"),
     )
     histogram_means: dict[str, float | None] = {}
+    histogram_observation_counts: dict[str, int] = {}
     for logical, base_name in histogram_specs:
         base = _histogram_base(all_snapshots, base_name)
-        mean, counts = _histogram_mean_ms(all_snapshots, base)
+        mean, counts, observation_count = _histogram_mean_ms(
+            all_snapshots,
+            base,
+        )
         histogram_means[logical] = mean
         if base is not None:
             sources.update((f"{base}_sum", f"{base}_count"))
             series_counts.update(dict(counts))
+            if observation_count is None:
+                _fail("metrics_histogram_delta_mismatch")
+            histogram_observation_counts[logical] = observation_count
 
     tpot_base = _histogram_base(
         all_snapshots, "vllm:request_time_per_output_token_seconds"
     )
-    mean_tpot, tpot_counts = _histogram_mean_ms(
+    mean_tpot, tpot_counts, tpot_observations = _histogram_mean_ms(
         all_snapshots, tpot_base
     )
     if tpot_base is not None:
         sources.update((f"{tpot_base}_sum", f"{tpot_base}_count"))
         series_counts.update(dict(tpot_counts))
+        if tpot_observations is None:
+            _fail("metrics_histogram_delta_mismatch")
+        histogram_observation_counts["tpot"] = tpot_observations
 
     itl_aliases = _ALIASES["itl"]
     itl_bases: list[str | None] = []
     for snapshot in all_snapshots:
         available: list[str] = []
         for base in itl_aliases:
-            has_sum = snapshot._family(f"{base}_sum") is not None
-            has_count = snapshot._family(f"{base}_count") is not None
+            has_sum = (
+                MetricsSnapshot._family(snapshot, f"{base}_sum")
+                is not None
+            )
+            has_count = (
+                MetricsSnapshot._family(snapshot, f"{base}_count")
+                is not None
+            )
             if has_sum != has_count:
                 _fail("metrics_histogram_pair_incomplete")
             if has_sum:
@@ -922,12 +1188,15 @@ def derive_metrics_window(
     if len(set(itl_bases)) != 1:
         _fail("metrics_alias_or_availability_changed")
     itl_base = itl_bases[0]
-    mean_itl, itl_counts = _histogram_mean_ms(
+    mean_itl, itl_counts, itl_observations = _histogram_mean_ms(
         all_snapshots, itl_base
     )
     if itl_base is not None:
         sources.update((f"{itl_base}_sum", f"{itl_base}_count"))
         series_counts.update(dict(itl_counts))
+        if itl_observations is None:
+            _fail("metrics_histogram_delta_mismatch")
+        histogram_observation_counts["itl"] = itl_observations
 
     running_name = _plain_family(
         all_snapshots, "vllm:num_requests_running"
@@ -953,6 +1222,11 @@ def derive_metrics_window(
             sources.add(physical)
             series_counts[logical] = count
 
+    scope_consistent, scope_count = _metric_scope_summary(
+        before,
+        sources,
+    )
+
     return MetricsWindow(
         elapsed_seconds=elapsed,
         observations=len(all_snapshots),
@@ -976,6 +1250,14 @@ def derive_metrics_window(
         max_kv_cache_usage_fraction=kv_max,
         source_families=tuple(sorted(sources)),
         series_counts=tuple(sorted(series_counts.items())),
+        histogram_observation_counts=tuple(
+            sorted(histogram_observation_counts.items())
+        ),
+        metric_scope_consistent=scope_consistent,
+        metric_scope_count=scope_count,
+        allowed_finished_requests=allowed_finished_requests,
+        disallowed_finished_requests=disallowed_finished_requests,
+        unclassified_finished_requests=unclassified_finished_requests,
     )
 
 
