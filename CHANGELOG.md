@@ -15,8 +15,16 @@ All notable changes to Throttle will be documented in this file.
 - Deterministic adversarial boundary coverage for Unicode spoofing, credentials,
   paths, digests, duplicate JSON keys, cyclic/deep structures, and payload
   non-reflection
+- Isolated, bounded vLLM Prometheus metric collection and suggestion-only
+  `max_num_seqs` bottleneck analysis components. Neither is connected to the
+  CLI or saved reports, and both remain decision-ineligible by construction.
 
 ### Changed
+- Golden now accepts any two canonical positive, distinct `max_num_seqs`
+  values, preserves one declared closed-loop load at or above the larger value,
+  and infers the treatment independently from all six saved reports. Historical
+  1-versus-8 evidence remains valid. The exercise claim is explicitly limited
+  to offered client demand, not direct server-scheduler saturation.
 - Multi-load benchmark sweeps now warn before key resolution or traffic that
   their condition-major results are exploratory and cannot be decision-eligible
 - Smoke sessions default to a 120-second ceiling, sustained benchmarks retain

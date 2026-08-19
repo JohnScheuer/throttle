@@ -414,11 +414,21 @@ possible, as documented in the
 
 ## Golden live protocol
 
-The controlled treatment implemented by the protocol is
-`max_num_seqs=1` versus `8`. Each golden position contains exactly one
-condition, `--concurrency 8`, so the workload actually exercises the treatment;
-lower exploratory load levels belong in separate reports. Everything else must
-remain pinned.
+The controlled treatment implemented by the protocol is any two distinct,
+canonical positive integer values of `max_num_seqs` (ASCII decimal digits,
+without a sign, whitespace, or leading zero, in the range 1 through
+2,147,483,647). Each golden position contains exactly one closed-loop
+condition. Its client concurrency must be at
+least the larger treatment value; use the analyzer's original offered
+concurrency when it is higher. For example, an `8` versus `10` treatment can
+run at `--concurrency 16`. If `--concurrency` is omitted, Golden defaults to the
+larger treatment value. Lower exploratory load levels belong in separate
+reports. Everything else must remain pinned.
+
+Reaching the declared client concurrency proves that Throttle offered enough
+simultaneous demand to exercise the configured limit. It does **not** prove
+that the server scheduler held that many sequences simultaneously or that the
+server was saturated.
 
 `throttle golden` owns the complete B1/C1/B2/C2/B3/C3 measurement session and
 the final validation. It does **not** change server configuration: before each
@@ -435,8 +445,9 @@ throttle golden --dry-run \
   --model Qwen/Qwen3-8B \
   --url https://inference.example/v1 \
   --api-key-env VLLM_API_KEY \
-  --baseline-config max_num_seqs=1 \
-  --candidate-config max_num_seqs=8 \
+  --baseline-config max_num_seqs=8 \
+  --candidate-config max_num_seqs=10 \
+  --concurrency 16 \
   --cost-model dedicated-hourly \
   --gpus 1 \
   --total-hourly-price 0.50 \
@@ -497,23 +508,26 @@ throttle compare B1.json C1.json B2.json C2.json B3.json C3.json \
 The gate requires live inference, exact ordering/non-overlap, one hashed
 accelerator fingerprint, a pinned software environment and full model commit,
 runtime-verified engine flags, the same workload/SLO/cache policy, zero invalid
-responses, and the 1-versus-8 treatment. CUDA positions additionally require a
-pinned image digest and CUDA/driver versions. It evaluates order-balanced phase
-contrasts and retains the 5% completion-token guard across every position; a
-declared SLO must also hold in all six runs. See
+responses, and one positive, distinct `max_num_seqs` pair with the same
+declared client load reached in every position. CUDA positions additionally
+require a pinned image digest and CUDA/driver versions. It evaluates
+order-balanced phase contrasts and retains the 5% completion-token guard across
+every position; a declared SLO must also hold in all six runs. See
 [the full protocol](docs/GOLDEN_PROTOCOL.md).
 
 Only when that complete gate passes and the order-balanced 95% interval
 excludes zero, the golden artifact and terminal add one clearly labelled,
 workload-scoped recommendation line naming the winning configuration and its
-candidate-relative throughput delta. It says which declared E2E/TTFT SLO gates
-passed; it never upgrades SLO compliance into a “latency parity” claim. An
-ineligible or inconclusive run has `decision_summary: null` and prints no
-recommendation.
+candidate-relative throughput delta. The aggregate's sanitized `treatment`
+block records the inferred baseline value, candidate value, and common client
+concurrency even when the statistical result is inconclusive. The summary says
+which declared E2E/TTFT SLO gates passed; it never upgrades SLO compliance into
+a “latency parity” or server-saturation claim. An ineligible or inconclusive run
+has `decision_summary: null` and prints no recommendation.
 
 Throttle never provisions or reconfigures the accelerator/server. In this repository no
 server credentials or endpoint identifiers are retained. A sanitized completed
-six-position run is included under
+six-position 1-versus-8 run is included under
 [`validation/golden-live-20260817`](validation/golden-live-20260817) as protocol
 evidence. It measures only its pinned model, accelerator, workload, and test window; it
 is not a universal performance, savings, or production recommendation.

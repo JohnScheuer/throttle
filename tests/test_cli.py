@@ -222,6 +222,9 @@ def _golden_args(
     *,
     key_env: str = "THROTTLE_GOLDEN_KEY",
     runtime_args: tuple[str, ...] | None = None,
+    baseline_max_num_seqs: str = "1",
+    candidate_max_num_seqs: str = "8",
+    concurrency: int | None = None,
 ) -> list[str]:
     if runtime_args is None:
         runtime_args = (
@@ -236,6 +239,7 @@ def _golden_args(
             "--driver-version",
             "570.86",
         )
+    load_args = () if concurrency is None else ("--concurrency", str(concurrency))
     return [
         "golden",
         "--model",
@@ -245,9 +249,10 @@ def _golden_args(
         "--api-key-env",
         key_env,
         "--baseline-config",
-        "max_num_seqs=1",
+        f"max_num_seqs={baseline_max_num_seqs}",
         "--candidate-config",
-        "max_num_seqs=8",
+        f"max_num_seqs={candidate_max_num_seqs}",
+        *load_args,
         "--cost-model",
         "dedicated-hourly",
         "--total-hourly-price",
@@ -346,6 +351,12 @@ def _supported_golden_artifact() -> dict[str, object]:
         "decision_eligible": True,
         "decision_state": "supported",
         "eligibility_reasons": [],
+        "treatment": {
+            "field": "max_num_seqs",
+            "baseline_value": 1,
+            "candidate_value": 8,
+            "closed_loop_concurrency": 8,
+        },
         "conditions": [
             {
                 "condition_id": "closed_loop:8",
@@ -752,10 +763,238 @@ class ParserAndPlanTests(unittest.TestCase):
 
             self.assertEqual(exit_code, EXIT_OK)
             self.assertIn("Decision-grade preflight: READY", stdout.getvalue())
+            self.assertIn(
+                "Load: closed-loop concurrency 8", stdout.getvalue()
+            )
             self.assertFalse(output_dir.exists())
             resolve_key.assert_not_called()
             runner.assert_not_called()
             operator_input.assert_not_called()
+
+    def test_arbitrary_pair_golden_plan_uses_requested_load_without_traffic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "golden-8-vs-10-plan"
+            stdout = io.StringIO()
+            argv = [
+                *_golden_args(
+                    output_dir,
+                    key_env="MISSING_GOLDEN_KEY",
+                    baseline_max_num_seqs="8",
+                    candidate_max_num_seqs="10",
+                    concurrency=16,
+                ),
+                "--dry-run",
+            ]
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "throttle.cli._resolve_key",
+                    side_effect=AssertionError("plan resolved a credential"),
+                ) as resolve_key,
+                patch(
+                    "throttle.cli.run_native",
+                    side_effect=AssertionError("plan sent benchmark traffic"),
+                ) as runner,
+                patch(
+                    "throttle.cli._timed_operator_input",
+                    side_effect=AssertionError("plan prompted the operator"),
+                ) as operator_input,
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = main(argv)
+
+            output = stdout.getvalue()
+            self.assertEqual(exit_code, EXIT_OK)
+            self.assertIn(
+                "Treatment: baseline max_num_seqs=8; candidate max_num_seqs=10",
+                output,
+            )
+            self.assertIn("Load: closed-loop concurrency 16", output)
+            self.assertIn(
+                "not direct server-scheduler saturation", output
+            )
+            self.assertIn("Decision-grade preflight: READY", output)
+            self.assertIn("B1 → C1 → B2 → C2 → B3 → C3", output)
+            self.assertFalse(output_dir.exists())
+            resolve_key.assert_not_called()
+            runner.assert_not_called()
+            operator_input.assert_not_called()
+
+    def test_invalid_golden_treatments_fail_before_key_output_or_traffic(self) -> None:
+        cases = (
+            ("zero", "max_num_seqs=0", "max_num_seqs=10"),
+            ("negative", "max_num_seqs=-1", "max_num_seqs=10"),
+            ("explicit_plus", "max_num_seqs=+8", "max_num_seqs=10"),
+            ("leading_space", "max_num_seqs= 8", "max_num_seqs=10"),
+            ("trailing_space", "max_num_seqs=8 ", "max_num_seqs=10"),
+            ("leading_zero", "max_num_seqs=08", "max_num_seqs=10"),
+            ("decimal", "max_num_seqs=8.0", "max_num_seqs=10"),
+            ("exponent", "max_num_seqs=1e1", "max_num_seqs=10"),
+            ("over_bound", "max_num_seqs=2147483648", "max_num_seqs=10"),
+            ("oversized", "max_num_seqs=" + "9" * 5_000, "max_num_seqs=10"),
+            (
+                "wrong_flag",
+                "max_num_batched_tokens=8",
+                "max_num_batched_tokens=10",
+            ),
+            ("equal", "max_num_seqs=8", "max_num_seqs=8"),
+            (
+                "private_payload",
+                "max_num_seqs=private-treatment-secret",
+                "max_num_seqs=10",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for name, baseline, candidate in cases:
+                with self.subTest(case=name):
+                    output_dir = Path(temp_dir) / name
+                    argv = _golden_args(
+                        output_dir,
+                        key_env="MISSING_GOLDEN_KEY",
+                        concurrency=16,
+                    )
+                    argv[argv.index("--baseline-config") + 1] = baseline
+                    argv[argv.index("--candidate-config") + 1] = candidate
+                    stderr = io.StringIO()
+                    with (
+                        patch.dict(os.environ, {}, clear=True),
+                        patch(
+                            "throttle.cli._resolve_key",
+                            side_effect=AssertionError(
+                                "invalid treatment resolved a credential"
+                            ),
+                        ) as resolve_key,
+                        patch(
+                            "throttle.cli.run_native",
+                            side_effect=AssertionError(
+                                "invalid treatment sent benchmark traffic"
+                            ),
+                        ) as runner,
+                        patch(
+                            "throttle.cli._timed_operator_input",
+                            side_effect=AssertionError(
+                                "invalid treatment prompted the operator"
+                            ),
+                        ) as operator_input,
+                        contextlib.redirect_stderr(stderr),
+                    ):
+                        with self.assertRaises(SystemExit) as raised:
+                            main(argv)
+
+                    self.assertEqual(raised.exception.code, EXIT_USAGE)
+                    self.assertFalse(output_dir.exists())
+                    resolve_key.assert_not_called()
+                    runner.assert_not_called()
+                    operator_input.assert_not_called()
+                    self.assertNotIn("Traceback", stderr.getvalue())
+                    if name == "equal":
+                        self.assertIn(
+                            "golden_max_num_seqs_values_must_be_distinct",
+                            stderr.getvalue(),
+                        )
+                    elif name == "wrong_flag":
+                        self.assertIn(
+                            "golden_treatment_must_only_change_max_num_seqs",
+                            stderr.getvalue(),
+                        )
+                    else:
+                        self.assertIn(
+                            "golden_max_num_seqs_values_must_be_canonical_positive_integers",
+                            stderr.getvalue(),
+                        )
+                    if name == "private_payload":
+                        self.assertNotIn("private-treatment-secret", stderr.getvalue())
+                    if name == "oversized":
+                        self.assertNotIn("9" * 5_000, stderr.getvalue())
+
+    def test_golden_load_below_larger_pair_value_fails_before_key_or_traffic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "golden-underloaded"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            argv = _golden_args(
+                output_dir,
+                key_env="MISSING_GOLDEN_KEY",
+                baseline_max_num_seqs="8",
+                candidate_max_num_seqs="10",
+                concurrency=9,
+            )
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "throttle.cli._resolve_key",
+                    side_effect=AssertionError("underloaded plan resolved a key"),
+                ) as resolve_key,
+                patch(
+                    "throttle.cli.run_native",
+                    side_effect=AssertionError("underloaded plan sent traffic"),
+                ) as runner,
+                patch(
+                    "throttle.cli._timed_operator_input",
+                    side_effect=AssertionError("underloaded plan prompted operator"),
+                ) as operator_input,
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = main(argv)
+
+            self.assertEqual(exit_code, EXIT_USAGE)
+            self.assertIn(
+                "golden_concurrency_must_reach_both_max_num_seqs_values",
+                stdout.getvalue(),
+            )
+            self.assertIn("blocked before key resolution or traffic", stderr.getvalue())
+            self.assertFalse(output_dir.exists())
+            resolve_key.assert_not_called()
+            runner.assert_not_called()
+            operator_input.assert_not_called()
+
+    def test_golden_count_bounded_block_must_be_able_to_reach_declared_load(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "golden-underfilled-blocks"
+            argv = [
+                *_golden_args(
+                    output_dir,
+                    key_env="MISSING_GOLDEN_KEY",
+                    baseline_max_num_seqs="8",
+                    candidate_max_num_seqs="10",
+                    concurrency=16,
+                ),
+                "--blocks",
+                "20",
+                "--requests-per-block",
+                "10",
+            ]
+            stdout = io.StringIO()
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "throttle.cli._resolve_key",
+                    side_effect=AssertionError("underfilled blocks resolved a key"),
+                ) as resolve_key,
+                patch(
+                    "throttle.cli.run_native",
+                    side_effect=AssertionError("underfilled blocks sent traffic"),
+                ) as runner,
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(argv)
+
+            self.assertEqual(exit_code, EXIT_USAGE)
+            self.assertIn(
+                "golden_requests_per_block_must_reach_declared_concurrency",
+                stdout.getvalue(),
+            )
+            self.assertFalse(output_dir.exists())
+            resolve_key.assert_not_called()
+            runner.assert_not_called()
 
     def test_golden_reuses_the_exact_preflighted_prompt_sets_for_traffic(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -947,6 +1186,13 @@ class ParserAndPlanTests(unittest.TestCase):
                     ("max_num_seqs", "8"),
                 ],
             )
+            self.assertEqual(
+                [
+                    config.conditions[0].max_in_flight  # type: ignore[attr-defined]
+                    for config in captured_configs
+                ],
+                [8, 8, 8, 8, 8, 8],
+            )
             validator.assert_called_once()
             for name in ("B1", "C1", "B2", "C2", "B3", "C3", "golden"):
                 path = output_dir / f"{name}.json"
@@ -964,6 +1210,96 @@ class ParserAndPlanTests(unittest.TestCase):
             )
             self.assertIn("Throttle golden live result", stdout.getvalue())
             self.assertNotIn("no traffic sent", stdout.getvalue())
+
+    def test_arbitrary_pair_orchestration_builds_exact_dynamic_six_configs(
+        self,
+    ) -> None:
+        captured_configs: list[object] = []
+
+        async def golden_runner(
+            config: object,
+            prompts: object,
+            warmups: object,
+            *,
+            progress: object,
+            **run_kwargs: object,
+        ) -> dict[str, object]:
+            del prompts, warmups, run_kwargs
+            captured_configs.append(config)
+            report = _golden_position_artifact()
+            progress.set(report)  # type: ignore[attr-defined]
+            return report
+
+        golden_result = _supported_golden_artifact()
+        golden_result["treatment"] = {
+            "field": "max_num_seqs",
+            "baseline_value": 8,
+            "candidate_value": 10,
+            "closed_loop_concurrency": 10,
+        }
+        golden_result["decision_summary"] = {
+            **golden_result["decision_summary"],  # type: ignore[arg-type]
+            "winner_config": {"max_num_seqs": 10},
+            "text": (
+                "Golden recommendation — tested workload only: candidate "
+                "max_num_seqs=10 won by 23.0%."
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "golden-8-vs-10"
+            argv = _golden_args(
+                output_dir,
+                baseline_max_num_seqs="8",
+                candidate_max_num_seqs="10",
+            )
+            with (
+                patch.dict(
+                    os.environ, {"THROTTLE_GOLDEN_KEY": SECRET_KEY}, clear=True
+                ),
+                patch("throttle.cli.run_native", side_effect=golden_runner),
+                patch(
+                    "throttle.cli.validate_golden_sequence",
+                    return_value=golden_result,
+                ),
+                patch(
+                    "throttle.cli._timed_operator_input",
+                    side_effect=[
+                        "B1 verified",
+                        "C1 verified",
+                        "B2 verified",
+                        "C2 verified",
+                        "B3 verified",
+                        "C3 verified",
+                    ],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(argv)
+
+            self.assertEqual(exit_code, EXIT_OK)
+            self.assertEqual(
+                [
+                    (
+                        config.sequence_position,  # type: ignore[attr-defined]
+                        config.variant,  # type: ignore[attr-defined]
+                        config.engine_flags[-1],  # type: ignore[attr-defined]
+                        config.conditions[0].max_in_flight,  # type: ignore[attr-defined]
+                    )
+                    for config in captured_configs
+                ],
+                [
+                    ("B1", "baseline", ("max_num_seqs", "8"), 10),
+                    ("C1", "candidate", ("max_num_seqs", "10"), 10),
+                    ("B2", "baseline", ("max_num_seqs", "8"), 10),
+                    ("C2", "candidate", ("max_num_seqs", "10"), 10),
+                    ("B3", "baseline", ("max_num_seqs", "8"), 10),
+                    ("C3", "candidate", ("max_num_seqs", "10"), 10),
+                ],
+            )
+            aggregate = json.loads(
+                (output_dir / "golden.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(aggregate["treatment"], golden_result["treatment"])
 
     def test_golden_cli_six_run_orchestration_uses_real_validator(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1057,6 +1393,15 @@ class ParserAndPlanTests(unittest.TestCase):
             self.assertEqual(artifact["saved_positions"], [])
             self.assertFalse(artifact["decision_eligible"])
             self.assertIsNone(artifact["decision_summary"])
+            self.assertEqual(
+                artifact["treatment"],
+                {
+                    "field": "max_num_seqs",
+                    "baseline_value": 1,
+                    "candidate_value": 8,
+                    "closed_loop_concurrency": 8,
+                },
+            )
             self.assertEqual(stat.S_IMODE(artifact_path.stat().st_mode), 0o600)
             self.assertNotIn(PRIVATE_ENDPOINT, artifact_text)
             self.assertNotIn(SECRET_KEY, artifact_text)

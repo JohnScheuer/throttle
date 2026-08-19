@@ -30,10 +30,12 @@ from .benchmark import (
 )
 from .compare import ComparisonInputError, compare_reports, load_report
 from .golden import (
-    GOLDEN_POSITIONS,
     GOLDEN_SESSION_ARTIFACT_TYPE,
+    GoldenTreatmentError,
     build_golden_plan,
+    golden_positions,
     golden_position_config,
+    parse_golden_treatment_flags,
     validate_golden_sequence,
 )
 from .models import CostModel, EndpointConfig, LoadCondition, RunConfig, SafetyLimits
@@ -313,7 +315,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="baseline_config",
         required=True,
         metavar="NAME=VALUE",
-        help="verified baseline treatment; currently exactly max_num_seqs=1",
+        help=(
+            "verified baseline treatment as canonical "
+            "max_num_seqs=INTEGER (1..2147483647)"
+        ),
     )
     golden.add_argument(
         "--candidate-config",
@@ -321,7 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="candidate_config",
         required=True,
         metavar="NAME=VALUE",
-        help="verified candidate treatment; currently exactly max_num_seqs=8",
+        help=(
+            "verified candidate treatment as a distinct canonical "
+            "max_num_seqs=INTEGER (1..2147483647)"
+        ),
     )
     golden.add_argument(
         "--dry-run",
@@ -779,6 +787,20 @@ def _print_golden(
     print(f"Protocol eligible: {'yes' if report['golden_protocol_eligible'] else 'NO'}")
     if report["eligibility_reasons"]:
         print("Reasons: " + ", ".join(report["eligibility_reasons"]))
+    treatment = report.get("treatment")
+    if (
+        isinstance(treatment, Mapping)
+        and treatment.get("field") == "max_num_seqs"
+        and type(treatment.get("baseline_value")) is int
+        and type(treatment.get("candidate_value")) is int
+        and type(treatment.get("closed_loop_concurrency")) is int
+    ):
+        print(
+            "Treatment: baseline max_num_seqs="
+            f"{treatment['baseline_value']}; candidate max_num_seqs="
+            f"{treatment['candidate_value']}; closed-loop concurrency "
+            f"{treatment['closed_loop_concurrency']}"
+        )
     for condition in report["conditions"]:
         interval = condition["throughput_delta_percent_ci"]
         print(
@@ -796,17 +818,39 @@ def _print_golden(
 
 def _golden_config_flags(
     parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> tuple[tuple[str, str], tuple[str, str]]:
+) -> tuple[tuple[str, str], tuple[str, str], int, int]:
     baseline = _engine_flags(parser, [args.baseline_config])[0]
     candidate = _engine_flags(parser, [args.candidate_config])[0]
-    return baseline, candidate
+    try:
+        baseline_value, candidate_value = parse_golden_treatment_flags(
+            baseline, candidate
+        )
+    except GoldenTreatmentError as exc:
+        _parser_error(parser, exc.code)
+        raise AssertionError("argparse.error must terminate")  # pragma: no cover
+    return baseline, candidate, baseline_value, candidate_value
 
 
 def _print_golden_plan(plan: Mapping[str, Any], output_dir: Path) -> None:
     print("Throttle golden plan — ZERO TRAFFIC SENT")
     print("Sequence: " + " → ".join(item["position"] for item in plan["positions"]))
-    print("Treatment: baseline max_num_seqs=1; candidate max_num_seqs=8")
-    print("Load: closed-loop concurrency 8 at every position")
+    treatment = plan["treatment"]
+    print(
+        "Treatment: baseline max_num_seqs="
+        f"{treatment['baseline_value']}; candidate max_num_seqs="
+        f"{treatment['candidate_value']}"
+    )
+    concurrency = treatment["closed_loop_concurrency"]
+    print(
+        "Load: closed-loop concurrency "
+        f"{concurrency} at every position"
+        if concurrency is not None
+        else "Load: invalid; Golden requires one closed-loop concurrency"
+    )
+    print(
+        "Demand evidence boundary: reaching this client concurrency proves "
+        "sufficient offered demand, not direct server-scheduler saturation."
+    )
     measurement = plan["measurement"]
     block_shape = (
         f"{measurement['blocks_per_position']} blocks × "
@@ -891,6 +935,7 @@ def _golden_session_artifact(
     saved_positions: Sequence[str],
     elapsed_seconds: float,
     estimated_cost: float | None,
+    treatment: Mapping[str, int | str],
     run_totals: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_totals = dict(run_totals or {})
@@ -907,6 +952,14 @@ def _golden_session_artifact(
         "stop_reason": reason,
         "completed_positions": list(completed_positions),
         "saved_positions": list(saved_positions),
+        "treatment": {
+            "field": "max_num_seqs",
+            "baseline_value": int(treatment["baseline_value"]),
+            "candidate_value": int(treatment["candidate_value"]),
+            "closed_loop_concurrency": int(
+                treatment["closed_loop_concurrency"]
+            ),
+        },
         "session_totals": session_totals,
         "decision_summary": None,
         "disclaimer": (
@@ -1101,7 +1154,16 @@ def _handle_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> in
 
 
 def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
-    baseline_flag, candidate_flag = _golden_config_flags(parser, args)
+    (
+        baseline_flag,
+        candidate_flag,
+        baseline_value,
+        candidate_value,
+    ) = _golden_config_flags(parser, args)
+    if args.concurrency is None and args.request_rate is None:
+        # Preserve the historical 1-versus-8 default while making every other
+        # pair exercise at least its larger configured treatment value.
+        args.concurrency = [max(baseline_value, candidate_value)]
     base, prompts, warmup_prompts = _build_config(parser, args, resolve_key=False)
     plan = build_golden_plan(
         base,
@@ -1143,6 +1205,8 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     saved_positions: list[str] = []
     session_started = time.perf_counter()
     session_budget = RunBudget(base, started=session_started)
+    treatment = plan["treatment"]
+    positions = golden_positions(baseline_value, candidate_value)
     aggregate_path = output_dir / "golden.json"
     display_aggregate_path = display_output_dir / "golden.json"
 
@@ -1155,6 +1219,7 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             saved_positions=saved_positions,
             elapsed_seconds=elapsed,
             estimated_cost=base.cost.elapsed_estimate(elapsed),
+            treatment=treatment,
             run_totals=session_budget.public_dict(),
         )
         print(f"Golden session stopped: {reason}.", file=sys.stderr)
@@ -1183,6 +1248,7 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             saved_positions=(),
             elapsed_seconds=0.0,
             estimated_cost=base.cost.elapsed_estimate(0.0),
+            treatment=treatment,
             run_totals=session_budget.public_dict(),
         )
         _atomic_write(initial, aggregate_path)
@@ -1202,7 +1268,7 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         return EXIT_FAILED
 
     try:
-        for position, variant, max_num_seqs in GOLDEN_POSITIONS:
+        for position, variant, max_num_seqs in positions:
             expected = f"{position} verified"
             print()
             print(
