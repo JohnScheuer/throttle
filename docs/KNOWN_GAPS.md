@@ -79,6 +79,19 @@ successful optimization claim.
     engine-flag metadata. The Golden consumed-evidence fingerprint projection is
     versioned and must be updated whenever a future schema adds new decision
     evidence.
+14. **The experimental agent chain is deliberately disconnected.** The server
+    metrics collector, suggestion-only bottleneck analyzer, and independent
+    safety validator are importable internal components only. The validator
+    replays the current reviewed policy, binds an analysis to one metrics
+    window and explicit context, and emits a detached projection with all
+    eligibility, action, Golden-bypass, CLI-integration, and report-integration
+    flags locked false. It does not make exporter metrics request-scoped, prove
+    traffic isolation, prove scheduler saturation, run Golden, or authorize a
+    configuration change. Its detached projection includes only evidence used
+    by the analyzer; exposing other collector diagnostics later requires a new
+    reviewed allowlist. Like any in-process Python API, it is a validation
+    boundary for data, not a sandbox against code that can modify module
+    internals.
 
 Deferred by design: automatic engine reconfiguration, provisioning,
 autoscaling, GPU selection, spot management, cache systems, production proxying,
