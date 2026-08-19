@@ -18,6 +18,10 @@ All notable changes to Throttle will be documented in this file.
 - Isolated, bounded vLLM Prometheus metric collection and suggestion-only
   `max_num_seqs` bottleneck analysis components. Neither is connected to the
   CLI or saved reports, and both remain decision-ineligible by construction.
+- An isolated safety-validation boundary that pins its own reviewed policy,
+  independently replays and binds collector/analyzer evidence, and returns a
+  detached, non-actionable projection. It does not authorize CLI or report
+  integration, apply configuration, or bypass Golden.
 
 ### Changed
 - Golden now accepts any two canonical positive, distinct `max_num_seqs`
