@@ -1,11 +1,11 @@
 """Independent fail-closed boundary for the experimental agent chain.
 
 This module audits the supplementary server-metrics window and bottleneck
-analysis before either may be considered for a future integration.  It is
-deliberately isolated from the CLI, benchmark runner, report schemas,
-comparison code, and Golden implementation.  Passing this boundary never
-changes decision eligibility, applies a configuration, or proves that a
-Golden run has taken place.
+analysis before the explicitly selected ``experimental-tuning`` command may
+present a detached projection.  It remains isolated from standard run-report
+schemas, comparison code, and the Golden implementation.  Passing this
+boundary never changes decision eligibility, applies a configuration, or
+proves that a Golden run has taken place.
 
 The checks below intentionally replay the analyzer policy rather than merely
 trusting its validator.  The returned object owns a detached canonical copy;
@@ -128,8 +128,8 @@ _RISKS = {
 _ANALYSIS_CAVEATS = (
     "This artifact contains an exploratory test suggestion, not a "
     "configuration recommendation.",
-    "Server exporter metrics may include unrelated traffic; traffic "
-    "isolation is operator-attested, not independently proven.",
+    "Exporter-to-inference-deployment matching and traffic isolation are "
+    "operator-attested, not independently proven.",
     "Sampled KV and running-request maxima are not co-timed, so no "
     "per-request KV usage or fit-under capacity is inferred.",
     "The 25 percent step is a bounded search policy, not an estimated "
@@ -183,8 +183,9 @@ _AUDIT_CHECKS = (
     "canonical_projection_detached_from_inputs",
 )
 _SAFETY_CAVEATS = (
-    "Safety validation permits only an isolated supplementary projection; "
-    "CLI and report integration remain unauthorized.",
+    "This result cannot authorize its own routing or insertion into a "
+    "standard Throttle report; only the explicit experimental-tuning "
+    "command may present the detached projection.",
     "Neither the upstream analysis nor this validation is decision-grade.",
     "A suggested pair still requires a separate six-position "
     "counterbalanced Golden run before any configuration decision.",
@@ -1494,8 +1495,9 @@ def audit_agent_outputs(
     """Validate, independently replay, and detach one experimental chain.
 
     A successful return means only that the supplementary output obeys the
-    current safety contract.  It never authorizes CLI/report integration and
-    never upgrades the output or a proposed Golden pair to decision-grade.
+    current safety contract.  It never authorizes routing into a standard
+    report or another CLI path, and never upgrades the output or a proposed
+    Golden pair to decision-grade.
     """
 
     _, supplied = _validate_input_objects(window, context, analysis)

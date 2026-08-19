@@ -1,10 +1,12 @@
 """Fail-closed, suggestion-only analysis of supplementary server metrics.
 
-This module is intentionally isolated from Throttle's CLI, benchmark runner,
-saved-report schema, comparison logic, and Golden protocol.  It selects at
-most one bounded ``max_num_seqs`` value for a future experiment.  It never
-applies configuration, changes decision eligibility, predicts savings, or
-claims that the proposed value will improve an outcome.
+This module remains isolated from Throttle's benchmark runner, saved-report
+schema, comparison logic, and Golden protocol.  Its output can be presented
+only by the explicitly selected ``experimental-tuning`` command after an
+independent safety audit.  It selects at most one bounded ``max_num_seqs``
+value for a future experiment.  It never applies configuration, changes
+decision eligibility, predicts savings, or claims that the proposed value will
+improve an outcome.
 
 The rules were written independently from public vLLM metric and scheduler
 documentation.  In particular, this module does not estimate KV consumption
@@ -126,8 +128,8 @@ _NEXT_STEPS = {
 _ANALYSIS_CAVEATS = (
     "This artifact contains an exploratory test suggestion, not a "
     "configuration recommendation.",
-    "Server exporter metrics may include unrelated traffic; traffic "
-    "isolation is operator-attested, not independently proven.",
+    "Exporter-to-inference-deployment matching and traffic isolation are "
+    "operator-attested, not independently proven.",
     "Sampled KV and running-request maxima are not co-timed, so no "
     "per-request KV usage or fit-under capacity is inferred.",
     "The 25 percent step is a bounded search policy, not an estimated "
