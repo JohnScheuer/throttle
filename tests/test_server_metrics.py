@@ -230,6 +230,31 @@ class ParserAndDerivationTests(unittest.TestCase):
         self.assertEqual(public["finished_requests_per_second"], 3)
         self.assertNotIn("requests_per_second", public)
 
+    def test_snapshot_lookup_cannot_hide_abort_evidence(self) -> None:
+        before = parse_vllm_metrics(
+            "\n".join(
+                (
+                    'vllm:request_success_total{finished_reason="stop"} 0',
+                    'vllm:request_success_total{finished_reason="abort"} 0',
+                )
+            )
+        )
+        after = parse_vllm_metrics(
+            "\n".join(
+                (
+                    'vllm:request_success_total{finished_reason="stop"} 20',
+                    'vllm:request_success_total{finished_reason="abort"} 20',
+                )
+            )
+        )
+        with self.assertRaises((AttributeError, TypeError)):
+            object.__setattr__(after, "_family", lambda _: {})
+        window = derive_metrics_window(before, after, 8)
+        self.assertEqual(window.requests_finished, 40)
+        self.assertEqual(window.allowed_finished_requests, 20)
+        self.assertEqual(window.disallowed_finished_requests, 20)
+        self.assertEqual(window.unclassified_finished_requests, 0)
+
     def test_window_projection_rejects_forged_values_and_text(self) -> None:
         before = parse_vllm_metrics("vllm:generation_tokens_total 1")
         after = parse_vllm_metrics("vllm:generation_tokens_total 2")
