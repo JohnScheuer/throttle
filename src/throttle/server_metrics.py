@@ -1,9 +1,10 @@
 """Bounded, supplementary vLLM Prometheus metric collection.
 
-This module is intentionally not wired into the CLI or benchmark runner yet.
-It provides the read-only collector boundary for a later, separately approved
-integration.  Server metrics are process-wide observations and never replace
-Throttle's request-scoped measurements or decision gates.
+This read-only collector is reachable only through the explicitly selected
+``experimental-tuning`` coordinator.  Default smoke, benchmark, comparison,
+and Golden paths do not invoke it.  Server metrics are process-wide
+observations and never replace Throttle's request-scoped measurements or
+decision gates.
 
 Behavioral reference reviewed with permission: Chanwit Kaewkasi,
 ``cogentica-ai/kvlm`` at commit

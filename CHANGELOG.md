@@ -2,7 +2,7 @@
 
 All notable changes to Throttle will be documented in this file.
 
-## [0.3.0] - 2026-08-18
+## [0.3.0] - Unreleased
 
 ### Added
 - One-command, operator-mediated `throttle golden` orchestration for the
@@ -16,12 +16,18 @@ All notable changes to Throttle will be documented in this file.
   paths, digests, duplicate JSON keys, cyclic/deep structures, and payload
   non-reflection
 - Isolated, bounded vLLM Prometheus metric collection and suggestion-only
-  `max_num_seqs` bottleneck analysis components. Neither is connected to the
-  CLI or saved reports, and both remain decision-ineligible by construction.
+  `max_num_seqs` bottleneck analysis components. The only presentation path is
+  the explicit `experimental-tuning` subcommand; standard commands and saved
+  run reports remain unchanged, and the analysis is decision-ineligible by
+  construction. Its create-only supplementary envelope binds the detached
+  safety projection to the sanitized smoke report by canonical SHA-256.
 - An isolated safety-validation boundary that pins its own reviewed policy,
   independently replays and binds collector/analyzer evidence, and returns a
-  detached, non-actionable projection. It does not authorize CLI or report
-  integration, apply configuration, or bypass Golden.
+  detached, non-actionable projection. The artifact cannot self-authorize
+  routing into another CLI/report path, apply configuration, or bypass Golden.
+- A pinned, deterministic vLLM exposition compatibility fixture and connected
+  loopback orchestration test. This is software evidence only, not a live GPU,
+  performance, scheduler-saturation, or savings result.
 
 ### Changed
 - Golden now accepts any two canonical positive, distinct `max_num_seqs`
@@ -47,7 +53,7 @@ All notable changes to Throttle will be documented in this file.
   non-JSON containers, cycles, and over-limit trees before comparison or Golden
   aggregation
 
-## [0.2.1] - 2026-08-17
+## [0.2.1] - 2026-08-18
 
 ### Added
 - Platform-aware accelerator provenance for CUDA, Metal, ROCm, and CPU runs
