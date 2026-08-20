@@ -4,6 +4,12 @@ All notable changes to Throttle will be documented in this file.
 
 ## [0.3.0] - Unreleased
 
+### Removed
+- Claude Code cost proxy extracted to separate repository: https://github.com/KushagraKanaujia/claude-cost-proxy
+  - Removed `throttle-proxy`, `throttle-setup`, `throttle-summary` commands
+  - Removed `aiohttp` dependency
+  - Main throttle repo now focuses exclusively on vLLM optimization
+
 ### Added
 - One-command, operator-mediated `throttle golden` orchestration for the
   B1/C1/B2/C2/B3/C3 counterbalanced protocol, including a zero-traffic dry run
