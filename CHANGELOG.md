@@ -5,13 +5,6 @@ All notable changes to Throttle will be documented in this file.
 ## [0.3.0] - Unreleased
 
 ### Added
-- **Cost-layer HTTP proxy** for Claude Code (`throttle-proxy`, `throttle-setup`, `throttle-summary`)
-  - Local caching proxy that forwards requests to Anthropic API
-  - Logs every request: model, tokens, latency, cost to `~/.throttle/logs/`
-  - Smart caching for non-tool-use responses (24h TTL, file modification tracking)
-  - Setup command configures Claude Code to use proxy via `~/.claude/settings.json`
-  - Summary command shows usage stats, cache hit rate, and cost savings
-  - Goal: measure real-world cache effectiveness over one week of actual usage
 - One-command, operator-mediated `throttle golden` orchestration for the
   B1/C1/B2/C2/B3/C3 counterbalanced protocol, including a zero-traffic dry run
   and sanitized partial-session evidence
