@@ -223,6 +223,10 @@ _RUN_TOTAL_KEYS = frozenset(
         "reserved_output_tokens",
         "peak_in_flight",
         "elapsed_seconds",
+        "cache_enabled",
+        "cache_hits",
+        "cache_misses",
+        "cache_hit_rate",
     }
 )
 _COST_SUMMARY_KEYS = frozenset(
@@ -1019,10 +1023,28 @@ def _report_context_counts(
     total_attempted = warmup_attempted + measured_attempted
     if type(run_totals) is not dict or set(run_totals) != _RUN_TOTAL_KEYS:
         _fail("experimental_run_report_invalid")
-    integer_total_names = _RUN_TOTAL_KEYS - frozenset({"elapsed_seconds"})
+    integer_total_names = _RUN_TOTAL_KEYS - frozenset(
+        {"elapsed_seconds", "cache_enabled", "cache_hit_rate"}
+    )
     if any(
         type(run_totals.get(name)) is not int or run_totals[name] < 0
         for name in integer_total_names
+    ):
+        _fail("experimental_run_report_invalid")
+    # Validate cache fields
+    cache_enabled = run_totals.get("cache_enabled")
+    cache_hits = run_totals.get("cache_hits")
+    cache_misses = run_totals.get("cache_misses")
+    cache_hit_rate = run_totals.get("cache_hit_rate")
+    if (
+        type(cache_enabled) is not bool
+        or type(cache_hits) is not int
+        or cache_hits < 0
+        or type(cache_misses) is not int
+        or cache_misses < 0
+        or not _finite_number(cache_hit_rate, positive=False)
+        or cache_hit_rate < 0.0
+        or cache_hit_rate > 1.0
     ):
         _fail("experimental_run_report_invalid")
     elapsed = run_totals.get("elapsed_seconds")
