@@ -217,7 +217,8 @@ def _classify_regime(probes: list[ProbeMetrics]) -> RegimeResult:
         )
 
     # Regime Classification Tree
-    if scaling_efficiency < 0.5 and ttft_dominance > 0.6:
+    # Note: dispatch-bound and memory-bound are mutually exclusive via ttft_dominance threshold
+    if scaling_efficiency < 0.5 and 0.6 < ttft_dominance <= 0.70:
         return RegimeResult("dispatch-bound", 0.80, evidence)
     if scaling_efficiency < 0.6 and ttft_dominance < 0.4:
         return RegimeResult("orchestration-bound", 0.70, evidence)
