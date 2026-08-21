@@ -36,6 +36,10 @@ from .compare import (
     compare_reports,
     load_report,
 )
+from .diagnose import (
+    handle_diagnose,
+    print_diagnose,
+)
 from .experimental_tuning import (
     ExperimentalTuningError,
     prepare_metrics_collector,
@@ -61,6 +65,7 @@ DEFAULT_OUTPUT = Path("throttle-report.json")
 DEFAULT_COMPARE_OUTPUT = Path("throttle-comparison.json")
 DEFAULT_GOLDEN_OUTPUT_DIR = Path("throttle-golden")
 DEFAULT_EXPERIMENTAL_OUTPUT = Path("throttle-experimental-tuning.json")
+DEFAULT_DIAGNOSE_OUTPUT = Path("throttle-diagnose.json")
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 EXIT_OK = 0
@@ -196,7 +201,7 @@ def _add_safety_options(parser: argparse.ArgumentParser) -> None:
         type=_positive_float,
         help=(
             "whole-run ceiling (default: 120 for smoke, 900 for benchmark, "
-            "5400 for the six-position golden session)"
+            "5400 for the six-position golden session, 60 for diagnose)"
         ),
     )
     parser.add_argument("--max-errors", type=_positive_int, default=1)
@@ -334,6 +339,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_run_options(benchmark)
     benchmark.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+
+    diagnose = subparsers.add_parser(
+        "diagnose",
+        help="pre-flight bottleneck regime classification (not decision-grade)",
+        description=(
+            "Run a short probe at multiple concurrency levels and classify "
+            "the dominant bottleneck regime. Use this before throttle golden "
+            "to identify which config dimensions are worth testing."
+        ),
+    )
+    _add_endpoint_options(diagnose)
+    diagnose.add_argument("--backend", choices=("native",), default="native")
+    _add_cost_options(diagnose)
+    _add_workload_options(diagnose)
+    _add_safety_options(diagnose)
+    diagnose.add_argument(
+        "--output", type=Path, default=DEFAULT_DIAGNOSE_OUTPUT
+    )
 
     experimental = subparsers.add_parser(
         "experimental-tuning",
@@ -547,7 +570,7 @@ def _run_mode(args: argparse.Namespace) -> str:
         return args.run_mode
     if args.command == "golden":
         return "benchmark"
-    if args.command == "experimental-tuning":
+    if args.command in {"experimental-tuning", "diagnose"}:
         return "smoke"
     return args.command
 
@@ -579,6 +602,7 @@ def _build_config(
 ]:
     mode = _run_mode(args)
     experimental = args.command == "experimental-tuning"
+    diagnose = args.command == "diagnose"
     if args.backend == "guidellm" and args.guidellm_prompt_tokens is None:
         _parser_error(parser, "--backend guidellm requires --guidellm-prompt-tokens")
     if args.warmup_requests is not None and args.warmup_requests < 0:
@@ -586,10 +610,10 @@ def _build_config(
     blocks = args.blocks if args.blocks is not None else (1 if mode == "smoke" else 3)
     requests_per_block = args.requests_per_block
     if requests_per_block is None and args.block_seconds is None:
-        requests_per_block = 201 if experimental else 8 if mode == "smoke" else 67
+        requests_per_block = 201 if experimental else 20 if diagnose else 8 if mode == "smoke" else 67
     warmups = args.warmup_requests
     if warmups is None:
-        warmups = 3 if experimental else 1 if mode == "smoke" else 3
+        warmups = 3 if (experimental or diagnose) else 1 if mode == "smoke" else 3
     if args.request_rate:
         conditions = tuple(
             LoadCondition("open_loop", float(rate), args.open_loop_max_in_flight)
@@ -611,6 +635,8 @@ def _build_config(
             if args.command == "golden"
             else 900.0
             if experimental
+            else 60.0
+            if diagnose
             else 120.0
             if mode == "smoke"
             else 900.0
@@ -639,30 +665,30 @@ def _build_config(
         ttft_slo_ms=args.ttft_slo_ms,
         seed=args.seed,
         stream=args.stream,
-        cache_policy=args.cache_policy,
-        model_revision=args.model_revision,
-        image_digest=args.image_digest,
-        gpu=args.gpu,
-        gpu_fingerprint=args.gpu_fingerprint,
-        cuda_version=args.cuda_version,
-        driver_version=args.driver_version,
-        accelerator_backend=args.accelerator_backend,
-        accelerator_runtime_version=args.accelerator_runtime_version,
-        host_os_version=args.host_os_version,
-        software_environment_digest=args.software_environment_digest,
-        server_version=args.server_version,
-        engine_flags=_engine_flags(parser, args.engine_flag),
-        engine_flags_provenance=args.engine_flags_provenance,
-        variant=args.variant,
-        sequence_position=args.sequence_position,
+        cache_policy=getattr(args, "cache_policy", "unknown"),
+        model_revision=getattr(args, "model_revision", "unknown"),
+        image_digest=getattr(args, "image_digest", "unknown"),
+        gpu=getattr(args, "gpu", "unknown"),
+        gpu_fingerprint=getattr(args, "gpu_fingerprint", "unknown"),
+        cuda_version=getattr(args, "cuda_version", "unknown"),
+        driver_version=getattr(args, "driver_version", "unknown"),
+        accelerator_backend=getattr(args, "accelerator_backend", "cuda"),
+        accelerator_runtime_version=getattr(args, "accelerator_runtime_version", "unknown"),
+        host_os_version=getattr(args, "host_os_version", "unknown"),
+        software_environment_digest=getattr(args, "software_environment_digest", "unknown"),
+        server_version=getattr(args, "server_version", "unknown"),
+        engine_flags=_engine_flags(parser, getattr(args, "engine_flag", [])),
+        engine_flags_provenance=getattr(args, "engine_flags_provenance", "operator_attested"),
+        variant=getattr(args, "variant", "unspecified"),
+        sequence_position=getattr(args, "sequence_position", "unspecified"),
         allow_unknown_cost=args.allow_unknown_cost,
         allow_insecure_http=args.allow_insecure_http,
-        evidence_source=args.evidence_source,
-        guidellm_gaps_acknowledged=args.allow_guidellm_validation_gaps,
-        enable_cache=args.enable_cache,
-        cache_ttl_seconds=args.cache_ttl_seconds,
-        cache_max_size=args.cache_max_size,
-        cache_similarity_threshold=args.cache_similarity_threshold,
+        evidence_source=getattr(args, "evidence_source", "unverified_endpoint"),
+        guidellm_gaps_acknowledged=getattr(args, "allow_guidellm_validation_gaps", False),
+        enable_cache=getattr(args, "enable_cache", False),
+        cache_ttl_seconds=getattr(args, "cache_ttl_seconds", 3600.0),
+        cache_max_size=getattr(args, "cache_max_size", 1000),
+        cache_similarity_threshold=getattr(args, "cache_similarity_threshold", 0.85),
     )
 
     try:
@@ -1245,7 +1271,7 @@ def _timed_operator_input(prompt: str, timeout_seconds: float) -> str:
     def read() -> None:
         try:
             replies.put((True, input(prompt)))
-        except BaseException as exc:  # forwarded to the main thread below
+        except BaseException as exc:
             replies.put((False, exc))
 
     reader = threading.Thread(target=read, name="throttle-golden-input", daemon=True)
@@ -1300,7 +1326,7 @@ async def _run_golden_position(
             warmup_prompts,
             progress=progress,
             shared_budget=session_budget,
-        ),  # type: ignore[arg-type]
+        ),
         timeout=timeout_seconds,
     )
 
@@ -1438,7 +1464,7 @@ def _handle_experimental_tuning(
         collector = prepare_metrics_collector(args.metrics_url)
     except ExperimentalTuningError as exc:
         _parser_error(parser, exc.code)
-        raise AssertionError("argparse.error must terminate")  # pragma: no cover
+        raise AssertionError("argparse.error must terminate")
 
     config, prompts, warmup_prompts = _build_config(
         parser,
@@ -1449,7 +1475,7 @@ def _handle_experimental_tuning(
         validate_experimental_config(config)
     except ExperimentalTuningError as exc:
         _parser_error(parser, exc.code)
-        raise AssertionError("argparse.error must terminate")  # pragma: no cover
+        raise AssertionError("argparse.error must terminate")
 
     evidence_prompts = _copy_prompt_workload(prompts)
     evidence_warmup_prompts = _copy_prompt_workload(warmup_prompts)
@@ -1612,6 +1638,10 @@ def _handle_experimental_tuning(
         if projection.get("analysis_status") == "suggestion_available"
         else EXIT_INCONCLUSIVE
     )
+
+
+def _handle_diagnose(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    return handle_diagnose(parser, args, _build_config, _atomic_write)
 
 
 def _handle_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
@@ -1933,6 +1963,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_OK
     if args.command in {"smoke", "benchmark"}:
         return _handle_run(parser, args)
+    if args.command == "diagnose":
+        return _handle_diagnose(parser, args)
     if args.command == "experimental-tuning":
         return _handle_experimental_tuning(parser, args)
     if args.command == "golden":

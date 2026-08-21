@@ -544,6 +544,32 @@ six-position 1-versus-8 run is included under
 evidence. It measures only its pinned model, accelerator, workload, and test window; it
 is not a universal performance, savings, or production recommendation.
 
+
+
+## Pre-flight bottleneck diagnosis
+`throttle diagnose` is a lightweight, non-destructive probe that runs prior to any formal benchmarking or `golden` protocol. It classifies the dominant serving bottleneck regime so you do not waste resources running sweeps on config dimensions that do not address your actual constraint.
+
+```bash
+throttle diagnose \
+  --model Qwen/Qwen3-8B \
+  --url https://inference.example/v1 \
+  --api-key-env VLLM_API_KEY \
+  --concurrency 1 4 8 \
+  --probe-requests 20 \
+  --output diagnose.json
+```
+
+The command runs 1 block of 20 requests per concurrency level with 3 warm-ups (maximum 200 total requests) under a strict 60-second execution ceiling.
+
+Based on client-side timing heuristics, it classifies the server into one of five regimes:
+- **dispatch-bound** (launch overhead): CPU overhead dominates; recommended tuning: `cuda_graph_capture`, `batch_size`.
+- **orchestration-bound** (host jitter): high inter-request latency; recommended tuning: `scheduler_config`, `request_batching_strategy`, `python_vs_cpp_runtime`.
+- **compute-bound** (GPU arithmetic): throughput scales linearly; recommended tuning: `max_num_seqs`, `max_num_batched_tokens`, quantization.
+- **memory-bound** (VRAM limits): TTFT degrades sharply; recommended tuning: `kv_cache_block_size`, `prefix_caching`, `max_model_len`.
+- **mixed**: multiple competing bottlenecks; run exploratory sweeps to isolate.
+
+If the error rate exceeds 50%, or samples are insufficient, it returns `classification: inconclusive` (exit code `3`). It always sets `decision_eligible: false` and cannot be used with `throttle compare`.
+
 ## Experimental suggestion-only tuning
 
 `throttle experimental-tuning` is a separate, explicitly opt-in path for one
