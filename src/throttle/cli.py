@@ -1692,6 +1692,8 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         candidate_value,
     ) = _golden_config_flags(parser, args)
     if args.concurrency is None and args.request_rate is None:
+        # Preserve the historical 1-versus-8 default while making every other
+        # pair exercise at least its larger configured treatment value.
         args.concurrency = [max(baseline_value, candidate_value)]
     base, prompts, warmup_prompts = _build_config(parser, args, resolve_key=False)
     plan = build_golden_plan(
@@ -1720,6 +1722,9 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         )
         return EXIT_USAGE
 
+    # Resolve only the credential after the operator approves the plan. Reuse the
+    # exact preflighted config and immutable prompt tuples so a file change cannot
+    # swap the measured workload between plan and traffic.
     api_key = _resolve_key(parser, args.api_key_env)
     base = replace(
         base,

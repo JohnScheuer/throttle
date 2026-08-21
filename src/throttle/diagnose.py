@@ -8,7 +8,6 @@ before running full benchmark or golden protocols.
 from __future__ import annotations
 
 import asyncio
-import math
 import statistics
 import sys
 from dataclasses import dataclass, field
@@ -18,8 +17,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .benchmark import SCHEMA_VERSION, DIAGNOSE_ARTIFACT_TYPE, RunProgress, run_native
 from .models import RunConfig
-
-
 
 REGIME_RECOMMENDATIONS: dict[str, dict[str, Any]] = {
     "dispatch-bound": {
@@ -159,6 +156,8 @@ def _classify_regime(probes: list[ProbeMetrics]) -> RegimeResult:
         quality_issues.append("high_error_rate")
 
     valid_probes = [p for p in probes if p.valid_count > 0 and p.throughput_tokens_per_sec is not None]
+    # Sort by concurrency to ensure baseline is lowest and peak is highest
+    valid_probes.sort(key=lambda p: p.concurrency)
 
     if len(valid_probes) < 2:
         if "insufficient_valid_samples" not in quality_issues:
