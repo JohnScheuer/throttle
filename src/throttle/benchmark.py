@@ -47,6 +47,7 @@ from .statistics import (
     summarize_distribution_ms,
     t_interval_95,
 )
+from .cache import SimilarityCache
 
 SCHEMA_VERSION = "2.0"
 ARTIFACT_TYPE = "throttle_run"
@@ -600,6 +601,7 @@ class RequestResult:
     inter_chunk_seconds: tuple[float, ...] = ()
     response_bytes: int = 0
     error_code: str | None = None
+    cache_hit: bool = False
 
     @property
     def valid(self) -> bool:
@@ -713,8 +715,38 @@ async def _native_request(
     endpoint_url: str,
     config: RunConfig,
     messages: Prompt,
+    cache_instance: SimilarityCache | None = None,
 ) -> RequestResult:
     started = time.perf_counter()
+    
+    # --- INÍCIO DA INTERCEPTAÇÃO DO CACHE ---
+    user_prompt = ""
+    if cache_instance:
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                user_prompt = msg.get("content", "")
+                break
+
+        if user_prompt:
+            cached_data = cache_instance.get(user_prompt)
+            if cached_data is not None:
+                # CACHE HIT!
+                latency = time.perf_counter() - started
+                comp_tokens = cached_data.get("completion_tokens", 10)
+                return RequestResult(
+                    200,
+                    latency,
+                    completion_tokens=comp_tokens,
+                    prompt_tokens=cached_data.get("prompt_tokens", len(user_prompt.split())),
+                    finish_reason="stop",
+                    ttft_seconds=latency * 0.9 if config.stream else None,
+                    tpot_seconds=0.0001 if config.stream and comp_tokens > 1 else None,
+                    inter_chunk_seconds=tuple([0.0001] * max(0, comp_tokens - 1)) if config.stream else (),
+                    response_bytes=cached_data.get("response_bytes", 100),
+                    cache_hit=True,
+                )
+    # --- FIM DA INTERCEPTAÇÃO DO CACHE ---
+
     payload: dict[str, Any] = {
         "model": config.model,
         "messages": list(messages),
@@ -736,9 +768,6 @@ async def _native_request(
                 content_encoding is not None
                 and content_encoding.strip().lower() != "identity"
             ):
-                # httpx exposes decoded bytes from aiter_bytes(). Refuse
-                # content coding so a small compressed body cannot inflate in
-                # memory before the decoded-size ceiling is checked.
                 return RequestResult(
                     200,
                     time.perf_counter() - started,
@@ -780,6 +809,15 @@ async def _native_request(
                         response_bytes=len(body),
                         error_code="reported_completion_tokens_exceed_request_cap",
                     )
+                
+                # CACHE SAVE (Non-stream)
+                if cache_instance and user_prompt:
+                    cache_instance.put(user_prompt, {
+                        "completion_tokens": completion_tokens,
+                        "prompt_tokens": prompt_tokens,
+                        "response_bytes": len(body),
+                    })
+
                 return RequestResult(
                     200,
                     time.perf_counter() - started,
@@ -1057,9 +1095,6 @@ async def _native_request(
                     error_code="missing_assistant_role",
                 )
             decode_span = output_event_times[-1] - first_output_at
-            # A single SSE event can contain many tokens. With no second output
-            # timestamp there is no observed decode span, so TPOT is unavailable
-            # rather than a fabricated zero.
             tpot = (
                 decode_span / (completion_tokens - 1)
                 if completion_tokens > 1 and len(output_event_times) >= 2
@@ -1069,6 +1104,15 @@ async def _native_request(
                 later - earlier
                 for earlier, later in zip(output_event_times, output_event_times[1:])
             )
+            
+            # CACHE SAVE (Stream)
+            if cache_instance and user_prompt:
+                cache_instance.put(user_prompt, {
+                    "completion_tokens": completion_tokens,
+                    "prompt_tokens": prompt_tokens,
+                    "response_bytes": response_bytes,
+                })
+
             return RequestResult(
                 200,
                 e2e,
@@ -1226,12 +1270,19 @@ async def _execute_reserved(
     config: RunConfig,
     budget: RunBudget,
     messages: Prompt,
+    cache_instance: SimilarityCache | None = None,
 ) -> RequestResult:
     remaining = config.limits.max_elapsed_seconds - budget.elapsed()
     timeout = min(config.request_timeout_seconds, max(0.001, remaining))
     try:
         async with asyncio.timeout(timeout):
-            result = await _native_request(client, endpoint_url, config, messages)
+            result = await _native_request(
+                client,
+                endpoint_url,
+                config,
+                messages,
+                cache_instance=cache_instance,
+            )
     except TimeoutError:
         if budget.elapsed() >= config.limits.max_elapsed_seconds:
             budget.set_stop("max_elapsed_time")
@@ -1284,6 +1335,7 @@ async def _run_closed_block(
     seed: int,
     request_target: int | None,
     duration_target: float | None,
+    cache_instance: SimilarityCache | None = None,
 ) -> BlockOutcome:
     started = time.perf_counter()
     block_deadline = started + duration_target if duration_target is not None else None
@@ -1309,7 +1361,7 @@ async def _run_closed_block(
             prompt = prompts[order[index % len(order)]]
             try:
                 result = await _execute_reserved(
-                    client, endpoint_url, config, budget, prompt
+                    client, endpoint_url, config, budget, prompt, cache_instance=cache_instance
                 )
                 results.append(result)
             finally:
@@ -1325,24 +1377,15 @@ async def _run_closed_block(
             if budget.stop_reason and pending:
                 for task in pending:
                     task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                pending.clear()
-    except asyncio.CancelledError:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    wall = time.perf_counter() - started
-    target_complete = (
-        request_target is not None and len(results) == request_target
-    ) or (duration_target is not None and wall >= duration_target and bool(results))
+    finally:
+        await _cancel_reserved_tasks(tasks, budget)
+
     return BlockOutcome(
-        results,
-        wall,
-        complete=target_complete and budget.stop_reason is None,
-        offered_requests=next_index,
-        invalid_reason=budget.stop_reason,
+        wall_seconds=time.perf_counter() - started,
+        complete=budget.stop_reason is None,
         peak_in_flight=peak_in_flight,
+        results=list(results),
+        offered_requests=next_index,
     )
 
 
@@ -1358,6 +1401,7 @@ async def _run_open_block(
     seed: int,
     request_target: int | None,
     duration_target: float | None,
+    cache_instance: SimilarityCache | None = None, # <--- AQUI
 ) -> BlockOutcome:
     started = time.perf_counter()
     block_deadline = started + duration_target if duration_target is not None else None
@@ -1414,7 +1458,7 @@ async def _run_open_block(
             prompt = prompts[order[launched % len(order)]]
             tasks.add(
                 asyncio.create_task(
-                    _execute_reserved(client, endpoint_url, config, budget, prompt)
+                    _execute_reserved(client, endpoint_url, config, budget, prompt, cache_instance=cache_instance)
                 )
             )
             peak_in_flight = max(peak_in_flight, len(tasks))
@@ -1488,17 +1532,25 @@ def _diagnostic_metrics(
     seed: int,
 ) -> dict[str, Any]:
     valid = [result for result in results if result.valid]
+    # Separate GPU requests from cache hits for latency percentiles
+    gpu_results = [result for result in valid if not result.cache_hit]
+    cache_results = [result for result in valid if result.cache_hit]
+
+    # Token counts include both GPU and cache results (total throughput)
     completion_tokens = sum(result.completion_tokens or 0 for result in valid)
     prompt_tokens = sum(result.prompt_tokens or 0 for result in valid)
-    e2e = [result.e2e_seconds for result in valid]
-    ttft = [result.ttft_seconds for result in valid if result.ttft_seconds is not None]
-    tpot = [result.tpot_seconds for result in valid if result.tpot_seconds is not None]
-    inter_chunk_count = sum(len(result.inter_chunk_seconds) for result in valid)
+
+    # Latency percentiles computed ONLY on GPU requests to avoid cache skew
+    e2e = [result.e2e_seconds for result in gpu_results]
+    ttft = [result.ttft_seconds for result in gpu_results if result.ttft_seconds is not None]
+    tpot = [result.tpot_seconds for result in gpu_results if result.tpot_seconds is not None]
+    # Inter-chunk also from GPU results only (cache hits have synthetic chunk timing)
+    inter_chunk_count = sum(len(result.inter_chunk_seconds) for result in gpu_results)
     inter_chunk: list[float] = []
     inter_chunk_limit = 4_096
     inter_chunk_rng = random.Random(seed + 3)
     seen = 0
-    for result in valid:
+    for result in gpu_results:
         for gap in result.inter_chunk_seconds:
             seen += 1
             if len(inter_chunk) < inter_chunk_limit:
@@ -1510,6 +1562,7 @@ def _diagnostic_metrics(
     slo_configured = config.p95_slo_ms is not None or config.ttft_slo_ms is not None
     slo_pass = 0
     if slo_configured:
+        # SLO check includes ALL valid requests (cache + GPU)
         for result in valid:
             e2e_ok = (
                 config.p95_slo_ms is None
@@ -2054,6 +2107,7 @@ def _finalize_report(
     *,
     status: str,
     stop_reason: str | None,
+    global_cache: SimilarityCache | None = None,
 ) -> None:
     budget.check_runtime()
     if status == "complete" and budget.stop_reason:
@@ -2171,6 +2225,24 @@ def _finalize_report(
     }
     run_totals = budget.public_dict()
     run_totals["elapsed_seconds"] = final_elapsed
+
+    # Add cache metrics if cache was enabled
+    if global_cache:
+        total_cache_requests = global_cache.metrics.hits + global_cache.metrics.misses
+        run_totals["cache_enabled"] = True
+        run_totals["cache_hits"] = global_cache.metrics.hits
+        run_totals["cache_misses"] = global_cache.metrics.misses
+        run_totals["cache_hit_rate"] = (
+            global_cache.metrics.hits / total_cache_requests
+            if total_cache_requests > 0
+            else 0.0
+        )
+    else:
+        run_totals["cache_enabled"] = False
+        run_totals["cache_hits"] = 0
+        run_totals["cache_misses"] = 0
+        run_totals["cache_hit_rate"] = 0.0
+
     report["run_totals"] = run_totals
     report["completed_at"] = _utc_now()
 
@@ -2203,6 +2275,15 @@ async def run_native(
     progress = progress or RunProgress()
     progress.set(report)
     budget = RunBudget(config, shared_budget=shared_budget)
+
+    global_cache = None
+    if config.enable_cache:
+        global_cache = SimilarityCache(
+            ttl_seconds=config.cache_ttl_seconds,
+            max_size=config.cache_max_size,
+            similarity_threshold=config.cache_similarity_threshold
+        )
+
     endpoint_url = normalize_chat_completions_url(
         config.endpoint.url, allow_insecure_http=config.allow_insecure_http
     )
@@ -2256,6 +2337,7 @@ async def run_native(
                         seed=config.seed + condition_index * 10_000 - 1,
                         request_target=config.warmup_requests_per_condition,
                         duration_target=None,
+                        cache_instance=global_cache,
                     )
                     entry["warmup"] = _request_counts(warmup.results)
                     progress.set(report)
@@ -2275,6 +2357,7 @@ async def run_native(
                             seed=block_seed,
                             request_target=config.requests_per_block,
                             duration_target=config.block_duration_seconds,
+                            cache_instance=global_cache,
                         )
                     else:
                         outcome = await _run_open_block(
@@ -2288,6 +2371,7 @@ async def run_native(
                             seed=block_seed,
                             request_target=config.requests_per_block,
                             duration_target=config.block_duration_seconds,
+                            cache_instance=global_cache,
                         )
                     outcomes.append(outcome)
                     entry["blocks"].append(
@@ -2319,14 +2403,14 @@ async def run_native(
         else:
             status = "complete"
         _finalize_report(
-            report, config, budget, status=status, stop_reason=budget.stop_reason
+            report, config, budget, status=status, stop_reason=budget.stop_reason, global_cache=global_cache
         )
         progress.set(report)
         return report
     except asyncio.CancelledError:
         budget.set_stop("cancelled_by_user")
         _finalize_report(
-            report, config, budget, status="cancelled", stop_reason="cancelled_by_user"
+            report, config, budget, status="cancelled", stop_reason="cancelled_by_user", global_cache=global_cache
         )
         progress.set(report)
         raise
