@@ -1,0 +1,73 @@
+{"prompt":"How do I deploy a Python web application to production?"}
+{"prompt":"What are the best practices for handling errors in REST APIs?"}
+{"prompt":"Explain the difference between authentication and authorization."}
+{"prompt":"How can I optimize database queries in PostgreSQL?"}
+{"prompt":"What is the best way to structure a React component?"}
+{"prompt":"How do I implement rate limiting in an API?"}
+{"prompt":"Explain how async/await works in JavaScript."}
+{"prompt":"What are common security vulnerabilities in web applications?"}
+{"prompt":"How do I set up continuous integration for a Node.js project?"}
+{"prompt":"What is the difference between unit tests and integration tests?"}
+{"prompt":"How do I deploy a Python web application to production?"}
+{"prompt":"Can you explain authentication versus authorization?"}
+{"prompt":"What are best practices for REST API error handling?"}
+{"prompt":"How do I write efficient PostgreSQL queries?"}
+{"prompt":"What's the recommended structure for React components?"}
+{"prompt":"How can I add rate limiting to my API?"}
+{"prompt":"Explain async and await in JavaScript."}
+{"prompt":"What security issues should I watch for in web apps?"}
+{"prompt":"How do I configure CI for a Node.js application?"}
+{"prompt":"What's the difference between unit and integration testing?"}
+{"prompt":"How do I deploy a Python application to production servers?"}
+{"prompt":"Explain the concepts of authentication and authorization."}
+{"prompt":"What are the best practices for handling errors in REST APIs?"}
+{"prompt":"How can I make my PostgreSQL database queries faster?"}
+{"prompt":"What is a good way to organize React component code?"}
+{"prompt":"How do I implement API rate limiting?"}
+{"prompt":"Can you explain how async/await works in JavaScript?"}
+{"prompt":"What are the most common web application security vulnerabilities?"}
+{"prompt":"How do I set up CI/CD for a Node.js project?"}
+{"prompt":"What is the difference between unit tests and integration tests?"}
+{"prompt":"How do I handle database connections in a web application?"}
+{"prompt":"What are microservices and when should I use them?"}
+{"prompt":"How can I improve the performance of my web application?"}
+{"prompt":"What is Docker and why should I use it?"}
+{"prompt":"How do I implement caching in a web application?"}
+{"prompt":"How do I deploy a Python web application to production?"}
+{"prompt":"What are best practices for error handling in REST APIs?"}
+{"prompt":"How do I handle database connections efficiently?"}
+{"prompt":"What are microservices and their use cases?"}
+{"prompt":"How can I optimize my web application's performance?"}
+{"prompt":"What is Docker and what are its benefits?"}
+{"prompt":"How do I add caching to my web application?"}
+{"prompt":"Explain authentication and authorization differences."}
+{"prompt":"How can I optimize database queries in PostgreSQL?"}
+{"prompt":"What's a good React component structure?"}
+{"prompt":"How do I implement rate limiting in an API?"}
+{"prompt":"Explain async/await in JavaScript."}
+{"prompt":"What security vulnerabilities exist in web applications?"}
+{"prompt":"How do I set up continuous integration for Node.js?"}
+{"prompt":"What differentiates unit tests from integration tests?"}
+{"prompt":"How do I deploy Python applications to production?"}
+{"prompt":"What are REST API error handling best practices?"}
+{"prompt":"How can I write faster PostgreSQL queries?"}
+{"prompt":"How should I structure my React components?"}
+{"prompt":"How do I add rate limiting to an API?"}
+{"prompt":"Can you explain async/await in JavaScript?"}
+{"prompt":"What are common security issues in web apps?"}
+{"prompt":"How do I configure CI for Node.js applications?"}
+{"prompt":"What's the difference between unit and integration tests?"}
+{"prompt":"How do I manage database connections in web apps?"}
+{"prompt":"When should I use microservices architecture?"}
+{"prompt":"How can I make my web application faster?"}
+{"prompt":"Why should I use Docker for deployment?"}
+{"prompt":"How do I implement application caching?"}
+{"prompt":"How do I deploy a Python web app to production?"}
+{"prompt":"What are the best practices for handling REST API errors?"}
+{"prompt":"How can I optimize PostgreSQL database queries?"}
+{"prompt":"What is the best way to structure React components?"}
+{"prompt":"How do I implement API rate limiting?"}
+{"prompt":"Explain how async/await works in JavaScript."}
+{"prompt":"What are common web application security vulnerabilities?"}
+{"prompt":"How do I set up CI for a Node.js project?"}
+{"prompt":"What is the difference between unit and integration testing?"}
