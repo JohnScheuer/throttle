@@ -34,6 +34,12 @@ All notable changes to Throttle will be documented in this file.
 - A pinned, deterministic vLLM exposition compatibility fixture and connected
   loopback orchestration test. This is software evidence only, not a live GPU,
   performance, scheduler-saturation, or savings result.
+- Opt-in similarity cache for bypassing inference on semantically similar
+  prompts. Cache hits are excluded from GPU latency percentiles to preserve
+  decision-grade measurements. Telemetry (`cache_enabled`, `cache_hits`,
+  `cache_misses`, `cache_hit_rate`) flows through experimental tuning
+  validation and saved-run comparison. Thread-safe implementation uses Jaccard
+  similarity on tokenized prompts.
 
 ### Changed
 - Golden now accepts any two canonical positive, distinct `max_num_seqs`
