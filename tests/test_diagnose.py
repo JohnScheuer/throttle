@@ -50,11 +50,12 @@ class TestDiagnose(unittest.TestCase):
         self.assertEqual(config.warmup_requests_per_condition, 3)
 
     def test_classify_dispatch_bound(self) -> None:
-        # High TTFT dominance, poor scaling efficiency
+        # TTFT dominance in range (0.6, 0.70], poor scaling efficiency
+        # avg_ttft=65, avg_tpot=35 -> ttft_dominance = 0.65
         probes = [
-            ProbeMetrics(concurrency=1, ttft_mean_ms=100.0, tpot_mean_ms=10.0, throughput_tokens_per_sec=20.0, valid_count=20, attempted_count=20),
-            ProbeMetrics(concurrency=4, ttft_mean_ms=110.0, tpot_mean_ms=10.0, throughput_tokens_per_sec=30.0, valid_count=20, attempted_count=20),
-            ProbeMetrics(concurrency=8, ttft_mean_ms=120.0, tpot_mean_ms=10.0, throughput_tokens_per_sec=35.0, valid_count=20, attempted_count=20),
+            ProbeMetrics(concurrency=1, ttft_mean_ms=60.0, tpot_mean_ms=30.0, throughput_tokens_per_sec=20.0, valid_count=20, attempted_count=20),
+            ProbeMetrics(concurrency=4, ttft_mean_ms=65.0, tpot_mean_ms=35.0, throughput_tokens_per_sec=30.0, valid_count=20, attempted_count=20),
+            ProbeMetrics(concurrency=8, ttft_mean_ms=70.0, tpot_mean_ms=40.0, throughput_tokens_per_sec=35.0, valid_count=20, attempted_count=20),
         ]
         result = _classify_regime(probes)
         self.assertEqual(result.classification, "dispatch-bound")
@@ -83,17 +84,26 @@ class TestDiagnose(unittest.TestCase):
         self.assertGreaterEqual(result.confidence, 0.7)
 
     def test_classify_memory_bound(self) -> None:
-        # Note: memory-bound criteria (ttft_dominance > 0.70, scaling < 0.45) overlap
-        # with dispatch-bound criteria (ttft_dominance > 0.6, scaling < 0.5).
-        # Since dispatch-bound is checked first in the classification tree, this test
-        # documents the actual behavior: such cases are classified as dispatch-bound.
+        # High TTFT dominance (> 0.70), poor scaling (< 0.45)
+        # avg_ttft=176.67, avg_tpot=10 -> ttft_dominance = 0.946 > 0.70
         probes = [
             ProbeMetrics(concurrency=1, ttft_mean_ms=150.0, tpot_mean_ms=10.0, throughput_tokens_per_sec=50.0, valid_count=20, attempted_count=20),
             ProbeMetrics(concurrency=4, ttft_mean_ms=180.0, tpot_mean_ms=10.0, throughput_tokens_per_sec=70.0, valid_count=20, attempted_count=20),
             ProbeMetrics(concurrency=8, ttft_mean_ms=200.0, tpot_mean_ms=10.0, throughput_tokens_per_sec=80.0, valid_count=20, attempted_count=20),
         ]
         result = _classify_regime(probes)
-        # Due to overlapping criteria with dispatch-bound, this is classified as dispatch-bound
+        self.assertEqual(result.classification, "memory-bound")
+        self.assertGreaterEqual(result.confidence, 0.7)
+
+    def test_classify_dispatch_bound_at_boundary(self) -> None:
+        # Boundary test: ttft_dominance = exactly 0.70 should be dispatch-bound (inclusive upper bound)
+        # avg_ttft=70, avg_tpot=30 -> ttft_dominance = 0.70
+        probes = [
+            ProbeMetrics(concurrency=1, ttft_mean_ms=68.0, tpot_mean_ms=29.0, throughput_tokens_per_sec=20.0, valid_count=20, attempted_count=20),
+            ProbeMetrics(concurrency=4, ttft_mean_ms=70.0, tpot_mean_ms=30.0, throughput_tokens_per_sec=30.0, valid_count=20, attempted_count=20),
+            ProbeMetrics(concurrency=8, ttft_mean_ms=72.0, tpot_mean_ms=31.0, throughput_tokens_per_sec=35.0, valid_count=20, attempted_count=20),
+        ]
+        result = _classify_regime(probes)
         self.assertEqual(result.classification, "dispatch-bound")
         self.assertGreaterEqual(result.confidence, 0.7)
 
