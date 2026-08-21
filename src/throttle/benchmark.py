@@ -51,6 +51,7 @@ from .cache import SimilarityCache
 
 SCHEMA_VERSION = "2.0"
 ARTIFACT_TYPE = "throttle_run"
+DIAGNOSE_ARTIFACT_TYPE = "throttle_diagnose"
 MIN_DECISION_BLOCKS = 3
 MIN_DECISION_REQUESTS = 200
 MIN_DECISION_SECONDS = 60.0
