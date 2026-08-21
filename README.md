@@ -303,6 +303,30 @@ Any failed, malformed, oversized, incomplete, or truncated response invalidates
 the entire block and condition for decisions. Diagnostic counts remain, while
 decision metrics are suppressed.
 
+## Similarity cache
+
+Throttle supports an opt-in in-memory similarity cache for bypassing inference
+when prompts are semantically similar. Enable with `--enable-cache`:
+
+```bash
+throttle benchmark --url https://... --model ... \
+  --enable-cache \
+  --cache-ttl-seconds 3600 \
+  --cache-max-size 1000 \
+  --cache-similarity-threshold 0.85
+```
+
+Cache hits are excluded from GPU latency percentiles to preserve decision-grade
+measurements: a 1ms cache lookup must not pollute a p95 computed from 50-500ms
+GPU requests. Run totals report `cache_enabled`, `cache_hits`, `cache_misses`,
+and `cache_hit_rate` separately. The cache uses Jaccard similarity on tokenized
+prompts and is thread-safe for concurrent requests.
+
+Cache telemetry flows through experimental tuning validation and saved-run
+comparison. This is a local optimization tool; cache behavior does not transfer
+to production deployments unless the production server implements equivalent
+semantic caching.
+
 ## Boundary and uncertainty rules
 
 The report field is `best_tested_concurrency` or `best_tested_request_rate`.
