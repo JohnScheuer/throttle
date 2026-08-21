@@ -1581,8 +1581,6 @@ def _diagnostic_metrics(
         if wall_seconds > 0
         else None,
         "error_rate": (len(results) - len(valid)) / len(results) if results else None,
-        "cache_hits": len(cache_results),
-        "gpu_requests": len(gpu_results),
         "e2e_latency_ms": summarize_distribution_ms(e2e, seed=seed),
         "ttft_ms": summarize_distribution_ms(ttft, seed=seed + 1),
         "tpot_ms": summarize_distribution_ms(tpot, seed=seed + 2),
