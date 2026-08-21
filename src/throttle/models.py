@@ -332,6 +332,10 @@ class RunConfig:
     accelerator_runtime_version: str = "unknown"
     host_os_version: str = "unknown"
     software_environment_digest: str = "unknown"
+    enable_cache: bool = False
+    cache_ttl_seconds: float = 3600.0
+    cache_max_size: int = 1000
+    cache_similarity_threshold: float = 0.85
 
     def planned_request_count(self) -> int | None:
         if self.requests_per_block is None:
