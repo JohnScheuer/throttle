@@ -1385,6 +1385,7 @@ async def _run_closed_block(
         complete=budget.stop_reason is None,
         peak_in_flight=peak_in_flight,
         results=list(results),
+        offered_requests=next_index,
     )
 
 
