@@ -261,6 +261,31 @@ def _add_manifest_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_cache_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--enable-cache",
+        action="store_true",
+        help="Enable similarity-based semantic caching to bypass API requests"
+    )
+    parser.add_argument(
+        "--cache-ttl-seconds",
+        type=_positive_float,
+        default=3600.0,
+        help="Time-to-live for cached responses in seconds"
+    )
+    parser.add_argument(
+        "--cache-max-size",
+        type=_positive_int,
+        default=1000,
+        help="Maximum number of items to hold in the cache (FIFO eviction)"
+    )
+    parser.add_argument(
+        "--cache-similarity-threshold",
+        type=_positive_float,
+        default=0.85,
+        help="Jaccard similarity threshold [0.0 - 1.0] for a cache hit"
+    )
+
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
     _add_endpoint_options(parser)
     parser.add_argument("--backend", choices=("native", "guidellm"), default="native")
@@ -283,7 +308,7 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     _add_workload_options(parser)
     _add_safety_options(parser)
     _add_manifest_options(parser)
-
+    _add_cache_options(parser)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -660,18 +685,24 @@ def _build_config(
         allow_insecure_http=args.allow_insecure_http,
         evidence_source=getattr(args, "evidence_source", "unverified_endpoint"),
         guidellm_gaps_acknowledged=getattr(args, "allow_guidellm_validation_gaps", False),
+        enable_cache=getattr(args, "enable_cache", False),
+        cache_ttl_seconds=getattr(args, "cache_ttl_seconds", 3600.0),
+        cache_max_size=getattr(args, "cache_max_size", 1000),
+        cache_similarity_threshold=getattr(args, "cache_similarity_threshold", 0.85),
     )
+
     try:
         prompts = load_prompts(args.prompts)
         warmup_prompts = load_prompts(args.warmup_prompts, warmup=True)
         validate_config(config, for_traffic=resolve_key)
         if config.backend == "guidellm":
             from .guidellm_backend import preflight_guidellm_config
-
             preflight_guidellm_config(config, for_traffic=resolve_key)
     except (OSError, ValueError, RuntimeError) as exc:
         _parser_error(parser, str(exc))
+        
     return config, prompts, warmup_prompts
+        
 
 
 def _copy_prompt_workload(
