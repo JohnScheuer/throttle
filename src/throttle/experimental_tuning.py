@@ -191,6 +191,9 @@ _BASE_METRIC_KEYS = frozenset(
         "valid_response_count",
         "completion_tokens",
         "prompt_tokens",
+        "gpu_completion_tokens",
+        "cache_hit_count",
+        "cache_completion_tokens",
         "requests_per_second",
         "output_tokens_per_second",
         "error_rate",
@@ -648,6 +651,9 @@ def _metrics_match_counts(
         return False
     completion_tokens = metrics.get("completion_tokens")
     prompt_tokens = metrics.get("prompt_tokens")
+    gpu_completion_tokens = metrics.get("gpu_completion_tokens")
+    cache_hit_count = metrics.get("cache_hit_count")
+    cache_completion_tokens = metrics.get("cache_completion_tokens")
     if not (
         metrics.get("valid_response_count") == valid_requests
         and type(completion_tokens) is int
@@ -655,13 +661,23 @@ def _metrics_match_counts(
         and completion_tokens <= valid_requests * config.max_tokens
         and type(prompt_tokens) is int
         and prompt_tokens >= 0
+        and type(gpu_completion_tokens) is int
+        and gpu_completion_tokens >= 0
+        and gpu_completion_tokens <= completion_tokens
+        and type(cache_hit_count) is int
+        and cache_hit_count >= 0
+        and cache_hit_count <= valid_requests
+        and type(cache_completion_tokens) is int
+        and cache_completion_tokens >= 0
+        and cache_completion_tokens <= completion_tokens
+        and gpu_completion_tokens + cache_completion_tokens == completion_tokens
         and _close(
             metrics.get("requests_per_second"),
             valid_requests / wall_seconds,
         )
         and _close(
             metrics.get("output_tokens_per_second"),
-            completion_tokens / wall_seconds,
+            gpu_completion_tokens / wall_seconds,
         )
         and metrics.get("error_rate") == 0.0
         and _distribution_is_valid(
