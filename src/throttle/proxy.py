@@ -69,6 +69,9 @@ class ProxyServer:
         self._inflight: Dict[str, asyncio.Future] = {}
         self._inflight_lock = asyncio.Lock()
 
+        # Backend call counter
+        self._backend_calls = 0
+
     async def startup(self):
         """Initialize HTTP client."""
         self._client = httpx.AsyncClient(timeout=120.0)
@@ -87,6 +90,7 @@ class ProxyServer:
                 "hits": self.cache.metrics.hits if self.cache else 0,
                 "misses": self.cache.metrics.misses if self.cache else 0,
                 "evictions": self.cache.metrics.evictions if self.cache else 0,
+                "backend_calls": self._backend_calls,
             } if self.cache else None,
         }
 
@@ -274,6 +278,12 @@ class ProxyServer:
             accumulated_content = []
             response_metadata = {}
 
+            # Increment backend call counter
+            # Note: cache misses != backend calls, because in-flight deduplication
+            # means multiple concurrent requests can all record cache misses while
+            # only one actually reaches the backend (others wait on the same Future)
+            self._backend_calls += 1
+
             async with self._client.stream(
                 "POST",
                 f"{self.backend_url}/v1/chat/completions",
@@ -322,6 +332,12 @@ class ProxyServer:
             }
         else:
             # Non-streaming request
+            # Increment backend call counter
+            # Note: cache misses != backend calls, because in-flight deduplication
+            # means multiple concurrent requests can all record cache misses while
+            # only one actually reaches the backend (others wait on the same Future)
+            self._backend_calls += 1
+
             response = await self._client.post(
                 f"{self.backend_url}/v1/chat/completions",
                 json=request_body,
