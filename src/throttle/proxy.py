@@ -266,6 +266,7 @@ class ProxyServer:
                 json=request_body,
                 headers=headers,
             ) as response:
+                response.raise_for_status()
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
                         data_str = line[6:]
@@ -313,86 +314,101 @@ class ProxyServer:
                 json=request_body,
                 headers=headers,
             )
+            response.raise_for_status()
             return response.json()
 
     async def chat_completions(self, request: Request):
         """Handle /v1/chat/completions requests with caching and deduplication."""
-        request_body = await request.json()
+        try:
+            request_body = await request.json()
 
-        # Extract prompt for cache lookup
-        prompt = self._extract_prompt(request_body)
-        is_streaming = request_body.get("stream", False)
+            # Extract prompt for cache lookup
+            prompt = self._extract_prompt(request_body)
+            is_streaming = request_body.get("stream", False)
 
-        # Check cache first (fast path)
-        if self.enable_cache and self.cache:
-            cached_response = self.cache.get(prompt)
-            if cached_response is not None:
-                # Cache hit
-                if is_streaming:
-                    # Fake-stream the cached response
-                    return StreamingResponse(
-                        self._fake_stream_response(cached_response),
-                        media_type="text/event-stream",
-                    )
+            # Check cache first (fast path)
+            if self.enable_cache and self.cache:
+                cached_response = self.cache.get(prompt)
+                if cached_response is not None:
+                    # Cache hit
+                    if is_streaming:
+                        # Fake-stream the cached response
+                        return StreamingResponse(
+                            self._fake_stream_response(cached_response),
+                            media_type="text/event-stream",
+                        )
+                    else:
+                        # Return cached response directly
+                        return JSONResponse(cached_response)
+
+            # Cache miss - check if request is in-flight
+            async with self._inflight_lock:
+                if prompt in self._inflight:
+                    # Request is already in-flight, wait for it
+                    future = self._inflight[prompt]
+                    is_waiter = True
                 else:
-                    # Return cached response directly
-                    return JSONResponse(cached_response)
+                    # Create new future for this request
+                    future = asyncio.Future()
+                    self._inflight[prompt] = future
+                    is_waiter = False
 
-        # Cache miss - check if request is in-flight
-        async with self._inflight_lock:
-            if prompt in self._inflight:
-                # Request is already in-flight, wait for it
-                future = self._inflight[prompt]
-                is_waiter = True
-            else:
-                # Create new future for this request
-                future = asyncio.Future()
-                self._inflight[prompt] = future
-                is_waiter = False
+            # If we're the primary request (not a waiter), make the backend call
+            # IMPORTANT: This happens OUTSIDE the lock to avoid blocking waiters
+            if not is_waiter:
+                headers = {
+                    "Content-Type": "application/json",
+                }
+                if "authorization" in request.headers:
+                    headers["Authorization"] = request.headers["authorization"]
 
-        # If we're the primary request (not a waiter), make the backend call
-        # IMPORTANT: This happens OUTSIDE the lock to avoid blocking waiters
-        if not is_waiter:
-            headers = {
-                "Content-Type": "application/json",
-            }
-            if "authorization" in request.headers:
-                headers["Authorization"] = request.headers["authorization"]
+                try:
+                    # Make the backend request (accumulates streaming if needed)
+                    response_data = await self._make_backend_request(
+                        request_body, headers, prompt, is_streaming
+                    )
 
-            try:
-                # Make the backend request (accumulates streaming if needed)
-                response_data = await self._make_backend_request(
-                    request_body, headers, prompt, is_streaming
+                    # Cache the response (only if it contains valid choices)
+                    if self.enable_cache and self.cache:
+                        choices = response_data.get("choices", [])
+                        if choices:
+                            self.cache.put(prompt, response_data)
+
+                    # Set the future result for all waiters
+                    future.set_result(response_data)
+
+                except Exception as e:
+                    # Propagate error to all waiters
+                    future.set_exception(e)
+                    raise
+                finally:
+                    # Clean up in-flight tracking
+                    async with self._inflight_lock:
+                        self._inflight.pop(prompt, None)
+
+            # All requests (both the one that made the call and waiters) reach here
+            # Get the result from the future
+            response_data = await future
+
+            # Return response in the requested format
+            if is_streaming:
+                return StreamingResponse(
+                    self._fake_stream_response(response_data),
+                    media_type="text/event-stream",
                 )
+            else:
+                return JSONResponse(response_data)
 
-                # Cache the response
-                if self.enable_cache and self.cache:
-                    self.cache.put(prompt, response_data)
-
-                # Set the future result for all waiters
-                future.set_result(response_data)
-
-            except Exception as e:
-                # Propagate error to all waiters
-                future.set_exception(e)
-                raise
-            finally:
-                # Clean up in-flight tracking
-                async with self._inflight_lock:
-                    self._inflight.pop(prompt, None)
-
-        # All requests (both the one that made the call and waiters) reach here
-        # Get the result from the future
-        response_data = await future
-
-        # Return response in the requested format
-        if is_streaming:
-            return StreamingResponse(
-                self._fake_stream_response(response_data),
-                media_type="text/event-stream",
-            )
-        else:
-            return JSONResponse(response_data)
+        except httpx.HTTPStatusError as e:
+            # Preserve backend error status and body
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = {"error": e.response.text or str(e)}
+            return JSONResponse(content=error_body, status_code=e.response.status_code)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
+            # Return timeout error to client
+            return JSONResponse(content={"error": f"Backend timeout: {str(e)}"}, status_code=504)
 
 
 def create_app(

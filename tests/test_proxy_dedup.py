@@ -284,67 +284,170 @@ async def test_backend_error_propagates_to_all_waiters(proxy_to_mock, mock_backe
         assert mock.request_count == 1, "Retry should reach backend, not serve cached error"
 
 
-async def test_backend_timeout_does_not_hang_waiters(proxy_to_mock, mock_backend_server):
-    """Backend timeout during in-flight request doesn't leave waiters hanging."""
-    mock = mock_backend_server
-    # Configure mock to delay 5 seconds (proxy httpx client has 120s timeout by default)
-    # We'll use a short client timeout to trigger timeout behavior
-    mock.configure_timeout(duration=5.0)
+async def test_backend_timeout_does_not_hang_waiters():
+    """Backend timeout during in-flight request propagates to all waiters and is not cached."""
+    import uvicorn
 
-    payload = {
-        "model": "mock-model",
-        "messages": [{"role": "user", "content": "Test timeout"}],
-        "stream": False,
-    }
+    # Create mock backend with delay that exceeds proxy timeout
+    mock = MockBackend(delay_seconds=0.1)
+    mock.configure_timeout(duration=2.0)  # 2s delay will exceed proxy's 1s timeout
 
-    async def send_request(client_id: int):
-        # Use 0.5 second timeout on client side to trigger timeout
-        async with httpx.AsyncClient(timeout=0.5) as client:
-            try:
-                response = await client.post(
-                    "http://127.0.0.1:58091/v1/chat/completions",
-                    json=payload,
-                )
-                return client_id, "success", response.status_code
-            except httpx.TimeoutException:
-                return client_id, "timeout", None
-            except Exception as e:
-                return client_id, "error", str(type(e).__name__)
+    app = FastAPI()
+    @app.post("/v1/chat/completions")
+    async def completions(request: Request):
+        return await mock.handle_request(request)
 
-    # Send 3 concurrent requests - bounded to 3 seconds total to catch hangs
-    start_time = time.time()
-    tasks = [send_request(i) for i in range(3)]
+    config = uvicorn.Config(app, host="127.0.0.1", port=58092, log_level="error")
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
+    await asyncio.sleep(1)  # Wait for server to start
+
+    # Create proxy with short timeout for testing
+    proxy = ProxyServer(
+        backend_url="http://127.0.0.1:58092",
+        enable_cache=True,
+        cache_ttl_seconds=3600.0,
+        cache_max_size=100,
+        cache_similarity_threshold=0.85,
+    )
+    proxy._client = httpx.AsyncClient(timeout=1.0)  # 1s timeout for testing
+
+    proxy_app = proxy.app
+    @proxy_app.on_event("startup")
+    async def startup():
+        pass  # Client already created
+
+    @proxy_app.on_event("shutdown")
+    async def shutdown():
+        await proxy._client.aclose()
+
+    proxy_config = uvicorn.Config(proxy_app, host="127.0.0.1", port=58093, log_level="error")
+    proxy_server = uvicorn.Server(proxy_config)
+    proxy_task = asyncio.create_task(proxy_server.serve())
+    await asyncio.sleep(1)
 
     try:
-        results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=3.0)
-    except asyncio.TimeoutError:
-        pytest.fail("Test hung - concurrent requests did not complete within 3 seconds")
+        payload = {
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "Test timeout"}],
+            "stream": False,
+        }
 
-    elapsed = time.time() - start_time
+        async def send_request(client_id: int):
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                try:
+                    response = await client.post(
+                        "http://127.0.0.1:58093/v1/chat/completions",
+                        json=payload,
+                    )
+                    # Proxy returns 504 on backend timeout
+                    if response.status_code == 504:
+                        return client_id, "timeout", 504
+                    return client_id, "success", response.status_code
+                except httpx.ReadTimeout:
+                    return client_id, "timeout", None
+                except Exception as e:
+                    return client_id, "error", str(type(e).__name__)
 
-    # Assert exactly 1 backend call (deduplication was in effect)
-    assert mock.request_count == 1, f"Expected 1 backend call, got {mock.request_count}"
+        # Send 3 concurrent requests - proxy backend will timeout
+        start_time = time.time()
+        tasks = [send_request(i) for i in range(3)]
 
-    # Assert all 3 responses indicate timeout
-    assert len(results) == 3, "Should have 3 results"
-    timeout_count = sum(1 for _, status, _ in results if status == "timeout")
-    assert timeout_count == 3, f"Expected all 3 to timeout, got {timeout_count}"
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10.0)
+        except asyncio.TimeoutError:
+            pytest.fail("Test hung - concurrent requests did not complete within 10 seconds")
 
-    # Assert completion was fast (all timed out together, didn't hang)
-    assert elapsed < 2.0, f"Requests took {elapsed:.2f}s, expected <2s (all should timeout quickly)"
+        elapsed = time.time() - start_time
 
-    # Assert subsequent identical request reaches backend normally (not stuck on stale Future)
-    mock.request_count = 0
-    mock._should_timeout = False  # Disable timeout for next request
+        # Assert exactly 1 backend call (deduplication was in effect)
+        assert mock.request_count == 1, f"Expected 1 backend call, got {mock.request_count}"
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        retry_response = await client.post(
-            "http://127.0.0.1:58091/v1/chat/completions",
-            json=payload,
-        )
-        assert retry_response.status_code == 200, "Retry should succeed"
-        # Should have reached backend (not stuck on timed-out Future)
-        assert mock.request_count == 1, "Retry should reach backend, not block on stale Future"
+        # Assert all 3 responses indicate error (proxy timeout propagated)
+        assert len(results) == 3, "Should have 3 results"
+        error_count = sum(1 for _, status, _ in results if status in ["timeout", "error"])
+        assert error_count == 3, f"Expected all 3 to get error/timeout, got {error_count}"
+
+        # Assert completion was reasonably fast (all failed together)
+        assert elapsed < 5.0, f"Requests took {elapsed:.2f}s, too slow"
+
+        # Assert timeout error was NOT cached (subsequent request reaches backend)
+        mock.request_count = 0
+        mock._should_timeout = False  # Disable timeout for next request
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            retry_response = await client.post(
+                "http://127.0.0.1:58093/v1/chat/completions",
+                json=payload,
+            )
+            assert retry_response.status_code == 200, "Retry should succeed"
+            # Should have reached backend (error was not cached)
+            assert mock.request_count == 1, "Retry should reach backend, timeout not cached"
+
+    finally:
+        # Shutdown servers
+        server.should_exit = True
+        proxy_server.should_exit = True
+        await task
+        await proxy_task
+
+
+async def test_empty_choices_not_cached(proxy_to_mock, mock_backend_server):
+    """Backend response with no choices is returned but not cached."""
+    mock = mock_backend_server
+
+    # Temporarily override mock to return empty choices
+    original_handle = mock.handle_request
+
+    async def empty_choices_handler(request: Request):
+        async with mock._lock:
+            mock.request_count += 1
+
+        # Return 200 but with no choices array
+        return JSONResponse({
+            "id": "empty-response",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "mock-model",
+            "choices": []  # Empty choices
+        })
+
+    mock.handle_request = empty_choices_handler
+
+    try:
+        payload = {
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "Test empty choices"}],
+            "stream": False,
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # First request gets empty choices
+            response1 = await client.post(
+                "http://127.0.0.1:58091/v1/chat/completions",
+                json=payload,
+            )
+            assert response1.status_code == 200
+            data1 = response1.json()
+            assert data1["choices"] == [], "Should return empty choices"
+            assert mock.request_count == 1
+
+            # Second identical request should reach backend (not cached)
+            response2 = await client.post(
+                "http://127.0.0.1:58091/v1/chat/completions",
+                json=payload,
+            )
+            assert response2.status_code == 200
+            data2 = response2.json()
+            assert data2["choices"] == [], "Should return empty choices"
+
+            # Should have made 2 backend calls (empty response not cached)
+            assert mock.request_count == 2, \
+                f"Expected 2 backend calls (empty not cached), got {mock.request_count}"
+
+    finally:
+        # Restore original handler
+        mock.handle_request = original_handle
 
 
 async def test_sequential_identical_requests_hit_cache(proxy_to_mock, mock_backend_server):
