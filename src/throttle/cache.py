@@ -57,22 +57,38 @@ class SimilarityCache:
 
     def get(self, prompt: str) -> Optional[Any]:
         """Retrieves structured response data if an exact or similarity match is found."""
+        result = self.get_with_key(prompt)
+        return result[1] if result else None
+
+    def get_with_key(self, prompt: str) -> Optional[tuple[str, Any]]:
+        """Retrieves (canonical_key, response_data) if an exact or similarity match is found.
+
+        Returns the matched cache key along with the value, allowing callers to update
+        the same entry when adding scope variants.
+        """
         now = time.time()
         with self._lock:
             self._evict_expired_unsafe(now)
-            
+
             # Fast-path: Exact match (O(1))
             if prompt in self._store:
                 self.metrics.hits += 1
-                return self._store[prompt][0]
-            
+                return (prompt, self._store[prompt][0])
+
             # Slow-path: Lexical match (O(N))
             for cached_prompt, (response_data, _) in self._store.items():
                 if self._jaccard_similarity(prompt, cached_prompt) >= self.similarity_threshold:
                     self.metrics.hits += 1
-                    return response_data
-                    
+                    return (cached_prompt, response_data)
+
             self.metrics.misses += 1
+            return None
+
+    def get_exact_no_metrics(self, prompt: str) -> Optional[Any]:
+        """Get exact match without incrementing metrics. For internal use during cache updates."""
+        with self._lock:
+            if prompt in self._store:
+                return self._store[prompt][0]
             return None
 
     def put(self, prompt: str, response_data: Any):

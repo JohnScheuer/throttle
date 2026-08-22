@@ -99,21 +99,19 @@ class ProxyServer:
     def _extract_scope_key(self, request_body: Dict[str, Any]) -> str:
         """Extract scope parameters that must match exactly for cache hits.
 
-        Two requests may only share a cache entry if their scope keys are identical.
-        This includes model, temperature, and all other sampling parameters.
+        Includes all request fields EXCEPT:
+        - messages: used for semantic similarity matching, not scope differentiation
+        - stream: controls response format (SSE vs JSON), not content; cached responses
+                  can be served as either streaming or non-streaming
+
+        All other fields (model, temperature, max_tokens, custom backend parameters, etc.)
+        are included to prevent cache collisions between requests with different parameters.
         """
-        # Extract all parameters that affect the response
+        excluded = {"messages", "stream"}
         scope_params = {
-            "model": request_body.get("model"),
-            "temperature": request_body.get("temperature"),
-            "top_p": request_body.get("top_p"),
-            "max_tokens": request_body.get("max_tokens"),
-            "frequency_penalty": request_body.get("frequency_penalty"),
-            "presence_penalty": request_body.get("presence_penalty"),
-            "stop": request_body.get("stop"),
-            "seed": request_body.get("seed"),
+            k: v for k, v in request_body.items()
+            if k not in excluded
         }
-        # Create deterministic scope key (sorted JSON)
         return json.dumps(scope_params, sort_keys=True)
 
     def _extract_prompt(self, request_body: Dict[str, Any]) -> str:
@@ -356,12 +354,13 @@ class ProxyServer:
 
             # Check cache first (fast path)
             if self.enable_cache and self.cache:
-                cached_entry = self.cache.get(prompt)
-                if cached_entry is not None:
-                    # Validate scope match
-                    if isinstance(cached_entry, dict) and cached_entry.get("_scope") == scope_key:
-                        # Scope matches - cache hit
-                        cached_response = cached_entry["response"]
+                result = self.cache.get_with_key(prompt)
+                if result is not None:
+                    canonical_key, scope_dict = result
+                    # scope_dict maps scope_key → response_data for this semantic prompt
+                    if isinstance(scope_dict, dict) and scope_key in scope_dict:
+                        # Hit: same semantic prompt AND same scope
+                        cached_response = scope_dict[scope_key]["response"]
                         if is_streaming:
                             # Fake-stream the cached response
                             return StreamingResponse(
@@ -371,7 +370,7 @@ class ProxyServer:
                         else:
                             # Return cached response directly
                             return JSONResponse(cached_response)
-                    # else: scope mismatch, treat as cache miss
+                    # else: similar prompt but different scope, treat as cache miss
 
             # Cache miss - check if request is in-flight
             # Use scope+prompt as deduplication key to avoid cross-scope collisions
@@ -406,12 +405,22 @@ class ProxyServer:
                     if self.enable_cache and self.cache:
                         choices = response_data.get("choices", [])
                         if choices:
-                            # Wrap response with scope metadata
-                            cached_entry = {
+                            # Get existing scope dict for this EXACT prompt (no similarity matching)
+                            # This doesn't increment metrics - we only count the initial GET attempt
+                            existing_scope_dict = self.cache.get_exact_no_metrics(prompt)
+                            if existing_scope_dict is not None and isinstance(existing_scope_dict, dict):
+                                scope_dict = existing_scope_dict
+                            else:
+                                scope_dict = {}
+
+                            # Add/update this scope variant (preserves other scope variants)
+                            scope_dict[scope_key] = {
                                 "_scope": scope_key,
                                 "response": response_data,
                             }
-                            self.cache.put(prompt, cached_entry)
+
+                            # Store updated scope dict under this prompt
+                            self.cache.put(prompt, scope_dict)
 
                     # Set the future result for all waiters
                     future.set_result(response_data)

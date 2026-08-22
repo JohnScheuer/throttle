@@ -756,3 +756,136 @@ async def test_concurrent_dedup_respects_scope(proxy_to_mock, mock_backend_serve
     for client_id, model, response_data in results:
         assert "choices" in response_data
         assert len(response_data["choices"]) > 0
+
+
+async def test_multiple_scope_variants_coexist(proxy_to_mock, mock_backend_server):
+    """Prime model A, then model B, then request A again: A's cache entry survives.
+
+    This is the direct regression test for DEFECT 1 (last-write-wins).
+    """
+    mock = mock_backend_server
+    messages = [{"role": "user", "content": "What is Python?"}]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1: Prime with model A
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-3.5-turbo", "messages": messages, "stream": False},
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        await asyncio.sleep(0.2)
+
+        # Request 2: Prime with model B (same prompt, different scope)
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-4", "messages": messages, "stream": False},
+        )
+        assert response2.status_code == 200
+        assert mock.request_count == 2
+
+        await asyncio.sleep(0.2)
+
+        # Request 3: Request model A again (should hit cache, not overwritten by B)
+        response3 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-3.5-turbo", "messages": messages, "stream": False},
+        )
+        assert response3.status_code == 200
+
+        # A's entry must have survived - no new backend call
+        assert mock.request_count == 2, \
+            f"Expected 2 backend calls (A's cache entry survived), got {mock.request_count}"
+
+
+async def test_alternating_temperatures_coexist(proxy_to_mock, mock_backend_server):
+    """Two temperatures alternating across 4 requests: 2 backend calls total.
+
+    Tests that both temperature scope variants coexist in cache.
+    """
+    mock = mock_backend_server
+    messages = [{"role": "user", "content": "Generate a number"}]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1: temperature=0.5
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-3.5-turbo", "messages": messages, "temperature": 0.5, "stream": False},
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        await asyncio.sleep(0.2)
+
+        # Request 2: temperature=0.9 (different scope)
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-3.5-turbo", "messages": messages, "temperature": 0.9, "stream": False},
+        )
+        assert response2.status_code == 200
+        assert mock.request_count == 2
+
+        await asyncio.sleep(0.2)
+
+        # Request 3: temperature=0.5 again (should hit cache)
+        response3 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-3.5-turbo", "messages": messages, "temperature": 0.5, "stream": False},
+        )
+        assert response3.status_code == 200
+        assert mock.request_count == 2, "Temperature 0.5 should hit cache"
+
+        await asyncio.sleep(0.2)
+
+        # Request 4: temperature=0.9 again (should hit cache)
+        response4 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-3.5-turbo", "messages": messages, "temperature": 0.9, "stream": False},
+        )
+        assert response4.status_code == 200
+
+        # Both temperature variants coexist - still 2 backend calls total
+        assert mock.request_count == 2, \
+            f"Expected 2 backend calls (both temperatures cached), got {mock.request_count}"
+
+
+async def test_custom_parameter_included_in_scope(proxy_to_mock, mock_backend_server):
+    """Two requests differing only in custom parameter: 2 backend calls, no collision.
+
+    This is the regression test for DEFECT 2 (custom parameters dropped from scope).
+    """
+    mock = mock_backend_server
+    messages = [{"role": "user", "content": "Test custom params"}]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1: custom_backend_param=foo
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={
+                "model": "gpt-3.5-turbo",
+                "messages": messages,
+                "custom_backend_param": "foo",
+                "stream": False,
+            },
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        await asyncio.sleep(0.2)
+
+        # Request 2: custom_backend_param=bar (different custom param)
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={
+                "model": "gpt-3.5-turbo",
+                "messages": messages,
+                "custom_backend_param": "bar",
+                "stream": False,
+            },
+        )
+        assert response2.status_code == 200
+
+        # Custom parameter is in scope - should NOT collide
+        assert mock.request_count == 2, \
+            f"Expected 2 backend calls (custom param in scope), got {mock.request_count}"
