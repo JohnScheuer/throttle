@@ -1,7 +1,59 @@
 import time
+import warnings
 from dataclasses import dataclass
 from threading import Lock
-from typing import Dict, Optional, Tuple, Any
+from enum import Enum
+from typing import Dict, Optional, Tuple, Any, List
+
+try:
+    import numpy as np
+    from optimum.onnxruntime import ORTModelForFeatureExtraction
+    from transformers import AutoTokenizer
+    import torch
+    EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
+
+_tokenizer = None
+_model = None
+_embedding_memo = {}
+
+def _get_embedding(text: str) -> Any:
+    global _tokenizer, _model, _embedding_memo
+    if not EMBEDDINGS_AVAILABLE:
+        return None
+    if text in _embedding_memo:
+        return _embedding_memo[text]
+        
+    if _model is None:
+        model_name = "sentence-transformers/all-MiniLM-L6-v2"
+        _tokenizer = AutoTokenizer.from_pretrained(model_name)
+        try:
+            _model = ORTModelForFeatureExtraction.from_pretrained(model_name)
+        except Exception:
+            try:
+                _model = ORTModelForFeatureExtraction.from_pretrained(model_name, export=True)
+            except Exception:
+                return None
+            
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            inputs = _tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            with torch.no_grad():
+                outputs = _model(**inputs)
+            token_embeddings = outputs.last_hidden_state
+            attention_mask = inputs['attention_mask']
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            embedding = sum_embeddings / sum_mask
+            embedding = embedding / torch.norm(embedding, p=2, dim=1, keepdim=True)
+            vec = embedding.cpu().numpy()[0]
+            _embedding_memo[text] = vec
+            return vec
+        except Exception:
+            return None
 
 @dataclass
 class CacheMetrics:
@@ -12,8 +64,8 @@ class CacheMetrics:
 class SimilarityCache:
     """
     An In-Memory Similarity-based Cache for LLM inferences.
-    Uses lexical Jaccard similarity for matching and supports TTL and max-size eviction.
-    Thread-safe for concurrent benchmarking.
+    Uses lexical Jaccard similarity and ONNX-based semantic similarity for matching.
+    Supports TTL and max-size eviction. Thread-safe.
     """
     def __init__(
         self, 
@@ -33,8 +85,6 @@ class SimilarityCache:
         self.similarity_threshold = similarity_threshold
         self.metrics = CacheMetrics()
         
-        # Store maps: prompt -> (response_data, timestamp)
-        # We store structured response data to preserve token usage/status if needed
         self._store: Dict[str, Tuple[Any, float]] = {}
         self._lock = Lock()
 
@@ -70,16 +120,33 @@ class SimilarityCache:
         with self._lock:
             self._evict_expired_unsafe(now)
 
-            # Fast-path: Exact match (O(1))
+            # Fast-path 1: Exact match (O(1))
             if prompt in self._store:
                 self.metrics.hits += 1
                 return (prompt, self._store[prompt][0])
 
-            # Slow-path: Lexical match (O(N))
+            # Fast-path 2: Lexical match (O(N))
             for cached_prompt, (response_data, _) in self._store.items():
                 if self._jaccard_similarity(prompt, cached_prompt) >= self.similarity_threshold:
                     self.metrics.hits += 1
                     return (cached_prompt, response_data)
+
+            # Slow-path: Semantic match (ONNX embedding, only if lexical misses)
+            # Guard: Short queries (<= 3 words) are highly prone to false positives in dense spaces.
+            if EMBEDDINGS_AVAILABLE and len(prompt.split()) > 3:
+                try:
+                    emb_q = _get_embedding(prompt)
+                    if emb_q is not None:
+                        for cached_prompt, (response_data, _) in self._store.items():
+                            if len(cached_prompt.split()) > 3:
+                                emb_cached = _get_embedding(cached_prompt)
+                                if emb_cached is not None:
+                                    sim = float(np.dot(emb_q, emb_cached))
+                                    if sim >= self.similarity_threshold:
+                                        self.metrics.hits += 1
+                                        return (cached_prompt, response_data)
+                except Exception:
+                    pass
 
             self.metrics.misses += 1
             return None

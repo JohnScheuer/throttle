@@ -177,26 +177,27 @@ async def test_five_concurrent_identical_requests_one_backend_call(proxy_to_mock
         assert stats["misses"] == 5, f"Expected 5 cache misses (all 5 checked cache)"
 
 
-async def test_ten_concurrent_paraphrases_current_behavior(proxy_to_mock, mock_backend_server):
-    """10 concurrent paraphrases: assert CURRENT behavior (each reaches backend).
+async def test_ten_concurrent_paraphrases_deduplicated(proxy_to_mock, mock_backend_server):
+    """10 concurrent paraphrases: assert that Promise Cache successfully deduplicates paraphrases.
 
-    This test documents current behavior where paraphrases are NOT deduplicated.
-    When Promise Cache lands, this test should be updated to expect deduplication.
+    Verifies that the Promise Cache handles multiple concurrent paraphrased requests
+    by grouping them into their respective semantic clusters, resulting in exactly
+    one backend call per unique semantic question.
     """
     mock = mock_backend_server
 
-    # 10 prompts: 2 groups of paraphrases
+    # 10 prompts: 2 groups of paraphrases (and exact duplicates)
     prompts = [
-        "How do I sort a Python list?",           # 0
-        "How can I sort a list in Python?",       # 1 - paraphrase of 0
-        "What's the way to sort a Python list?",  # 2 - paraphrase of 0
-        "How to sort lists in Python?",           # 3 - paraphrase of 0
-        "What is the capital of France?",         # 4
-        "What's France's capital city?",          # 5 - paraphrase of 4
-        "Tell me the capital of France",          # 6 - paraphrase of 4
-        "How do I sort a Python list?",           # 7 - exact dup of 0
-        "What is the capital of France?",         # 8 - exact dup of 4
-        "Which city is the capital of France?",   # 9 - paraphrase of 4
+        "How do I sort a Python list?",           # 0 (Cluster 1)
+        "How can I sort a list in Python?",       # 1 (Cluster 1 - paraphrase of 0)
+        "What's the way to sort a Python list?",  # 2 (Cluster 1 - paraphrase of 0)
+        "How to sort lists in Python?",           # 3 (Cluster 1 - paraphrase of 0)
+        "What is the capital of France?",         # 4 (Cluster 2)
+        "What's France's capital city?",          # 5 (Cluster 2 - paraphrase of 4)
+        "Tell me the capital of France",          # 6 (Cluster 2 - paraphrase of 4)
+        "How do I sort a Python list?",           # 7 (Cluster 1 - exact dup of 0)
+        "What is the capital of France?",         # 8 (Cluster 2 - exact dup of 4)
+        "Which city is the capital of France?",   # 9 (Cluster 2 - paraphrase of 4)
     ]
 
     async def send_request(idx: int, prompt: str):
@@ -214,12 +215,11 @@ async def test_ten_concurrent_paraphrases_current_behavior(proxy_to_mock, mock_b
     tasks = [send_request(i, prompts[i]) for i in range(10)]
     results = await asyncio.gather(*tasks)
 
-    # CURRENT BEHAVIOR: Paraphrases are NOT deduplicated, only exact matches
-    # Expected: 8 backend calls (10 prompts - 2 exact dups)
-    # When Promise Cache lands, expect: 2 backend calls (one per semantic cluster)
-    expected_backend_calls = 8
+    # DEDUPLICATED BEHAVIOR: All concurrent paraphrases share the matching promise.
+    # Expected: exactly 2 backend calls (one for Python list sorting, one for France Capital)
+    expected_backend_calls = 2
     assert mock.request_count == expected_backend_calls, \
-        f"CURRENT behavior: Expected {expected_backend_calls} backend calls, got {mock.request_count}"
+        f"Promise Cache behavior: Expected {expected_backend_calls} backend calls, got {mock.request_count}"
 
     # Assert backend_calls counter matches mock
     async with httpx.AsyncClient() as health_client:
