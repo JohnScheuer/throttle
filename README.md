@@ -7,7 +7,7 @@ OpenAI-compatible chat-completions servers. It provisions nothing, changes
 nothing on the server, and never claims universal optimization or projected
 savings.
 
-Throttle has six explicit workflows:
+Throttle has eight explicit workflows:
 
 - `throttle plan` sends zero traffic and shows the destination, request/token
   ceilings, duration, cost bound, and privacy implications.
@@ -18,6 +18,10 @@ Throttle has six explicit workflows:
   concurrency or open-loop request rates. A multi-load sweep is exploratory:
   its current condition-major order is not counterbalanced, so it cannot reach
   `decision_eligible: true` even when every request succeeds.
+- `throttle diagnose` is a lightweight pre-flight bottleneck classifier that
+  runs before formal benchmarking. It identifies the dominant serving regime
+  (dispatch-bound, orchestration-bound, compute-bound, memory-bound, or mixed)
+  to guide configuration tuning.
 - `throttle experimental-tuning` is an explicit, suggestion-only smoke run
   that samples a configured vLLM Prometheus exporter. It never applies a
   setting and cannot change decision or Golden eligibility.
@@ -27,6 +31,10 @@ Throttle has six explicit workflows:
 - `throttle compare` compares saved reports offline. Two inputs perform a
   normal saved-run comparison; six ordered inputs validate the golden
   B1/C1/B2/C2/B3/C3 protocol.
+- `throttle proxy` runs a standalone OpenAI-compatible HTTP server that sits
+  in front of real inference backends and caches responses using semantic
+  similarity matching. Unlike the benchmark cache, this serves external HTTP
+  clients (curl, OpenAI SDKs, etc.) for production traffic caching.
 
 Results describe only the declared workload and manifest.
 
@@ -366,6 +374,39 @@ Cache telemetry flows through experimental tuning validation and saved-run
 comparison. This is a local optimization tool; cache behavior does not transfer
 to production deployments unless the production server implements equivalent
 semantic caching.
+
+## Proxy mode
+
+`throttle proxy` runs a standalone OpenAI-compatible HTTP server that caches
+responses for external HTTP clients. Unlike the benchmark cache (which only
+accelerates Throttle's own load generator), the proxy serves production
+traffic from curl, OpenAI SDKs, and other HTTP clients.
+
+**Quick start:**
+
+```bash
+# Start proxy in front of Ollama
+throttle proxy \
+  --backend-url http://localhost:11434 \
+  --enable-cache \
+  --port 8080
+
+# External clients connect to the proxy instead of the backend
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:1b",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "max_tokens": 50
+  }'
+```
+
+The proxy forwards cache misses to the configured backend and returns cached
+responses for semantically similar prompts. Cache hits and misses are reported
+via the `/health` endpoint.
+
+For detailed configuration, streaming behavior, and production deployment
+considerations, see [PROXY_DEMO.md](PROXY_DEMO.md).
 
 ## Boundary and uncertainty rules
 

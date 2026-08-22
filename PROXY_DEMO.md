@@ -122,11 +122,14 @@ Response:
 
 ## Performance
 
-Test results with Ollama (llama3.2:1b):
+Validated test results with Ollama (llama3.2:1b) on 73-prompt realistic traffic:
 
-- **Cache hit latency**: ~5ms
-- **Cache miss latency**: ~330ms (backend inference time)
-- **Speedup**: ~66x faster for cache hits
+- **Cache hit latency**: 1.4ms median
+- **Cache miss latency**: 790.5ms median (backend inference time)
+- **Cache hit rate**: 10-11% baseline with Jaccard threshold 0.85
+
+Cache hits are served from memory without backend requests. Hit rate depends on
+traffic patterns and similarity threshold tuning.
 
 ## Use Cases
 
