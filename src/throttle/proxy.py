@@ -3,6 +3,16 @@
 This module provides a lightweight HTTP proxy server that sits in front of real
 inference backends (vLLM, Ollama, SGLang, LMDeploy) and caches responses using
 semantic similarity matching.
+
+IMPORTANT LIMITATION: The current implementation uses Jaccard token-overlap
+similarity (threshold 0.85) which is strict and may miss natural paraphrases.
+For example, "optimize PostgreSQL queries" vs "optimize database queries in
+PostgreSQL" has Jaccard similarity ~0.64 (below threshold) despite identical
+semantic meaning. This is a known limitation of lexical similarity.
+
+A more robust solution would use semantic embeddings (e.g., ONNX-based two-tier
+matching) to catch paraphrases that Jaccard misses. The current threshold
+balances precision (avoiding false positives) with recall (catching duplicates).
 """
 
 import asyncio
@@ -18,7 +28,14 @@ from .cache import SimilarityCache
 
 
 class ProxyServer:
-    """OpenAI-compatible proxy with semantic caching."""
+    """OpenAI-compatible proxy with semantic caching and request deduplication.
+
+    Implements per-prompt in-flight request deduplication to prevent race
+    conditions where multiple concurrent identical requests all miss the cache
+    and hit the backend independently. Only one backend call is made per
+    unique prompt at a time; concurrent duplicates wait for the first request
+    to complete and share its result.
+    """
 
     def __init__(
         self,
@@ -46,6 +63,11 @@ class ProxyServer:
 
         # HTTP client for backend requests
         self._client: Optional[httpx.AsyncClient] = None
+
+        # In-flight request tracking for deduplication
+        # Maps prompt -> Future[response]
+        self._inflight: Dict[str, asyncio.Future] = {}
+        self._inflight_lock = asyncio.Lock()
 
     async def startup(self):
         """Initialize HTTP client."""
@@ -211,15 +233,87 @@ class ProxyServer:
             }
             self.cache.put(prompt, cached_response)
 
+    async def _make_backend_request(
+        self,
+        request_body: Dict[str, Any],
+        headers: Dict[str, str],
+        prompt: str,
+        is_streaming: bool,
+    ) -> Dict[str, Any]:
+        """Make the actual backend request and return the complete response.
+
+        For non-streaming: returns response directly.
+        For streaming: accumulates the stream and returns complete response.
+        """
+        if is_streaming:
+            # For streaming, accumulate the complete response
+            accumulated_content = []
+            response_metadata = {}
+
+            async with self._client.stream(
+                "POST",
+                f"{self.backend_url}/v1/chat/completions",
+                json=request_body,
+                headers=headers,
+            ) as response:
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            continue
+
+                        try:
+                            chunk = json.loads(data_str)
+
+                            if not response_metadata:
+                                response_metadata["id"] = chunk.get("id", "")
+                                response_metadata["model"] = chunk.get("model", "")
+                                response_metadata["created"] = chunk.get("created", int(time.time()))
+
+                            for choice in chunk.get("choices", []):
+                                delta = choice.get("delta", {})
+                                if "content" in delta:
+                                    accumulated_content.append(delta["content"])
+                                if choice.get("finish_reason"):
+                                    response_metadata["finish_reason"] = choice["finish_reason"]
+                        except json.JSONDecodeError:
+                            pass
+
+            full_content = "".join(accumulated_content)
+            return {
+                "id": response_metadata.get("id", ""),
+                "object": "chat.completion",
+                "created": response_metadata.get("created", int(time.time())),
+                "model": response_metadata.get("model", ""),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": full_content,
+                        },
+                        "finish_reason": response_metadata.get("finish_reason", "stop"),
+                    }
+                ],
+            }
+        else:
+            # Non-streaming request
+            response = await self._client.post(
+                f"{self.backend_url}/v1/chat/completions",
+                json=request_body,
+                headers=headers,
+            )
+            return response.json()
+
     async def chat_completions(self, request: Request):
-        """Handle /v1/chat/completions requests with caching."""
+        """Handle /v1/chat/completions requests with caching and deduplication."""
         request_body = await request.json()
 
         # Extract prompt for cache lookup
         prompt = self._extract_prompt(request_body)
         is_streaming = request_body.get("stream", False)
 
-        # Check cache
+        # Check cache first (fast path)
         if self.enable_cache and self.cache:
             cached_response = self.cache.get(prompt)
             if cached_response is not None:
@@ -234,35 +328,60 @@ class ProxyServer:
                     # Return cached response directly
                     return JSONResponse(cached_response)
 
-        # Cache miss - forward to backend
-        headers = {
-            "Content-Type": "application/json",
-        }
+        # Cache miss - check if request is in-flight
+        async with self._inflight_lock:
+            if prompt in self._inflight:
+                # Request is already in-flight, wait for it
+                future = self._inflight[prompt]
+                is_waiter = True
+            else:
+                # Create new future for this request
+                future = asyncio.Future()
+                self._inflight[prompt] = future
+                is_waiter = False
 
-        # Copy authorization if present
-        if "authorization" in request.headers:
-            headers["Authorization"] = request.headers["authorization"]
+        # If we're the primary request (not a waiter), make the backend call
+        # IMPORTANT: This happens OUTSIDE the lock to avoid blocking waiters
+        if not is_waiter:
+            headers = {
+                "Content-Type": "application/json",
+            }
+            if "authorization" in request.headers:
+                headers["Authorization"] = request.headers["authorization"]
 
+            try:
+                # Make the backend request (accumulates streaming if needed)
+                response_data = await self._make_backend_request(
+                    request_body, headers, prompt, is_streaming
+                )
+
+                # Cache the response
+                if self.enable_cache and self.cache:
+                    self.cache.put(prompt, response_data)
+
+                # Set the future result for all waiters
+                future.set_result(response_data)
+
+            except Exception as e:
+                # Propagate error to all waiters
+                future.set_exception(e)
+                raise
+            finally:
+                # Clean up in-flight tracking
+                async with self._inflight_lock:
+                    self._inflight.pop(prompt, None)
+
+        # All requests (both the one that made the call and waiters) reach here
+        # Get the result from the future
+        response_data = await future
+
+        # Return response in the requested format
         if is_streaming:
-            # Forward streaming request (caching happens inside _forward_streaming)
             return StreamingResponse(
-                self._forward_streaming(self.backend_url, request_body, headers, prompt),
+                self._fake_stream_response(response_data),
                 media_type="text/event-stream",
             )
         else:
-            # Forward non-streaming request
-            response = await self._client.post(
-                f"{self.backend_url}/v1/chat/completions",
-                json=request_body,
-                headers=headers,
-            )
-
-            response_data = response.json()
-
-            # Cache the response
-            if self.enable_cache and self.cache:
-                self.cache.put(prompt, response_data)
-
             return JSONResponse(response_data)
 
 
