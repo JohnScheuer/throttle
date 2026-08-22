@@ -1536,9 +1536,17 @@ def _diagnostic_metrics(
     gpu_results = [result for result in valid if not result.cache_hit]
     cache_results = [result for result in valid if result.cache_hit]
 
-    # Token counts include both GPU and cache results (total throughput)
+    # Total token counts (all requests)
     completion_tokens = sum(result.completion_tokens or 0 for result in valid)
     prompt_tokens = sum(result.prompt_tokens or 0 for result in valid)
+
+    # GPU-only token counts (excludes cache hits)
+    gpu_completion_tokens = sum(result.completion_tokens or 0 for result in gpu_results)
+    gpu_prompt_tokens = sum(result.prompt_tokens or 0 for result in gpu_results)
+
+    # Cache-only metrics
+    cache_hit_count = len(cache_results)
+    cache_completion_tokens = sum(result.completion_tokens or 0 for result in cache_results)
 
     # Latency percentiles computed ONLY on GPU requests to avoid cache skew
     e2e = [result.e2e_seconds for result in gpu_results]
@@ -1577,8 +1585,12 @@ def _diagnostic_metrics(
         "valid_response_count": len(valid),
         "completion_tokens": completion_tokens,
         "prompt_tokens": prompt_tokens,
+        "gpu_completion_tokens": gpu_completion_tokens,
+        "cache_hit_count": cache_hit_count,
+        "cache_completion_tokens": cache_completion_tokens,
         "requests_per_second": len(valid) / wall_seconds if wall_seconds > 0 else None,
-        "output_tokens_per_second": completion_tokens / wall_seconds
+        # Throughput calculated from GPU requests only (excludes cache hits)
+        "output_tokens_per_second": gpu_completion_tokens / wall_seconds
         if wall_seconds > 0
         else None,
         "error_rate": (len(results) - len(valid)) / len(results) if results else None,
