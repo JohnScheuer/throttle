@@ -45,9 +45,11 @@ class ProxyServer:
         cache_ttl_seconds: float = 3600.0,
         cache_max_size: int = 1000,
         cache_similarity_threshold: float = 0.85,
+        backend_timeout_seconds: float = 120.0,
     ):
         self.backend_url = backend_url.rstrip("/")
         self.enable_cache = enable_cache
+        self.backend_timeout_seconds = backend_timeout_seconds
         self.cache: Optional[SimilarityCache] = None
 
         if self.enable_cache:
@@ -74,7 +76,7 @@ class ProxyServer:
 
     async def startup(self):
         """Initialize HTTP client."""
-        self._client = httpx.AsyncClient(timeout=120.0)
+        self._client = httpx.AsyncClient(timeout=self.backend_timeout_seconds)
 
     async def shutdown(self):
         """Cleanup HTTP client."""
@@ -94,15 +96,40 @@ class ProxyServer:
             } if self.cache else None,
         }
 
+    def _extract_scope_key(self, request_body: Dict[str, Any]) -> str:
+        """Extract scope parameters that must match exactly for cache hits.
+
+        Two requests may only share a cache entry if their scope keys are identical.
+        This includes model, temperature, and all other sampling parameters.
+        """
+        # Extract all parameters that affect the response
+        scope_params = {
+            "model": request_body.get("model"),
+            "temperature": request_body.get("temperature"),
+            "top_p": request_body.get("top_p"),
+            "max_tokens": request_body.get("max_tokens"),
+            "frequency_penalty": request_body.get("frequency_penalty"),
+            "presence_penalty": request_body.get("presence_penalty"),
+            "stop": request_body.get("stop"),
+            "seed": request_body.get("seed"),
+        }
+        # Create deterministic scope key (sorted JSON)
+        return json.dumps(scope_params, sort_keys=True)
+
     def _extract_prompt(self, request_body: Dict[str, Any]) -> str:
-        """Extract prompt string from request for cache key."""
+        """Extract semantic text from messages for similarity matching.
+
+        Includes role information to distinguish different conversation structures.
+        """
         messages = request_body.get("messages", [])
-        # Simple concatenation of all message content for cache key
         prompt_parts = []
         for msg in messages:
             if isinstance(msg, dict) and "content" in msg:
-                prompt_parts.append(msg["content"])
-        return " ".join(prompt_parts)
+                role = msg.get("role", "user")
+                content = msg["content"]
+                # Include role to distinguish different conversation structures
+                prompt_parts.append(f"{role}: {content}")
+        return "\n".join(prompt_parts)
 
     async def _fake_stream_response(
         self, cached_response: Dict[str, Any]
@@ -322,35 +349,42 @@ class ProxyServer:
         try:
             request_body = await request.json()
 
-            # Extract prompt for cache lookup
+            # Extract scope and semantic text
+            scope_key = self._extract_scope_key(request_body)
             prompt = self._extract_prompt(request_body)
             is_streaming = request_body.get("stream", False)
 
             # Check cache first (fast path)
             if self.enable_cache and self.cache:
-                cached_response = self.cache.get(prompt)
-                if cached_response is not None:
-                    # Cache hit
-                    if is_streaming:
-                        # Fake-stream the cached response
-                        return StreamingResponse(
-                            self._fake_stream_response(cached_response),
-                            media_type="text/event-stream",
-                        )
-                    else:
-                        # Return cached response directly
-                        return JSONResponse(cached_response)
+                cached_entry = self.cache.get(prompt)
+                if cached_entry is not None:
+                    # Validate scope match
+                    if isinstance(cached_entry, dict) and cached_entry.get("_scope") == scope_key:
+                        # Scope matches - cache hit
+                        cached_response = cached_entry["response"]
+                        if is_streaming:
+                            # Fake-stream the cached response
+                            return StreamingResponse(
+                                self._fake_stream_response(cached_response),
+                                media_type="text/event-stream",
+                            )
+                        else:
+                            # Return cached response directly
+                            return JSONResponse(cached_response)
+                    # else: scope mismatch, treat as cache miss
 
             # Cache miss - check if request is in-flight
+            # Use scope+prompt as deduplication key to avoid cross-scope collisions
+            dedup_key = f"{scope_key}||{prompt}"
             async with self._inflight_lock:
-                if prompt in self._inflight:
+                if dedup_key in self._inflight:
                     # Request is already in-flight, wait for it
-                    future = self._inflight[prompt]
+                    future = self._inflight[dedup_key]
                     is_waiter = True
                 else:
                     # Create new future for this request
                     future = asyncio.Future()
-                    self._inflight[prompt] = future
+                    self._inflight[dedup_key] = future
                     is_waiter = False
 
             # If we're the primary request (not a waiter), make the backend call
@@ -372,7 +406,12 @@ class ProxyServer:
                     if self.enable_cache and self.cache:
                         choices = response_data.get("choices", [])
                         if choices:
-                            self.cache.put(prompt, response_data)
+                            # Wrap response with scope metadata
+                            cached_entry = {
+                                "_scope": scope_key,
+                                "response": response_data,
+                            }
+                            self.cache.put(prompt, cached_entry)
 
                     # Set the future result for all waiters
                     future.set_result(response_data)
@@ -384,7 +423,7 @@ class ProxyServer:
                 finally:
                     # Clean up in-flight tracking
                     async with self._inflight_lock:
-                        self._inflight.pop(prompt, None)
+                        self._inflight.pop(dedup_key, None)
 
             # All requests (both the one that made the call and waiters) reach here
             # Get the result from the future
@@ -417,6 +456,7 @@ def create_app(
     cache_ttl_seconds: float = 3600.0,
     cache_max_size: int = 1000,
     cache_similarity_threshold: float = 0.85,
+    backend_timeout_seconds: float = 120.0,
 ) -> FastAPI:
     """Factory function to create a proxy app."""
     proxy = ProxyServer(
@@ -425,6 +465,7 @@ def create_app(
         cache_ttl_seconds=cache_ttl_seconds,
         cache_max_size=cache_max_size,
         cache_similarity_threshold=cache_similarity_threshold,
+        backend_timeout_seconds=backend_timeout_seconds,
     )
 
     # Register startup/shutdown hooks

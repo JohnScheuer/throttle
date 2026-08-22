@@ -525,6 +525,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.85,
         help="Jaccard similarity threshold (0.0-1.0, default: 0.85)",
     )
+    proxy.add_argument(
+        "--backend-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="backend request timeout in seconds (default: 120.0)",
+    )
 
     return parser
 
@@ -2065,6 +2071,7 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         cache_ttl_seconds=args.cache_ttl_seconds,
         cache_max_size=args.cache_max_size,
         cache_similarity_threshold=args.cache_similarity_threshold,
+        backend_timeout_seconds=args.backend_timeout_seconds,
     )
 
     try:

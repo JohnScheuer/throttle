@@ -309,17 +309,17 @@ async def test_backend_timeout_does_not_hang_waiters():
         cache_ttl_seconds=3600.0,
         cache_max_size=100,
         cache_similarity_threshold=0.85,
+        backend_timeout_seconds=1.0,  # 1s timeout for testing
     )
-    proxy._client = httpx.AsyncClient(timeout=1.0)  # 1s timeout for testing
 
     proxy_app = proxy.app
     @proxy_app.on_event("startup")
     async def startup():
-        pass  # Client already created
+        await proxy.startup()
 
     @proxy_app.on_event("shutdown")
     async def shutdown():
-        await proxy._client.aclose()
+        await proxy.shutdown()
 
     proxy_config = uvicorn.Config(proxy_app, host="127.0.0.1", port=58093, log_level="error")
     proxy_server = uvicorn.Server(proxy_config)
@@ -556,3 +556,203 @@ async def test_concurrent_requests_with_mixed_prompts(proxy_to_mock, mock_backen
         stats = health.json()["cache_stats"]
         assert stats["backend_calls"] == 4
         assert stats["backend_calls"] == mock.request_count
+
+
+async def test_scope_collision_different_model(proxy_to_mock, mock_backend_server):
+    """Same messages but different model: two backend calls, no cache collision."""
+    mock = mock_backend_server
+
+    messages = [{"role": "user", "content": "What is 2+2?"}]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1: model=gpt-3.5-turbo
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-3.5-turbo", "messages": messages, "stream": False},
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        # Small delay to ensure request 1 completes
+        await asyncio.sleep(0.2)
+
+        # Request 2: model=gpt-4 (same messages, different model)
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "gpt-4", "messages": messages, "stream": False},
+        )
+        assert response2.status_code == 200
+
+        # Should have made 2 backend calls (different model = different scope)
+        assert mock.request_count == 2, \
+            f"Expected 2 backend calls (different model), got {mock.request_count}"
+
+
+async def test_scope_collision_different_temperature(proxy_to_mock, mock_backend_server):
+    """Same messages but different temperature: two backend calls, no cache collision."""
+    mock = mock_backend_server
+
+    messages = [{"role": "user", "content": "Tell me a joke"}]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1: temperature=0.0
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "mock-model", "messages": messages, "temperature": 0.0, "stream": False},
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        await asyncio.sleep(0.2)
+
+        # Request 2: temperature=0.9 (same messages, different temperature)
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "mock-model", "messages": messages, "temperature": 0.9, "stream": False},
+        )
+        assert response2.status_code == 200
+
+        # Should have made 2 backend calls (different temperature = different scope)
+        assert mock.request_count == 2, \
+            f"Expected 2 backend calls (different temperature), got {mock.request_count}"
+
+
+async def test_scope_collision_different_max_tokens(proxy_to_mock, mock_backend_server):
+    """Same messages but different max_tokens: two backend calls, no cache collision."""
+    mock = mock_backend_server
+
+    messages = [{"role": "user", "content": "Write a story"}]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1: max_tokens=100
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "mock-model", "messages": messages, "max_tokens": 100, "stream": False},
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        await asyncio.sleep(0.2)
+
+        # Request 2: max_tokens=500 (same messages, different max_tokens)
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "mock-model", "messages": messages, "max_tokens": 500, "stream": False},
+        )
+        assert response2.status_code == 200
+
+        # Should have made 2 backend calls (different max_tokens = different scope)
+        assert mock.request_count == 2, \
+            f"Expected 2 backend calls (different max_tokens), got {mock.request_count}"
+
+
+async def test_scope_same_parameters_cache_hit(proxy_to_mock, mock_backend_server):
+    """Same messages AND same parameters: one backend call, second is cache hit."""
+    mock = mock_backend_server
+
+    payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Calculate 5+7"}],
+        "temperature": 0.5,
+        "max_tokens": 200,
+        "stream": False,
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json=payload,
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        await asyncio.sleep(0.2)
+
+        # Request 2: identical payload
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json=payload,
+        )
+        assert response2.status_code == 200
+
+        # Should have made only 1 backend call (second was cache hit)
+        assert mock.request_count == 1, \
+            f"Expected 1 backend call (cache hit), got {mock.request_count}"
+
+        # Verify cache hit in stats
+        health = await client.get("http://127.0.0.1:58091/health")
+        stats = health.json()["cache_stats"]
+        assert stats["hits"] >= 1, "Should have at least one cache hit"
+
+
+async def test_role_differentiation(proxy_to_mock, mock_backend_server):
+    """Same text but different role assignment: two backend calls."""
+    mock = mock_backend_server
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Request 1: user asks question
+        response1 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": False,
+            },
+        )
+        assert response1.status_code == 200
+        assert mock.request_count == 1
+
+        await asyncio.sleep(0.2)
+
+        # Request 2: assistant says same text (different role)
+        response2 = await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={
+                "model": "mock-model",
+                "messages": [{"role": "assistant", "content": "Hello"}],
+                "stream": False,
+            },
+        )
+        assert response2.status_code == 200
+
+        # Should have made 2 backend calls (different role = different semantic text)
+        assert mock.request_count == 2, \
+            f"Expected 2 backend calls (different role), got {mock.request_count}"
+
+
+async def test_concurrent_dedup_respects_scope(proxy_to_mock, mock_backend_server):
+    """Concurrent requests with same messages but different models: both reach backend.
+
+    Critical test: in-flight deduplication must respect scope boundaries.
+    Two concurrent requests with identical prompts but different models should NOT
+    be deduplicated - each should reach the backend independently.
+    """
+    mock = mock_backend_server
+
+    messages = [{"role": "user", "content": "Concurrent scope test"}]
+
+    async def send_request(client_id: int, model: str):
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "http://127.0.0.1:58091/v1/chat/completions",
+                json={"model": model, "messages": messages, "stream": False},
+            )
+            return client_id, model, response.json()
+
+    # Send 2 concurrent requests with different models
+    tasks = [
+        send_request(0, "gpt-3.5-turbo"),
+        send_request(1, "gpt-4"),
+    ]
+    results = await asyncio.gather(*tasks)
+
+    # Should have made 2 backend calls (different scope = no deduplication)
+    assert mock.request_count == 2, \
+        f"Expected 2 backend calls (different models, no dedup), got {mock.request_count}"
+
+    # Verify both requests got responses
+    assert len(results) == 2, "Should have 2 results"
+    for client_id, model, response_data in results:
+        assert "choices" in response_data
+        assert len(response_data["choices"]) > 0
