@@ -475,6 +475,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="two saved reports, or six ordered B1 C1 B2 C2 B3 C3 reports for the golden protocol",
     )
     compare.add_argument("--output", type=Path, default=DEFAULT_COMPARE_OUTPUT)
+
+    proxy = subparsers.add_parser(
+        "proxy",
+        help="run an OpenAI-compatible caching proxy server",
+        description=(
+            "Start a lightweight HTTP proxy that sits in front of a real inference "
+            "backend and caches responses using semantic similarity matching. "
+            "Compatible with vLLM, Ollama, SGLang, LMDeploy, and other OpenAI-compatible "
+            "servers."
+        ),
+    )
+    proxy.add_argument(
+        "--backend-url",
+        required=True,
+        help="backend inference server URL (e.g., http://localhost:8000)",
+    )
+    proxy.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="proxy server host (default: 127.0.0.1)",
+    )
+    proxy.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="proxy server port (default: 8080)",
+    )
+    proxy.add_argument(
+        "--enable-cache",
+        action="store_true",
+        help="enable semantic similarity caching",
+    )
+    proxy.add_argument(
+        "--cache-ttl-seconds",
+        type=float,
+        default=3600.0,
+        help="cache entry TTL in seconds (default: 3600)",
+    )
+    proxy.add_argument(
+        "--cache-max-size",
+        type=int,
+        default=1000,
+        help="maximum cache entries (default: 1000)",
+    )
+    proxy.add_argument(
+        "--cache-similarity-threshold",
+        type=float,
+        default=0.85,
+        help="Jaccard similarity threshold (0.0-1.0, default: 0.85)",
+    )
+
     return parser
 
 
@@ -1978,6 +2029,55 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     return EXIT_OK if result["decision_eligible"] else EXIT_INCONCLUSIVE
 
 
+def _handle_proxy(args: argparse.Namespace) -> int:
+    """Start the caching proxy server."""
+    try:
+        import uvicorn
+        from .proxy import create_app
+    except ImportError as e:
+        print(
+            f"Error: FastAPI and uvicorn are required for proxy mode: {e}",
+            file=sys.stderr,
+        )
+        print(
+            "Install with: pip install 'fastapi>=0.115.0' 'uvicorn[standard]>=0.30.0'",
+            file=sys.stderr,
+        )
+        return EXIT_FAILED
+
+    print(f"Starting Throttle proxy server on {args.host}:{args.port}")
+    print(f"Backend: {args.backend_url}")
+    print(f"Cache enabled: {args.enable_cache}")
+    if args.enable_cache:
+        print(f"  TTL: {args.cache_ttl_seconds}s")
+        print(f"  Max size: {args.cache_max_size}")
+        print(f"  Similarity threshold: {args.cache_similarity_threshold}")
+    print()
+    print("Health endpoint: http://{args.host}:{args.port}/health")
+    print("Chat completions: http://{args.host}:{args.port}/v1/chat/completions")
+    print()
+    print("Press Ctrl+C to stop")
+    print()
+
+    app = create_app(
+        backend_url=args.backend_url,
+        enable_cache=args.enable_cache,
+        cache_ttl_seconds=args.cache_ttl_seconds,
+        cache_max_size=args.cache_max_size,
+        cache_similarity_threshold=args.cache_similarity_threshold,
+    )
+
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+        return EXIT_OK
+    except KeyboardInterrupt:
+        print("\nProxy server stopped")
+        return EXIT_OK
+    except Exception as e:
+        print(f"Proxy server error: {e}", file=sys.stderr)
+        return EXIT_FAILED
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2025,6 +2125,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not report["compatibility"]["compatible"]:
             return EXIT_USAGE
         return EXIT_OK if report.get("decision_eligible") else EXIT_INCONCLUSIVE
+    if args.command == "proxy":
+        return _handle_proxy(args)
     parser.error("a subcommand is required")
     return EXIT_USAGE
 
