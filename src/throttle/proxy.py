@@ -249,16 +249,16 @@ class ProxyServer:
         For non-streaming: returns response directly.
         For streaming: accumulates the stream and returns complete response.
         """
+        # Increment backend call counter
+        # Note: cache misses != backend calls, because in-flight deduplication
+        # means multiple concurrent requests can all record cache misses while
+        # only one actually reaches the backend (others wait on the same Future)
+        self._backend_calls += 1
+
         if is_streaming:
             # For streaming, accumulate the complete response
             accumulated_content = []
             response_metadata = {}
-
-            # Increment backend call counter
-            # Note: cache misses != backend calls, because in-flight deduplication
-            # means multiple concurrent requests can all record cache misses while
-            # only one actually reaches the backend (others wait on the same Future)
-            self._backend_calls += 1
 
             async with self._client.stream(
                 "POST",
@@ -308,12 +308,6 @@ class ProxyServer:
             }
         else:
             # Non-streaming request
-            # Increment backend call counter
-            # Note: cache misses != backend calls, because in-flight deduplication
-            # means multiple concurrent requests can all record cache misses while
-            # only one actually reaches the backend (others wait on the same Future)
-            self._backend_calls += 1
-
             response = await self._client.post(
                 f"{self.backend_url}/v1/chat/completions",
                 json=request_body,
