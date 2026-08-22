@@ -504,7 +504,7 @@ def _supported_golden_artifact() -> dict[str, object]:
 
 
 class ParserAndPlanTests(unittest.TestCase):
-    def test_parser_has_seven_explicit_subcommands(self) -> None:
+    def test_parser_has_eight_explicit_subcommands(self) -> None:
         parser = build_parser()
         subparser_action = next(
             action
@@ -521,6 +521,7 @@ class ParserAndPlanTests(unittest.TestCase):
                 "experimental-tuning",
                 "golden",
                 "compare",
+                "proxy",
             },
         )
 
