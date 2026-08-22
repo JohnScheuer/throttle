@@ -1720,5 +1720,74 @@ class ExperimentalTuningFailureTests(unittest.IsolatedAsyncioTestCase):
                 )
 
 
+class MetricSchemaGuardTests(unittest.IsolatedAsyncioTestCase):
+    """Guard tests to prevent metric schema drift between benchmark and validation."""
+
+    async def test_benchmark_metric_keys_match_validation_allowlists(self) -> None:
+        """Ensure benchmark.py metrics match experimental_tuning.py allowlists.
+
+        This test prevents the root cause of the 22-test failure (commit 2564a51):
+        benchmark.py added cache metrics but experimental_tuning.py's allowlists
+        were not updated, causing validation to silently fail until tests broke.
+
+        If this test fails, it means new metric fields were added to benchmark
+        reports but _BASE_METRIC_KEYS and/or _AGGREGATE_METRIC_KEYS were not
+        updated in experimental_tuning.py.
+        """
+        from throttle.experimental_tuning import _BASE_METRIC_KEYS, _AGGREGATE_METRIC_KEYS
+
+        # Generate a real report through the benchmark code path
+        report = await _full_smoke_report()
+
+        # Extract actual metric keys from the report
+        conditions = report.get("conditions", [])
+        self.assertGreater(len(conditions), 0, "Report must have at least one condition")
+
+        condition = conditions[0]
+        blocks = condition.get("blocks", [])
+        self.assertGreater(len(blocks), 0, "Condition must have at least one block")
+
+        # Check block metrics (should match _BASE_METRIC_KEYS)
+        block = blocks[0]
+        block_metrics = block.get("metrics", {})
+        block_actual_keys = set(block_metrics.keys())
+
+        block_missing = _BASE_METRIC_KEYS - block_actual_keys
+        block_extra = block_actual_keys - _BASE_METRIC_KEYS
+
+        self.assertEqual(
+            block_missing,
+            set(),
+            f"_BASE_METRIC_KEYS has keys not in benchmark block metrics: {sorted(block_missing)}. "
+            "Remove these from _BASE_METRIC_KEYS in experimental_tuning.py"
+        )
+        self.assertEqual(
+            block_extra,
+            set(),
+            f"Benchmark block metrics has keys not in _BASE_METRIC_KEYS: {sorted(block_extra)}. "
+            "Add these to _BASE_METRIC_KEYS in experimental_tuning.py"
+        )
+
+        # Check aggregate metrics (should match _AGGREGATE_METRIC_KEYS)
+        aggregate_metrics = condition.get("metrics", {})
+        aggregate_actual_keys = set(aggregate_metrics.keys())
+
+        aggregate_missing = _AGGREGATE_METRIC_KEYS - aggregate_actual_keys
+        aggregate_extra = aggregate_actual_keys - _AGGREGATE_METRIC_KEYS
+
+        self.assertEqual(
+            aggregate_missing,
+            set(),
+            f"_AGGREGATE_METRIC_KEYS has keys not in benchmark aggregate metrics: {sorted(aggregate_missing)}. "
+            "Remove these from _AGGREGATE_METRIC_KEYS in experimental_tuning.py"
+        )
+        self.assertEqual(
+            aggregate_extra,
+            set(),
+            f"Benchmark aggregate metrics has keys not in _AGGREGATE_METRIC_KEYS: {sorted(aggregate_extra)}. "
+            "Add these to _AGGREGATE_METRIC_KEYS in experimental_tuning.py"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
