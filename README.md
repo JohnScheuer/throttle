@@ -76,6 +76,46 @@ To install directly from the checked-out source instead:
 python -m pip install .
 ```
 
+### Quick Start (Local Testing)
+
+The fastest way to try Throttle is against a local Ollama server:
+
+1. **Install Ollama** from [ollama.com](https://ollama.com/download)
+
+2. **Pull and start a small model:**
+   ```sh
+   ollama pull llama3.2:1b
+   ollama serve  # if not already running
+   ```
+
+3. **Run a smoke test:**
+   ```sh
+   # Set a dummy API key (Ollama doesn't need one, but throttle requires the variable)
+   export OLLAMA_API_KEY="ollama"
+
+   throttle smoke \
+     --model llama3.2:1b \
+     --url http://localhost:11434/v1 \
+     --api-key-env OLLAMA_API_KEY \
+     --cost-model unknown \
+     --allow-unknown-cost \
+     --output smoke.json
+   ```
+
+4. **Test the cache feature:**
+   ```sh
+   throttle smoke \
+     --model llama3.2:1b \
+     --url http://localhost:11434/v1 \
+     --api-key-env OLLAMA_API_KEY \
+     --cost-model unknown \
+     --allow-unknown-cost \
+     --enable-cache \
+     --output smoke-with-cache.json
+   ```
+
+The smoke run completes in under 2 minutes and sends 27 requests total (24 measured + 3 warmups). With `--enable-cache`, you'll see dramatically higher throughput for cached requests at higher concurrency levels.
+
 ### Real staging endpoint: plan, then smoke
 
 This is the exact successful flow used against a real Qwen/vLLM GPU endpoint,
