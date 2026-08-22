@@ -56,7 +56,7 @@ class ProxyServer:
                 max_size=cache_max_size,
                 similarity_threshold=cache_similarity_threshold,
                 enable_embeddings=True,
-                embedding_threshold=0.80,
+                embedding_threshold=0.95,
             )
 
         self.app = FastAPI(title="Throttle Proxy", version="0.3.0")
