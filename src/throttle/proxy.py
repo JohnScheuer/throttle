@@ -331,6 +331,7 @@ class ProxyServer:
                 json=request_body,
                 headers=headers,
             ) as response:
+                response.raise_for_status()
                 async for line in response.aiter_lines():
                     if line.startswith("data: "):
                         data_str = line[6:]
@@ -378,116 +379,112 @@ class ProxyServer:
                 json=request_body,
                 headers=headers,
             )
+            response.raise_for_status()
             return response.json()
 
     async def chat_completions(self, request: Request):
         """Handle /v1/chat/completions requests with caching and deduplication."""
-        request_body = await request.json()
+        try:
+            request_body = await request.json()
 
-        # Extract scope and semantic text
-        scope_key = self._extract_scope_key(request_body)
-        prompt = self._extract_prompt(request_body)
-        is_streaming = request_body.get("stream", False)
+            # Extract scope and semantic text
+            scope_key = self._extract_scope_key(request_body)
+            prompt = self._extract_prompt(request_body)
+            is_streaming = request_body.get("stream", False)
 
-        # Check cache first (fast path)
-        if self.enable_cache and self.cache:
-            result = self.cache.get_with_key_no_metrics(prompt)
-            if result is not None:
-                canonical_key, scope_dict = result
-                # scope_dict maps scope_key → response_data for this semantic prompt
-                if isinstance(scope_dict, dict) and scope_key in scope_dict:
-                    # Hit: same semantic prompt AND same scope
-                    self.cache.metrics.hits += 1
-                    cached_response = scope_dict[scope_key]["response"]
-                    if is_streaming:
-                        # Fake-stream the cached response
-                        return StreamingResponse(
-                            self._fake_stream_response(cached_response),
-                            media_type="text/event-stream",
-                        )
-                    else:
-                        # Return cached response directly
-                        return JSONResponse(cached_response)
-                # else: similar prompt but different scope, treat as cache miss
-                self.cache.metrics.misses += 1
-            else:
-                # No similar prompt found
-                self.cache.metrics.misses += 1
-
-        # Cache miss - check if request is in-flight
-        # Use scope+prompt as deduplication key to avoid cross-scope collisions
-        dedup_key = f"{scope_key}||{prompt}"
-        async with self._inflight_lock:
-            if dedup_key in self._inflight:
-                # Request is already in-flight, wait for it
-                future = self._inflight[dedup_key]
-                is_waiter = True
-            else:
-                # Create new future for this request
-                future = asyncio.Future()
-                self._inflight[dedup_key] = future
-                is_waiter = False
-
-        # If we're the primary request (not a waiter), make the backend call
-        # IMPORTANT: This happens OUTSIDE the lock to avoid blocking waiters
-        if not is_waiter:
-            headers = {
-                "Content-Type": "application/json",
-            }
-            if "authorization" in request.headers:
-                headers["Authorization"] = request.headers["authorization"]
-
-            try:
-                # Make the backend request (accumulates streaming if needed)
-                response_data = await self._make_backend_request(
-                    request_body, headers, prompt, is_streaming
-                )
-
-                # Cache the response (only if it contains valid choices)
-                if self.enable_cache and self.cache:
-                    choices = response_data.get("choices", [])
-                    if choices:
-                        # Get existing scope dict for this EXACT prompt (no similarity matching)
-                        # This doesn't increment metrics - we only count the initial GET attempt
-                        existing_scope_dict = self.cache.get_exact_no_metrics(prompt)
-                        if existing_scope_dict is not None and isinstance(existing_scope_dict, dict):
-                            scope_dict = existing_scope_dict
+            # Check cache first (fast path)
+            if self.enable_cache and self.cache:
+                result = self.cache.get_with_key_no_metrics(prompt)
+                if result is not None:
+                    canonical_key, scope_dict = result
+                    if isinstance(scope_dict, dict) and scope_key in scope_dict:
+                        self.cache.metrics.hits += 1
+                        cached_response = scope_dict[scope_key]["response"]
+                        if is_streaming:
+                            return StreamingResponse(
+                                self._fake_stream_response(cached_response),
+                                media_type="text/event-stream",
+                            )
                         else:
-                            scope_dict = {}
+                            return JSONResponse(cached_response)
+                    self.cache.metrics.misses += 1
+                else:
+                    self.cache.metrics.misses += 1
 
-                        # Add/update this scope variant (preserves other scope variants)
-                        scope_dict[scope_key] = {
-                            "_scope": scope_key,
-                            "response": response_data,
-                        }
+            # Cache miss - check if request is in-flight
+            dedup_key = f"{scope_key}||{prompt}"
+            async with self._inflight_lock:
+                if dedup_key in self._inflight:
+                    future = self._inflight[dedup_key]
+                    is_waiter = True
+                else:
+                    future = asyncio.Future()
+                    self._inflight[dedup_key] = future
+                    is_waiter = False
 
-                        # Store updated scope dict under this prompt
-                        self.cache.put(prompt, scope_dict)
+            if not is_waiter:
+                headers = {"Content-Type": "application/json"}
+                if "authorization" in request.headers:
+                    headers["Authorization"] = request.headers["authorization"]
 
-                # Set the future result for all waiters
-                future.set_result(response_data)
+                try:
+                    response_data = await self._make_backend_request(
+                        request_body, headers, prompt, is_streaming
+                    )
 
-            except Exception as e:
-                # Propagate error to all waiters
-                future.set_exception(e)
-                raise
-            finally:
-                # Clean up in-flight tracking
-                async with self._inflight_lock:
-                    self._inflight.pop(dedup_key, None)
+                    if self.enable_cache and self.cache:
+                        choices = response_data.get("choices", [])
+                        if choices:
+                            existing_scope_dict = self.cache.get_exact_no_metrics(prompt)
+                            if existing_scope_dict is not None and isinstance(existing_scope_dict, dict):
+                                scope_dict = existing_scope_dict
+                            else:
+                                scope_dict = {}
+                            scope_dict[scope_key] = {
+                                "_scope": scope_key,
+                                "response": response_data,
+                            }
+                            self.cache.put(prompt, scope_dict)
 
-        # All requests (both the one that made the call and waiters) reach here
-        # Get the result from the future
-        response_data = await future
+                    future.set_result(response_data)
 
-        # Return response in the requested format
-        if is_streaming:
-            return StreamingResponse(
-                self._fake_stream_response(response_data),
-                media_type="text/event-stream",
-            )
-        else:
-            return JSONResponse(response_data)
+                except Exception as e:
+                    future.set_exception(e)
+                    raise
+                finally:
+                    async with self._inflight_lock:
+                        self._inflight.pop(dedup_key, None)
+
+            response_data = await future
+
+            if is_streaming:
+                return StreamingResponse(
+                    self._fake_stream_response(response_data),
+                    media_type="text/event-stream",
+                )
+            else:
+                return JSONResponse(response_data)
+
+        except httpx.HTTPStatusError as e:
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = {"error": e.response.text or str(e)}
+            return JSONResponse(content=error_body, status_code=e.response.status_code)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
+            return JSONResponse(content={"error": f"Backend timeout: {str(e)}"}, status_code=504)
+
+
+        except httpx.HTTPStatusError as e:
+            # Preserve backend error status and body
+            try:
+                error_body = e.response.json()
+            except Exception:
+                error_body = {"error": e.response.text or str(e)}
+            return JSONResponse(content=error_body, status_code=e.response.status_code)
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
+            # Return timeout error to client
+            return JSONResponse(content={"error": f"Backend timeout: {str(e)}"}, status_code=504)
 
 
 def create_app(
