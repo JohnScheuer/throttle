@@ -951,24 +951,51 @@ def _print_run(report: Mapping[str, Any], output: Path) -> None:
         print("Throttle SMOKE — SHORT SAMPLE, NON-DECISION-GRADE")
     else:
         print("Throttle BENCHMARK — repeated measured blocks")
-    print(
-        " condition              valid  grade   requests  block-mean tok/s   p95 e2e   p95 TTFT  SLO goodput"
-    )
+
+    # Check if cache is enabled to adjust table format
+    cache_enabled = report.get("run_totals", {}).get("cache_enabled", False)
+
+    if cache_enabled:
+        print(
+            " condition              valid  grade   requests  GPU tok/s  cache hits   p95 e2e   p95 TTFT  SLO goodput"
+        )
+    else:
+        print(
+            " condition              valid  grade   requests  block-mean tok/s   p95 e2e   p95 TTFT  SLO goodput"
+        )
+
     for item in report["conditions"]:
         condition = item["condition"]
         metrics = item.get("metrics") or {}
         slo = metrics.get("slo_goodput")
-        print(
-            f" {condition['id']:<22} "
-            f"{'yes' if item.get('valid') else 'NO':>5}  "
-            f"{'yes' if item.get('decision_grade') else 'no':>5}  "
-            f"{item.get('request_counts', {}).get('valid', 0):>4}/"
-            f"{item.get('request_counts', {}).get('attempted', 0):<4}  "
-            f"{_metric(metrics.get('block_mean_output_tokens_per_second')):>16}  "
-            f"{_metric((metrics.get('e2e_latency_ms') or {}).get('p95')):>9}  "
-            f"{_metric((metrics.get('ttft_ms') or {}).get('p95')):>9}  "
-            f"{_metric((slo or {}).get('requests_per_second')):>11}"
-        )
+
+        if cache_enabled:
+            # Show GPU throughput and cache hit count
+            cache_hits = metrics.get("cache_hit_count", 0)
+            print(
+                f" {condition['id']:<22} "
+                f"{'yes' if item.get('valid') else 'NO':>5}  "
+                f"{'yes' if item.get('decision_grade') else 'no':>5}  "
+                f"{item.get('request_counts', {}).get('valid', 0):>4}/"
+                f"{item.get('request_counts', {}).get('attempted', 0):<4}  "
+                f"{_metric(metrics.get('block_mean_output_tokens_per_second')):>9}  "
+                f"{cache_hits:>10}  "
+                f"{_metric((metrics.get('e2e_latency_ms') or {}).get('p95')):>9}  "
+                f"{_metric((metrics.get('ttft_ms') or {}).get('p95')):>9}  "
+                f"{_metric((slo or {}).get('requests_per_second')):>11}"
+            )
+        else:
+            print(
+                f" {condition['id']:<22} "
+                f"{'yes' if item.get('valid') else 'NO':>5}  "
+                f"{'yes' if item.get('decision_grade') else 'no':>5}  "
+                f"{item.get('request_counts', {}).get('valid', 0):>4}/"
+                f"{item.get('request_counts', {}).get('attempted', 0):<4}  "
+                f"{_metric(metrics.get('block_mean_output_tokens_per_second')):>16}  "
+                f"{_metric((metrics.get('e2e_latency_ms') or {}).get('p95')):>9}  "
+                f"{_metric((metrics.get('ttft_ms') or {}).get('p95')):>9}  "
+                f"{_metric((slo or {}).get('requests_per_second')):>11}"
+            )
         if item.get("decision_ineligible_reasons"):
             print("   evidence note: " + ", ".join(item["decision_ineligible_reasons"]))
     best = report.get("best_tested", {})
