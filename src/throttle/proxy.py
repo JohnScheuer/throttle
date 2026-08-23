@@ -254,6 +254,7 @@ class ProxyServer:
                     }
                 ],
             }
+            # WARNING: This cache.put is scope-blind (stores raw response, not scope-aware dict). Unsafe to wire up as written.
             self.cache.put(prompt, cached_response)
 
     async def _make_backend_request(
