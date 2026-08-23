@@ -18,6 +18,7 @@ balances precision (avoiding false positives) with recall (catching duplicates).
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
@@ -45,6 +46,7 @@ class ProxyServer:
         cache_ttl_seconds: float = 3600.0,
         cache_max_size: int = 1000,
         cache_similarity_threshold: float = 0.85,
+        lifespan=None,
     ):
         self.backend_url = backend_url.rstrip("/")
         self.enable_cache = enable_cache
@@ -57,7 +59,7 @@ class ProxyServer:
                 similarity_threshold=cache_similarity_threshold,
             )
 
-        self.app = FastAPI(title="Throttle Proxy", version="0.3.0")
+        self.app = FastAPI(title="Throttle Proxy", version="0.3.0", lifespan=lifespan)
         self.app.post("/v1/chat/completions")(self.chat_completions)
         self.app.get("/health")(self.health)
 
@@ -457,21 +459,24 @@ def create_app(
     cache_similarity_threshold: float = 0.85,
 ) -> FastAPI:
     """Factory function to create a proxy app."""
+    # ProxyServer will be captured by the lifespan closure
+    proxy = None
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        await proxy.startup()
+        yield
+        # Shutdown
+        await proxy.shutdown()
+
     proxy = ProxyServer(
         backend_url,
         enable_cache=enable_cache,
         cache_ttl_seconds=cache_ttl_seconds,
         cache_max_size=cache_max_size,
         cache_similarity_threshold=cache_similarity_threshold,
+        lifespan=lifespan,
     )
-
-    # Register startup/shutdown hooks
-    @proxy.app.on_event("startup")
-    async def startup_event():
-        await proxy.startup()
-
-    @proxy.app.on_event("shutdown")
-    async def shutdown_event():
-        await proxy.shutdown()
 
     return proxy.app

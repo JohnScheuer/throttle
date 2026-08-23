@@ -111,23 +111,27 @@ async def proxy_to_mock(mock_backend_server):
     """Fixture providing a proxy pointing to mock backend."""
     import uvicorn
 
+    # ProxyServer will be captured by the lifespan closure
+    proxy = None
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        await proxy.startup()
+        yield
+        # Shutdown
+        await proxy.shutdown()
+
     proxy = ProxyServer(
         backend_url="http://127.0.0.1:58090",
         enable_cache=True,
         cache_ttl_seconds=3600.0,
         cache_max_size=100,
         cache_similarity_threshold=0.85,
+        lifespan=lifespan,
     )
 
     app = proxy.app
-
-    @app.on_event("startup")
-    async def startup():
-        await proxy.startup()
-
-    @app.on_event("shutdown")
-    async def shutdown():
-        await proxy.shutdown()
 
     config = uvicorn.Config(app, host="127.0.0.1", port=58091, log_level="error")
     server = uvicorn.Server(config)
