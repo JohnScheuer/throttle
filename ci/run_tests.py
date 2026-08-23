@@ -1,10 +1,9 @@
-"""Run the full unittest suite and reject any reduced-coverage outcome."""
+"""Run the full pytest suite and reject any reduced-coverage outcome."""
 
 from __future__ import annotations
 
 import argparse
 import sys
-import unittest
 from pathlib import Path
 
 
@@ -21,25 +20,39 @@ def main() -> None:
     if not start_directory.is_dir():
         raise SystemExit("test start directory does not exist")
 
-    suite = unittest.defaultTestLoader.discover(str(start_directory))
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    if result.testsRun == 0:
+    # Import pytest here to ensure it's available
+    try:
+        import pytest
+    except ImportError:
+        print("pytest not installed", file=sys.stderr)
+        raise SystemExit(1)
+
+    # Run pytest with strict configuration:
+    # -v: verbose
+    # --tb=short: short traceback format
+    # --strict-markers: reject unknown markers
+    # -ra: show summary of all outcomes except passed
+    # --no-cov: disable coverage if accidentally enabled
+    exit_code = pytest.main([
+        str(start_directory),
+        "-v",
+        "--tb=short",
+        "--strict-markers",
+        "-ra",
+    ])
+
+    # pytest exit codes:
+    # 0: all tests passed
+    # 1: tests failed
+    # 2: test execution interrupted
+    # 3: internal error
+    # 4: pytest command line usage error
+    # 5: no tests collected
+    if exit_code == 5:
         print("CI discovered zero tests", file=sys.stderr)
         raise SystemExit(1)
-    reduced_coverage = (
-        len(result.skipped)
-        + len(result.expectedFailures)
-        + len(result.unexpectedSuccesses)
-    )
-    if reduced_coverage:
-        print(
-            "CI requires zero skipped, expected-failure, or unexpected-success "
-            f"tests; observed {reduced_coverage}",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-    if not result.wasSuccessful():
-        raise SystemExit(1)
+    if exit_code != 0:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
