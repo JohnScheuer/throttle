@@ -5,8 +5,6 @@ from unittest.mock import AsyncMock, MagicMock
 import asyncio
 import json
 
-from fastapi import Request
-from fastapi.testclient import TestClient
 from throttle.proxy import ProxyServer
 
 
