@@ -223,12 +223,14 @@ class ProxyServer:
             prompt = self._extract_prompt(request_body)
             is_streaming = request_body.get("stream", False)
 
-            # Check cache first (fast path)
+            # Check cache first without committing metrics until scope validation.
             if self.enable_cache and self.cache:
-                result = self.cache.get_with_key(prompt)
+                result = self.cache.get_with_key_no_metrics(prompt)
                 if result is not None:
-                    canonical_key, scope_dict = result
+                    _, scope_dict = result
                     if isinstance(scope_dict, dict) and scope_key in scope_dict:
+                        # A cache hit requires both semantic prompt match and scope match.
+                        self.cache.metrics.hits += 1
                         cached_response = scope_dict[scope_key]["response"]
                         if is_streaming:
                             return StreamingResponse(
@@ -237,6 +239,12 @@ class ProxyServer:
                             )
                         else:
                             return JSONResponse(cached_response)
+
+                    # Similar prompt found, but not for this request scope.
+                    self.cache.metrics.misses += 1
+                else:
+                    # No semantic prompt match.
+                    self.cache.metrics.misses += 1
 
             # Cache miss - In-flight deduplication matching
             is_waiter = False
