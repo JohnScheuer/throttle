@@ -118,12 +118,23 @@ class ProxyServer:
 
         All other fields (model, temperature, max_tokens, custom backend parameters, etc.)
         are included to prevent cache collisions between requests with different parameters.
+
+        When model_backends is non-empty, also includes the resolved backend URL to prevent
+        cache collisions when different backends serve models with the same name.
         """
         excluded = {"messages", "stream"}
         scope_params = {
             k: v for k, v in request_body.items()
             if k not in excluded
         }
+
+        # Include backend URL in scope when using per-model routing
+        # This prevents cache collisions when different backends serve same model name
+        if self.model_backends:
+            model = request_body.get("model", "")
+            backend_url = self._get_backend_url(model)
+            scope_params["_backend_url"] = backend_url
+
         return json.dumps(scope_params, sort_keys=True)
 
     def _extract_prompt(self, request_body: Dict[str, Any]) -> str:
