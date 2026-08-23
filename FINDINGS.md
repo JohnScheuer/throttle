@@ -26,6 +26,8 @@ This failure exists before the ITEM 3 commit (f5a5842). It is unrelated to the s
 
 **Test coverage:** test_backend_timeout_does_not_hang_waiters is skipped and documents that error paths are not tested.
 
+**Integration test failure:** test_backend_error_propagation (tests/test_proxy_integration.py:230) fails against current main. Test expects HTTP 500 from backend to propagate as HTTP 500 from proxy, but proxy returns HTTP 200 with cached error response. Failure confirms proxy lacks raise_for_status() validation.
+
 **Not yet investigated.** Requires determining:
 1. Which HTTP error codes should prevent caching
 2. Whether finish_reason values indicate error states
