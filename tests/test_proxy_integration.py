@@ -58,6 +58,7 @@ def is_backend_available(backend_url: str) -> bool:
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:11434")
 BACKEND_MODEL = os.getenv("BACKEND_MODEL", "llama3.2:1b")
+BACKEND_MODEL_2 = os.getenv("BACKEND_MODEL_2", "llama3.2:3b")
 SKIP_REASON = f"Backend not available at {BACKEND_URL}"
 
 
@@ -234,7 +235,7 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         # Same messages, different model
         await self._make_request(messages)
-        await self._make_request(messages, model="llama3.2:3b")
+        await self._make_request(messages, model=BACKEND_MODEL_2)
 
         # Same messages and model, different temperature
         await self._make_request(messages, temperature=0.7)
@@ -268,7 +269,7 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         hits_after_a1 = health_after_a1.get("cache_stats", {}).get("hits", 0)
 
         # Use model B - different cache scope
-        await self._make_request(messages, model="llama3.2:3b")
+        await self._make_request(messages, model=BACKEND_MODEL_2)
 
         # Use model A again - should hit its cache
         await self._make_request(messages)
