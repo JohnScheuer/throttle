@@ -66,22 +66,15 @@ when the question is whether one verified server configuration beat another.
 
 ## Try it safely
 
-Throttle requires Python 3.11+. Clone the public repository and install the
-reviewed v0.3.0 wheel:
+Throttle requires Python 3.11+. Clone the public repository and install from source:
 
 ```sh
 git clone https://github.com/KushagraKanaujia/throttle.git
 cd throttle
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install ./dist/throttle_bench-0.3.0-py3-none-any.whl
-throttle --version
-```
-
-To install directly from the checked-out source instead:
-
-```sh
 python -m pip install .
+throttle --version
 ```
 
 ### Quick Start (Local Testing)
