@@ -2,7 +2,7 @@
 
 All notable changes to Throttle will be documented in this file.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-08-22
 
 ### Removed
 - Claude Code cost proxy extracted to separate repository: https://github.com/KushagraKanaujia/claude-cost-proxy

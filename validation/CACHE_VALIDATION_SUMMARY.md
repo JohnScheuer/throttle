@@ -1,7 +1,13 @@
-# Cache Feature Validation - Realistic Traffic Test
+# Benchmark Cache Validation - Realistic Traffic Test
+
+**IMPORTANT**: This validation is for the **benchmark harness cache** (`throttle benchmark --enable-cache`), NOT the standalone proxy cache (`throttle proxy`). These are separate features with different use cases:
+- Benchmark cache: Accelerates Throttle's own load generator for testing
+- Proxy cache: Serves external HTTP clients (curl, OpenAI SDKs, etc.)
+
+Both use the same `SimilarityCache` class but serve different purposes.
 
 ## Objective
-Prove the similarity cache works with realistic traffic patterns, not synthetic/fake data.
+Prove the benchmark similarity cache works with realistic traffic patterns, not synthetic/fake data.
 
 ## Test Setup
 

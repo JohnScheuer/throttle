@@ -27,6 +27,8 @@ All tests should pass before submitting a pull request. The suite covers:
 - GuideLLM subprocess boundary
 - Six-run golden protocol validation
 - Experimental tuning collector/analyzer/safety chain
+- Proxy cache behavior, scope isolation, and in-flight deduplication (unit tests)
+- Proxy integration tests against live Ollama backend (skipped if Ollama unavailable)
 
 ## Code Style
 

@@ -375,30 +375,47 @@ responses for external HTTP clients. Unlike the benchmark cache (which only
 accelerates Throttle's own load generator), the proxy serves production
 traffic from curl, OpenAI SDKs, and other HTTP clients.
 
-**Quick start:**
+**Quick start** (start Ollama first with `ollama serve` and `ollama pull llama3.2:1b`):
 
 ```bash
-# Start proxy in front of Ollama
+# Start proxy - backend URL does NOT include /v1 (proxy appends it automatically)
 throttle proxy \
   --backend-url http://localhost:11434 \
   --enable-cache \
   --port 8080
+```
 
-# External clients connect to the proxy instead of the backend
+```bash
+# First request - cache miss
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama3.2:1b",
-    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 50
   }'
+
+# Check cache stats - should show "misses": 1, "hits": 0
+curl http://localhost:8080/health
+
+# Second IDENTICAL request - cache hit (MUST match model, max_tokens, messages exactly)
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:1b",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 50
+  }'
+
+# Verify cache hit - should show "hits": 1
+curl http://localhost:8080/health
 ```
 
-The proxy forwards cache misses to the configured backend and returns cached
-responses for semantically similar prompts. Cache hits and misses are reported
-via the `/health` endpoint.
+**Cache scope**: model, temperature, max_tokens, and all other sampling parameters must match exactly for a cache hit. Changing any parameter creates a different cache scope.
 
-For detailed configuration, streaming behavior, and production deployment
+**Important limitation**: The cache uses **lexical** Jaccard token-overlap similarity (threshold 0.85), NOT semantic embeddings. **Paraphrases will miss** despite identical meaning. For example, `"optimize PostgreSQL queries"` vs `"optimize database queries in PostgreSQL"` has Jaccard similarity ~0.64 (below threshold), so the second request hits the backend. Exact or near-exact token matches work well.
+
+For detailed configuration, streaming behavior, error handling, and production deployment
 considerations, see [PROXY_DEMO.md](PROXY_DEMO.md).
 
 ## Boundary and uncertainty rules
