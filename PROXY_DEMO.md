@@ -1,6 +1,9 @@
 # Throttle Proxy - OpenAI-Compatible Caching Proxy
 
-The Throttle proxy is a lightweight HTTP server that sits in front of real inference backends (vLLM, Ollama, SGLang, LMDeploy) and caches responses using lexical similarity matching (Jaccard token-overlap).
+The Throttle proxy is a lightweight HTTP server that sits in front of real inference backends and caches responses using lexical similarity matching (Jaccard token-overlap).
+
+**Verified compatible:** Ollama (CI integration tests pass)
+**Expected compatible:** vLLM, SGLang, LMDeploy (GPU verification pending - see `validation/gpu_backend_verification.sh`)
 
 ## Features
 

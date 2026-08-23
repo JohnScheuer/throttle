@@ -1,8 +1,10 @@
 """Throttle Proxy: OpenAI-compatible caching proxy for LLM inference backends.
 
 This module provides a lightweight HTTP proxy server that sits in front of real
-inference backends (vLLM, Ollama, SGLang, LMDeploy) and caches responses using
-semantic similarity matching.
+inference backends and caches responses using semantic similarity matching.
+
+Verified compatible with Ollama. Expected compatible with vLLM, SGLang, LMDeploy,
+and other OpenAI-compatible servers (GPU verification pending).
 
 IMPORTANT LIMITATION: The current implementation uses Jaccard token-overlap
 similarity (threshold 0.85) which is strict and may miss natural paraphrases.

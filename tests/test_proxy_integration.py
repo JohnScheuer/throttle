@@ -1,13 +1,18 @@
 """Integration tests for proxy against a real inference backend.
 
-These tests use Ollama with a small model to verify cache behavior, scope isolation,
-in-flight deduplication, streaming, and error handling with real HTTP calls.
+These tests verify cache behavior, scope isolation, in-flight deduplication,
+streaming, and error handling with real HTTP calls against OpenAI-compatible backends.
+
+Backend and model can be configured via environment variables:
+- BACKEND_URL: Backend server URL (default: http://localhost:11434 for Ollama)
+- BACKEND_MODEL: Model name (default: llama3.2:1b for Ollama)
 
 Tests are skipped if no backend is available rather than failing.
 """
 
 import asyncio
 import json
+import os
 import time
 import unittest
 from typing import List, Dict, Any
@@ -20,16 +25,40 @@ from throttle.proxy import ProxyServer
 
 
 def is_backend_available(backend_url: str) -> bool:
-    """Check if Ollama backend is reachable."""
+    """Check if backend is reachable.
+
+    Tries both Ollama-specific endpoint and generic health endpoint.
+    """
     try:
+        # Try Ollama-specific endpoint
         response = httpx.get(f"{backend_url.rstrip('/')}/api/tags", timeout=5.0)
-        return response.status_code == 200
+        if response.status_code == 200:
+            return True
     except Exception:
-        return False
+        pass
+
+    try:
+        # Try generic health endpoint
+        response = httpx.get(f"{backend_url.rstrip('/')}/health", timeout=5.0)
+        if response.status_code == 200:
+            return True
+    except Exception:
+        pass
+
+    try:
+        # Try OpenAI-compatible models endpoint
+        response = httpx.get(f"{backend_url.rstrip('/')}/v1/models", timeout=5.0)
+        if response.status_code == 200:
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
-BACKEND_URL = "http://localhost:11434"
-SKIP_REASON = f"Ollama not available at {BACKEND_URL}"
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:11434")
+BACKEND_MODEL = os.getenv("BACKEND_MODEL", "llama3.2:1b")
+SKIP_REASON = f"Backend not available at {BACKEND_URL}"
 
 
 @pytest.mark.skipif(not is_backend_available(BACKEND_URL), reason=SKIP_REASON)
@@ -76,11 +105,14 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def _make_request(
         self,
         messages: List[Dict[str, str]],
-        model: str = "llama3.2:1b",
+        model: str = None,
         stream: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """Make chat completion request through proxy."""
+        if model is None:
+            model = BACKEND_MODEL
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             payload = {
                 "model": model,
@@ -201,16 +233,16 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         backend_calls_before = health_before.get("cache_stats", {}).get("backend_calls", 0)
 
         # Same messages, different model
-        await self._make_request(messages, model="llama3.2:1b")
+        await self._make_request(messages)
         await self._make_request(messages, model="llama3.2:3b")
 
         # Same messages and model, different temperature
-        await self._make_request(messages, model="llama3.2:1b", temperature=0.7)
-        await self._make_request(messages, model="llama3.2:1b", temperature=0.9)
+        await self._make_request(messages, temperature=0.7)
+        await self._make_request(messages, temperature=0.9)
 
         # Same messages and model, different max_tokens
-        await self._make_request(messages, model="llama3.2:1b", max_tokens=10)
-        await self._make_request(messages, model="llama3.2:1b", max_tokens=20)
+        await self._make_request(messages, max_tokens=10)
+        await self._make_request(messages, max_tokens=20)
 
         health_after = await self._get_health()
         backend_calls_after = health_after.get("cache_stats", {}).get("backend_calls", 0)
@@ -231,7 +263,7 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         messages = [{"role": "user", "content": "Say hello"}]
 
         # Prime model A cache
-        await self._make_request(messages, model="llama3.2:1b")
+        await self._make_request(messages)
         health_after_a1 = await self._get_health()
         hits_after_a1 = health_after_a1.get("cache_stats", {}).get("hits", 0)
 
@@ -239,7 +271,7 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self._make_request(messages, model="llama3.2:3b")
 
         # Use model A again - should hit its cache
-        await self._make_request(messages, model="llama3.2:1b")
+        await self._make_request(messages)
         health_after_a2 = await self._get_health()
         hits_after_a2 = health_after_a2.get("cache_stats", {}).get("hits", 0)
 
