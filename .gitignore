@@ -45,8 +45,5 @@ Thumbs.db
 *.json.bak
 demo-*.json
 
-# Keep only reviewed release wheels for fast tester installation.
-dist/*
-!dist/throttle_bench-0.2.0-py3-none-any.whl
-!dist/throttle_bench-0.2.1-py3-none-any.whl
-!dist/throttle_bench-0.3.0-py3-none-any.whl
+# Build artifacts are generated in CI and uploaded as artifacts
+dist/

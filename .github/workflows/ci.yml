@@ -96,16 +96,6 @@ jobs:
           fi
 
           python ci/verify_wheel.py "${wheels[0]}"
-          tracked_wheel="dist/$(basename "${wheels[0]}")"
-          if [[ ! -f "${tracked_wheel}" ]]; then
-            printf 'reviewed tracked wheel is missing: %s\n' "${tracked_wheel}" >&2
-            exit 1
-          fi
-          python ci/verify_wheel.py "${tracked_wheel}"
-          if ! cmp -s "${wheels[0]}" "${tracked_wheel}"; then
-            printf 'tracked wheel differs from deterministic source build\n' >&2
-            exit 1
-          fi
           printf 'path=%s\n' "${wheels[0]}" >> "${GITHUB_OUTPUT}"
 
       - name: Install and test only the built wheel in a clean environment
@@ -129,3 +119,10 @@ jobs:
           PYTHONPATH="${GITHUB_WORKSPACE}/ci/offline_guard" \
             "${clean_env}/bin/python" "${GITHUB_WORKSPACE}/ci/run_tests.py" \
             --start-directory "${GITHUB_WORKSPACE}/tests"
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: throttle-wheel-python-3.14
+          path: ${{ steps.wheel.outputs.path }}
+          retention-days: 30
