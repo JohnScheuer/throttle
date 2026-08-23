@@ -6,6 +6,7 @@ import time
 from multiprocessing import Process
 
 import httpx
+import pytest
 
 from throttle.proxy import create_app
 
@@ -23,6 +24,7 @@ def run_proxy_server(port: int):
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
 
 
+@pytest.mark.asyncio
 async def test_proxy_cache_hit_with_real_http_client():
     """Test that a real external HTTP client can get cache hits through the proxy."""
 
@@ -172,6 +174,7 @@ async def test_proxy_cache_hit_with_real_http_client():
             proxy_process.kill()
 
 
+@pytest.mark.asyncio
 async def test_proxy_streaming_with_cache():
     """Test that streaming responses work through the proxy with caching."""
 

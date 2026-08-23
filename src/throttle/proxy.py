@@ -90,15 +90,38 @@ class ProxyServer:
             } if self.cache else None,
         }
 
+    def _extract_scope_key(self, request_body: Dict[str, Any]) -> str:
+        """Extract scope parameters that must match exactly for cache hits.
+
+        Includes all request fields EXCEPT:
+        - messages: used for semantic similarity matching, not scope differentiation
+        - stream: controls response format (SSE vs JSON), not content; cached responses
+                  can be served as either streaming or non-streaming
+
+        All other fields (model, temperature, max_tokens, custom backend parameters, etc.)
+        are included to prevent cache collisions between requests with different parameters.
+        """
+        excluded = {"messages", "stream"}
+        scope_params = {
+            k: v for k, v in request_body.items()
+            if k not in excluded
+        }
+        return json.dumps(scope_params, sort_keys=True)
+
     def _extract_prompt(self, request_body: Dict[str, Any]) -> str:
-        """Extract prompt string from request for cache key."""
+        """Extract semantic text from messages for similarity matching.
+
+        Includes role information to distinguish different conversation structures.
+        """
         messages = request_body.get("messages", [])
-        # Simple concatenation of all message content for cache key
         prompt_parts = []
         for msg in messages:
             if isinstance(msg, dict) and "content" in msg:
-                prompt_parts.append(msg["content"])
-        return " ".join(prompt_parts)
+                role = msg.get("role", "user")
+                content = msg["content"]
+                # Include role to distinguish different conversation structures
+                prompt_parts.append(f"{role}: {content}")
+        return "\n".join(prompt_parts)
 
     async def _fake_stream_response(
         self, cached_response: Dict[str, Any]
@@ -309,35 +332,48 @@ class ProxyServer:
         """Handle /v1/chat/completions requests with caching and deduplication."""
         request_body = await request.json()
 
-        # Extract prompt for cache lookup
+        # Extract scope and semantic text
+        scope_key = self._extract_scope_key(request_body)
         prompt = self._extract_prompt(request_body)
         is_streaming = request_body.get("stream", False)
 
         # Check cache first (fast path)
         if self.enable_cache and self.cache:
-            cached_response = self.cache.get(prompt)
-            if cached_response is not None:
-                # Cache hit
-                if is_streaming:
-                    # Fake-stream the cached response
-                    return StreamingResponse(
-                        self._fake_stream_response(cached_response),
-                        media_type="text/event-stream",
-                    )
-                else:
-                    # Return cached response directly
-                    return JSONResponse(cached_response)
+            result = self.cache.get_with_key_no_metrics(prompt)
+            if result is not None:
+                canonical_key, scope_dict = result
+                # scope_dict maps scope_key → response_data for this semantic prompt
+                if isinstance(scope_dict, dict) and scope_key in scope_dict:
+                    # Hit: same semantic prompt AND same scope
+                    self.cache.metrics.hits += 1
+                    cached_response = scope_dict[scope_key]["response"]
+                    if is_streaming:
+                        # Fake-stream the cached response
+                        return StreamingResponse(
+                            self._fake_stream_response(cached_response),
+                            media_type="text/event-stream",
+                        )
+                    else:
+                        # Return cached response directly
+                        return JSONResponse(cached_response)
+                # else: similar prompt but different scope, treat as cache miss
+                self.cache.metrics.misses += 1
+            else:
+                # No similar prompt found
+                self.cache.metrics.misses += 1
 
         # Cache miss - check if request is in-flight
+        # Use scope+prompt as deduplication key to avoid cross-scope collisions
+        dedup_key = f"{scope_key}||{prompt}"
         async with self._inflight_lock:
-            if prompt in self._inflight:
+            if dedup_key in self._inflight:
                 # Request is already in-flight, wait for it
-                future = self._inflight[prompt]
+                future = self._inflight[dedup_key]
                 is_waiter = True
             else:
                 # Create new future for this request
                 future = asyncio.Future()
-                self._inflight[prompt] = future
+                self._inflight[dedup_key] = future
                 is_waiter = False
 
         # If we're the primary request (not a waiter), make the backend call
@@ -355,9 +391,26 @@ class ProxyServer:
                     request_body, headers, prompt, is_streaming
                 )
 
-                # Cache the response
+                # Cache the response (only if it contains valid choices)
                 if self.enable_cache and self.cache:
-                    self.cache.put(prompt, response_data)
+                    choices = response_data.get("choices", [])
+                    if choices:
+                        # Get existing scope dict for this EXACT prompt (no similarity matching)
+                        # This doesn't increment metrics - we only count the initial GET attempt
+                        existing_scope_dict = self.cache.get_exact_no_metrics(prompt)
+                        if existing_scope_dict is not None and isinstance(existing_scope_dict, dict):
+                            scope_dict = existing_scope_dict
+                        else:
+                            scope_dict = {}
+
+                        # Add/update this scope variant (preserves other scope variants)
+                        scope_dict[scope_key] = {
+                            "_scope": scope_key,
+                            "response": response_data,
+                        }
+
+                        # Store updated scope dict under this prompt
+                        self.cache.put(prompt, scope_dict)
 
                 # Set the future result for all waiters
                 future.set_result(response_data)
@@ -369,7 +422,7 @@ class ProxyServer:
             finally:
                 # Clean up in-flight tracking
                 async with self._inflight_lock:
-                    self._inflight.pop(prompt, None)
+                    self._inflight.pop(dedup_key, None)
 
         # All requests (both the one that made the call and waiters) reach here
         # Get the result from the future
