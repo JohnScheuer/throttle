@@ -111,81 +111,85 @@ python3 -m pytest tests/test_proxy.py -v
 
 The integration test suite verifies correctness but does NOT capture performance metrics. To measure vLLM-specific performance:
 
-#### A. Time-to-First-Token (TTFT) on Cache Miss
+#### A. Backend Latency (Time-to-First-Token on Cache Miss)
 
 **Not currently captured by integration tests.** To measure:
 
-1. Use the `throttle bench` CLI with `--enable-cache`:
+1. Use the `throttle smoke` CLI with `--enable-cache`:
    ```bash
-   throttle bench \
-       --backend-url http://localhost:8100 \
+   export OPENAI_API_KEY=dummy
+   throttle smoke \
        --model "Qwen/Qwen2.5-0.5B-Instruct" \
-       --prompt "What is the capital of France?" \
-       --runs 1 \
-       --enable-cache
+       --url http://localhost:8100 \
+       --enable-cache \
+       --max-tokens 10 \
+       --stream \
+       --allow-unknown-cost
    ```
 
-2. Look for the `ttft_ms` field in the JSON output:
-   ```json
-   {
-     "prompt": "What is the capital of France?",
-     "ttft_ms": 45.2,
-     "total_ms": 123.4,
-     ...
-   }
-   ```
-
-   **TTFT on miss** = `ttft_ms` value from the first run (cache miss)
-
-#### B. Time-to-First-Token (TTFT) on Cache Hit
-
-**Not currently captured by integration tests.** To measure:
-
-1. Run the same `throttle bench` command a second time (cache hit):
+2. Look for the `ttft_ms.mean` field in the JSON output (`throttle-report.json`):
    ```bash
-   throttle bench \
-       --backend-url http://localhost:8100 \
+   cat throttle-report.json | python3 -c "import json, sys; d=json.load(sys.stdin); print('Backend TTFT mean:', d['conditions'][0]['blocks'][0]['diagnostic_metrics']['ttft_ms']['mean'], 'ms')"
+   ```
+
+   **Example output:**
+   ```
+   Backend TTFT mean: 144.41 ms
+   ```
+
+   **Backend latency** = `ttft_ms.mean` value from the first condition (cache miss, concurrency 1)
+
+#### B. Cache Lookup Cost
+
+**Not directly reported in integration tests.** To estimate:
+
+1. Run `throttle smoke` a second time (cache hits):
+   ```bash
+   export OPENAI_API_KEY=dummy
+   throttle smoke \
        --model "Qwen/Qwen2.5-0.5B-Instruct" \
-       --prompt "What is the capital of France?" \
-       --runs 1 \
-       --enable-cache
+       --url http://localhost:8100 \
+       --enable-cache \
+       --max-tokens 10 \
+       --stream \
+       --allow-unknown-cost
    ```
 
-2. Compare `ttft_ms` from the second run (cache hit):
-   ```json
-   {
-     "prompt": "What is the capital of France?",
-     "ttft_ms": 2.1,
-     "total_ms": 8.3,
-     ...
-   }
+2. Check the cached condition (concurrency 4 or 8):
+   ```bash
+   cat throttle-report.json | python3 -c "import json, sys; d=json.load(sys.stdin); print('Cache hit e2e p95:', d['conditions'][1]['blocks'][0]['diagnostic_metrics']['e2e_latency_ms']['p95'], 'ms')"
    ```
 
-   **TTFT on hit** = `ttft_ms` value from the second run (cache hit)
-   **Speedup** = (TTFT on miss) / (TTFT on hit)
+   **Note:** Cache hits have `ttft_ms.count = 0` (no backend token generation). Use end-to-end latency as proxy for cache lookup cost.
+
+   **Cache lookup cost** ≈ e2e latency p95 for cached requests (typically 1-10ms)
 
 #### C. Break-Even Hit Rate
 
-**Not currently captured by existing tooling.** The break-even hit rate depends on:
-- Backend TTFT latency (vLLM-specific)
-- Proxy cache overhead per request
-- Similarity computation cost
+**Not currently captured by existing tooling.** The break-even hit rate is the minimum cache hit rate needed for the proxy to provide net latency savings.
+
+**Formula (from project specification):**
+
+```
+break_even_hit_rate = lookup_cost / backend_latency
+```
+
+Where:
+- **lookup_cost** = In-process cache lookup latency (from step B, typically 1-10ms)
+- **backend_latency** = Full backend response time (from step A, TTFT mean)
 
 **To calculate manually:**
 
-1. Measure backend TTFT (`B_ttft`) from step A
-2. Measure cache hit TTFT (`C_ttft`) from step B
-3. Estimate cache overhead (`O`) ≈ 1-5ms (Jaccard similarity + cache lookup)
+1. Measure **backend_latency** from step A (TTFT mean for cache misses)
+2. Estimate **lookup_cost** from step B (e2e p95 for cache hits)
+3. Calculate: `break_even_hit_rate = lookup_cost / backend_latency`
 
-**Break-even hit rate** = `O / (B_ttft - C_ttft)`
+**Example (from actual Ollama measurements):**
+- Backend latency (TTFT mean) = 144.41ms
+- Cache lookup cost (e2e p95 for hits) ≈ 5ms (estimated)
+- Break-even = 5ms / 144.41ms = 0.0346 (3.5%)
 
-**Example:**
-- vLLM TTFT = 45ms
-- Cache hit TTFT = 2ms
-- Cache overhead = 3ms
-- Break-even = 3ms / (45ms - 2ms) = 0.07 (7%)
-
-Interpretation: If >7% of requests are cache hits, the proxy saves latency overall.
+**Interpretation:** If >3.5% of requests are cache hits, the proxy provides net latency savings. Below this threshold, cache lookup overhead outweighs savings from avoided backend calls.
 
 **What would be needed to capture this automatically:**
 - Add `--measure-breakeven` flag to `throttle bench` that:
