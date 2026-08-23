@@ -458,3 +458,52 @@ async def test_concurrent_requests_with_mixed_prompts(proxy_to_mock, mock_backen
     stats = health.json()["cache_stats"]
     assert stats["backend_calls"] == 4
     assert stats["backend_calls"] == mock.request_count
+
+
+async def test_cross_scope_hit_inflation_bug_regression(proxy_to_mock, mock_backend_server):
+    """Regression test: cross-scope requests should not inflate hit counter.
+
+    Before fix, metrics.hits was incremented when finding a similar prompt,
+    before scope validation. This caused model B to report a cache hit even
+    though it missed and hit the backend.
+
+    This test verifies hits counter only increments on true hits (semantic + scope match).
+    """
+    mock = mock_backend_server
+    messages = [{"role": "user", "content": "Say hello"}]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Prime cache with model A
+        await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "model-a", "messages": messages, "stream": False},
+        )
+
+        # Get health after priming
+        health = await client.get("http://127.0.0.1:58091/health")
+        stats_after_a = health.json()["cache_stats"]
+        assert stats_after_a["hits"] == 0, "First request should not be a hit"
+        assert stats_after_a["misses"] == 1, "First request should be a miss"
+        assert stats_after_a["backend_calls"] == 1
+
+        # Request with model B (same messages, different scope)
+        await client.post(
+            "http://127.0.0.1:58091/v1/chat/completions",
+            json={"model": "model-b", "messages": messages, "stream": False},
+        )
+
+        # Get health after model B
+        health = await client.get("http://127.0.0.1:58091/health")
+        stats_after_b = health.json()["cache_stats"]
+
+        # REGRESSION: Before fix, hits would be 1 (false positive from similarity before scope check)
+        # CORRECT: hits should still be 0 (similar prompt but different scope = miss)
+        assert stats_after_b["hits"] == 0, \
+            "Model B should not increment hits (similar prompt, different scope)"
+        assert stats_after_b["misses"] == 2, \
+            "Model B should increment misses (scope mismatch)"
+        assert stats_after_b["backend_calls"] == 2, \
+            "Model B should hit backend (cache miss)"
+
+        # Verify mock actually received 2 distinct requests
+        assert mock.request_count == 2, "Both requests should reach backend"
