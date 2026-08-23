@@ -52,6 +52,9 @@ class ProxyServer:
         lifespan=None,
     ):
         self.backend_url = backend_url.rstrip("/")
+        # IMPORTANT: _extract_scope_key() depends on this mapping. Mutating model_backends
+        # after construction changes scope keys for all subsequent requests, orphaning every
+        # existing cache entry.
         self.model_backends = model_backends or {}
         self.enable_cache = enable_cache
         self.cache: Optional[SimilarityCache] = None
