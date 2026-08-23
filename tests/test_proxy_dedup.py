@@ -142,7 +142,7 @@ async def proxy_to_mock(mock_backend_server):
 
     yield proxy
 
-    # Shutdown
+    # Shutdown server and wait for lifespan cleanup
     server.should_exit = True
     await task
 
@@ -181,10 +181,11 @@ async def test_five_concurrent_identical_requests_one_backend_call(proxy_to_mock
         assert content == first_content, f"Response {i} differs from response 0"
 
     # Assert backend_calls counter matches mock's count
-    health = await httpx.AsyncClient().get("http://127.0.0.1:58091/health")
-    stats = health.json()["cache_stats"]
-    assert stats["backend_calls"] == 1, f"Counter shows {stats['backend_calls']}, mock received {mock.request_count}"
-    assert stats["misses"] == 5, f"Expected 5 cache misses (all 5 checked cache)"
+    async with httpx.AsyncClient() as health_client:
+        health = await health_client.get("http://127.0.0.1:58091/health")
+        stats = health.json()["cache_stats"]
+        assert stats["backend_calls"] == 1, f"Counter shows {stats['backend_calls']}, mock received {mock.request_count}"
+        assert stats["misses"] == 5, f"Expected 5 cache misses (all 5 checked cache)"
 
 
 async def test_ten_concurrent_paraphrases_current_behavior(proxy_to_mock, mock_backend_server):
@@ -247,9 +248,10 @@ async def test_ten_concurrent_paraphrases_current_behavior(proxy_to_mock, mock_b
     assert 8 in response_groups[results[4][1]["choices"][0]["message"]["content"]]
 
     # Assert backend_calls counter matches mock
-    health = await httpx.AsyncClient().get("http://127.0.0.1:58091/health")
-    stats = health.json()["cache_stats"]
-    assert stats["backend_calls"] == expected_backend_calls
+    async with httpx.AsyncClient() as health_client:
+        health = await health_client.get("http://127.0.0.1:58091/health")
+        stats = health.json()["cache_stats"]
+        assert stats["backend_calls"] == expected_backend_calls
 
 
 async def test_backend_error_propagates_to_all_waiters(mock_backend_server):
@@ -458,10 +460,11 @@ async def test_concurrent_requests_with_mixed_prompts(proxy_to_mock, mock_backen
     assert content_3 == content_4 == content_5
 
     # Counter should match
-    health = await httpx.AsyncClient().get("http://127.0.0.1:58091/health")
-    stats = health.json()["cache_stats"]
-    assert stats["backend_calls"] == 4
-    assert stats["backend_calls"] == mock.request_count
+    async with httpx.AsyncClient() as health_client:
+        health = await health_client.get("http://127.0.0.1:58091/health")
+        stats = health.json()["cache_stats"]
+        assert stats["backend_calls"] == 4
+        assert stats["backend_calls"] == mock.request_count
 
 
 async def test_cross_scope_hit_inflation_bug_regression(proxy_to_mock, mock_backend_server):
