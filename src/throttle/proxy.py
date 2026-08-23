@@ -48,9 +48,11 @@ class ProxyServer:
         cache_ttl_seconds: float = 3600.0,
         cache_max_size: int = 1000,
         cache_similarity_threshold: float = 0.85,
+        model_backends: Optional[Dict[str, str]] = None,
         lifespan=None,
     ):
         self.backend_url = backend_url.rstrip("/")
+        self.model_backends = model_backends or {}
         self.enable_cache = enable_cache
         self.cache: Optional[SimilarityCache] = None
 
@@ -97,6 +99,14 @@ class ProxyServer:
                 "backend_calls": self._backend_calls,
             } if self.cache else None,
         }
+
+    def _get_backend_url(self, model: str) -> str:
+        """Get backend URL for a specific model.
+
+        If model_backends mapping is provided and contains the model,
+        returns the model-specific URL. Otherwise returns default backend_url.
+        """
+        return self.model_backends.get(model, self.backend_url).rstrip("/")
 
     def _extract_scope_key(self, request_body: Dict[str, Any]) -> str:
         """Extract scope parameters that must match exactly for cache hits.
@@ -283,6 +293,10 @@ class ProxyServer:
         # only one actually reaches the backend (others wait on the same Future)
         self._backend_calls += 1
 
+        # Get model-specific backend URL
+        model = request_body.get("model", "")
+        backend_url = self._get_backend_url(model)
+
         if is_streaming:
             # For streaming, accumulate the complete response
             accumulated_content = []
@@ -290,7 +304,7 @@ class ProxyServer:
 
             async with self._client.stream(
                 "POST",
-                f"{self.backend_url}/v1/chat/completions",
+                f"{backend_url}/v1/chat/completions",
                 json=request_body,
                 headers=headers,
             ) as response:
@@ -337,7 +351,7 @@ class ProxyServer:
         else:
             # Non-streaming request
             response = await self._client.post(
-                f"{self.backend_url}/v1/chat/completions",
+                f"{backend_url}/v1/chat/completions",
                 json=request_body,
                 headers=headers,
             )

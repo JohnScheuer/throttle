@@ -5,7 +5,9 @@ streaming, and error handling with real HTTP calls against OpenAI-compatible bac
 
 Backend and model can be configured via environment variables:
 - BACKEND_URL: Backend server URL (default: http://localhost:11434 for Ollama)
+- BACKEND_URL_2: Secondary backend URL for MODEL_2 (default: same as BACKEND_URL)
 - BACKEND_MODEL: Model name (default: llama3.2:1b for Ollama)
+- BACKEND_MODEL_2: Secondary model name (default: llama3.2:3b for Ollama)
 
 Tests are skipped if no backend is available rather than failing.
 """
@@ -57,6 +59,7 @@ def is_backend_available(backend_url: str) -> bool:
 
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:11434")
+BACKEND_URL_2 = os.getenv("BACKEND_URL_2", os.getenv("BACKEND_URL", "http://localhost:11434"))
 BACKEND_MODEL = os.getenv("BACKEND_MODEL", "llama3.2:1b")
 BACKEND_MODEL_2 = os.getenv("BACKEND_MODEL_2", "llama3.2:3b")
 SKIP_REASON = f"Backend not available at {BACKEND_URL}"
@@ -68,11 +71,18 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         """Start proxy server with cache enabled."""
+        # Build model-to-backend mapping
+        # If BACKEND_URL_2 differs from BACKEND_URL, route BACKEND_MODEL_2 to it
+        model_backends = {}
+        if BACKEND_URL_2 != BACKEND_URL:
+            model_backends[BACKEND_MODEL_2] = BACKEND_URL_2
+
         self.proxy = ProxyServer(
             backend_url=BACKEND_URL,
             enable_cache=True,
             cache_ttl_seconds=3600,
             cache_max_size=100,
+            model_backends=model_backends if model_backends else None,
         )
 
         app = self.proxy.app

@@ -93,17 +93,12 @@ test_vllm() {
         sleep 1
     done
 
-    # Run integration tests with routing proxy
+    # Run integration tests with per-model backend URLs
     # Tests will use MODEL from server 1 (port 8100) and MODEL_2 from server 2 (port 8101)
-    # NOTE: This requires a routing layer to direct MODEL_2 requests to port 8101
-    # For now, tests using BACKEND_MODEL_2 will fail with 404 (model not found on port 8100)
     echo "Running integration tests against vLLM..."
-    echo "WARNING: Cross-model tests (test_scope_isolation_different_parameters, test_scope_variants_coexisting)"
-    echo "         will fail because BACKEND_URL points to single server (port 8100)."
-    echo "         Full multi-model support requires routing layer (e.g., Nginx) to direct"
-    echo "         MODEL_2 requests to port 8101."
     cd "$THROTTLE_REPO_DIR"
     BACKEND_URL="http://localhost:8100" \
+    BACKEND_URL_2="http://localhost:8101" \
     BACKEND_MODEL="$MODEL" \
     BACKEND_MODEL_2="$MODEL_2" \
         python3 -m pytest tests/test_proxy_integration.py -v --tb=short

@@ -141,28 +141,50 @@ The integration test suite verifies correctness but does NOT capture performance
 
 #### B. Cache Lookup Cost
 
-**Not directly reported in integration tests.** To estimate:
+**Measured by contributor benchmarks** (cache miss path overhead):
 
-1. Run `throttle smoke` a second time (cache hits):
-   ```bash
-   export OPENAI_API_KEY=dummy
-   throttle smoke \
-       --model "Qwen/Qwen2.5-0.5B-Instruct" \
-       --url http://localhost:8100 \
-       --enable-cache \
-       --max-tokens 10 \
-       --stream \
-       --allow-unknown-cost
-   ```
+The cache lookup cost varies with cache size due to Jaccard similarity computation over all cached entries:
 
-2. Check the cached condition (concurrency 4 or 8):
-   ```bash
-   cat throttle-report.json | python3 -c "import json, sys; d=json.load(sys.stdin); print('Cache hit e2e p95:', d['conditions'][1]['blocks'][0]['diagnostic_metrics']['e2e_latency_ms']['p95'], 'ms')"
-   ```
+- **10 entries:** Jaccard scan 0.016ms + ONNX embedding overhead = **5.3ms total miss path**
+- **100 entries:** Jaccard scan 0.175ms + ONNX embedding overhead = **6.0ms total miss path** (unmeasured, interpolated)
+- **1,000 entries:** Jaccard scan 1.573ms + ONNX embedding overhead = **6.8ms total miss path**
 
-   **Note:** Cache hits have `ttft_ms.count = 0` (no backend token generation). Use end-to-end latency as proxy for cache lookup cost.
+**Source:** Contributor benchmark data measuring Jaccard token-overlap computation time and combined miss path latency including ONNX embedding generation.
 
-   **Cache lookup cost** ≈ e2e latency p95 for cached requests (typically 1-10ms)
+**Note:** Integration tests use default cache size of 100 entries (`--cache-max-size 100`). For cache size 100, use **6.0ms** as lookup cost estimate.
+
+**Cache hit latency:** Cannot be measured by existing tooling.
+
+**What `throttle smoke --enable-cache` CAN measure for cached requests:**
+- Cache hit confirmation: `cache_hit_count` field (e.g., `cache_hit_count: 8`)
+- Token counts: `cache_completion_tokens` (e.g., `80`) and `gpu_completion_tokens: 0`
+
+**What `throttle smoke --enable-cache` CANNOT measure for cached requests:**
+
+Raw `e2e_latency_ms` field from cached condition (concurrency 4 and 8 in smoke run):
+```json
+{
+  "count": 0,
+  "mean": null,
+  "p50": null,
+  "p90": null,
+  "p95": null,
+  "p95_ci": {
+    "analysis_sample_n": 0,
+    "confidence": 0.95,
+    "high": null,
+    "low": null,
+    "method": "bounded_percentile_bootstrap_requests",
+    "n": 0,
+    "resamples": 300
+  },
+  "p99": null
+}
+```
+
+The harness confirms cache hits occurred but does not instrument cached response path for timing. Both `ttft_ms` and `e2e_latency_ms` show `count: 0` with all percentile fields null.
+
+**Conclusion:** No existing tooling can measure end-to-end latency on cache hits through the proxy.
 
 #### C. Break-Even Hit Rate
 
@@ -175,21 +197,25 @@ break_even_hit_rate = lookup_cost / backend_latency
 ```
 
 Where:
-- **lookup_cost** = In-process cache lookup latency (from step B, typically 1-10ms)
+- **lookup_cost** = In-process cache lookup latency (from step B, 5.3ms to 6.8ms depending on cache size)
 - **backend_latency** = Full backend response time (from step A, TTFT mean)
 
 **To calculate manually:**
 
 1. Measure **backend_latency** from step A (TTFT mean for cache misses)
-2. Estimate **lookup_cost** from step B (e2e p95 for cache hits)
+2. Use **lookup_cost** from step B (measured miss path overhead including Jaccard scan and ONNX embedding)
 3. Calculate: `break_even_hit_rate = lookup_cost / backend_latency`
 
-**Example (from actual Ollama measurements):**
+**Example (from actual Ollama measurements with cache size 100):**
 - Backend latency (TTFT mean) = 144.41ms
-- Cache lookup cost (e2e p95 for hits) ≈ 5ms (estimated)
-- Break-even = 5ms / 144.41ms = 0.0346 (3.5%)
+- Cache lookup cost (100 entries) = 6.0ms
+- Break-even = 6.0ms / 144.41ms = 0.0416 (4.2%)
 
-**Interpretation:** If >3.5% of requests are cache hits, the proxy provides net latency savings. Below this threshold, cache lookup overhead outweighs savings from avoided backend calls.
+**Interpretation:** If >4.2% of requests are cache hits, the proxy provides net latency savings. Below this threshold, cache lookup overhead outweighs savings from avoided backend calls.
+
+**Cache size impact:**
+- Smaller cache (10 entries): 5.3ms / 144.41ms = 3.7% break-even
+- Larger cache (1,000 entries): 6.8ms / 144.41ms = 4.7% break-even
 
 **What would be needed to capture this automatically:**
 - Add `--measure-breakeven` flag to `throttle bench` that:
@@ -200,14 +226,24 @@ Where:
 
 ### 7. Known vLLM-Specific Considerations
 
-**Tests that require multi-model support:**
-- `test_scope_isolation_different_parameters` uses `llama3.2:3b` as a second model
-- `test_scope_variants_coexisting` uses `llama3.2:3b` as a second model
+**Multi-model testing:**
 
-If your vLLM deployment only has one model loaded, these tests will fail with 404. Solutions:
-1. Load a second model in vLLM (e.g., `Qwen/Qwen2.5-1.5B-Instruct`)
-2. Set `BACKEND_MODEL_2` environment variable (requires test suite modification)
-3. Accept that 2 tests will fail (not a vLLM compatibility issue)
+vLLM limitation: Each vLLM server instance serves exactly one model. The test suite includes two tests that verify cross-model cache isolation:
+- `test_scope_isolation_different_parameters`
+- `test_scope_variants_coexisting`
+
+These tests require two different models. Since Ollama supports multiple models on a single server but vLLM does not, the test suite now supports `BACKEND_URL_2` to route the second model to a separate server.
+
+**For vLLM multi-model testing:**
+1. Launch two vLLM servers on different ports (e.g., 8100 and 8101) with different models
+2. Set `BACKEND_URL="http://localhost:8100"` and `BACKEND_URL_2="http://localhost:8101"`
+3. Set `BACKEND_MODEL` to the first model name and `BACKEND_MODEL_2` to the second model name
+
+The automated script `validation/gpu_backend_verification.sh vllm` handles this setup automatically.
+
+**For Ollama (default behavior):**
+- `BACKEND_URL_2` defaults to `BACKEND_URL` if not set
+- Both models are served from the same Ollama server
 
 **Response shape:** vLLM uses OpenAI-compatible response format. No changes needed.
 
