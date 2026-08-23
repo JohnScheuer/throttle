@@ -59,27 +59,17 @@ If the primary request to the backend hangs, all concurrent waiters for that sam
 2. Whether timed-out requests should retry or fail immediately
 3. Whether timeout configuration belongs in ProxyServer.__init__ or per-request
 
-## Phase 2: Async Transport Cleanup Warnings
+## Phase 2: Async Transport Cleanup Warnings (RESOLVED)
 
 **Finding:** Tests using proxy_to_mock fixture raise unraisable exception warnings in CI with PYTHONWARNINGS=error.
 
-**Error pattern:**
-```
-pytest.PytestUnraisableExceptionWarning: Exception ignored while calling deallocator <function _SelectorTransport.__del__ at ...>: None
-pytest.PytestUnraisableExceptionWarning: Exception ignored while finalizing socket <socket.socket fd=15, family=2, type=1, proto=6, laddr=('127.0.0.1', ...), raddr=('127.0.0.1', 58091)>: None
-```
+**Root cause:** Three tests in test_proxy_dedup.py created httpx.AsyncClient to fetch /health endpoint without using async context manager or calling .aclose(). pytest's gc_collect_harder during test session teardown surfaces these as ResourceWarning for unclosed transports.
 
-**Affected tests:**
-- test_ten_concurrent_paraphrases_current_behavior
-- test_sequential_identical_requests_hit_cache
-- test_cross_scope_hit_inflation_bug_regression (Python 3.11, 3.12)
-- test_safety_validation.py::AdversarialValidationTests::test_result_tampering_and_uninitialized_result_fail_projection (Python 3.13, 3.14)
+**Resolution (commit 3fb3464):** Wrapped all three unclosed client instantiations with async context manager:
+- test_five_concurrent_identical_requests_one_backend_call (line 184)
+- test_ten_concurrent_paraphrases_current_behavior (line 250)
+- test_concurrent_requests_with_mixed_prompts (line 461)
 
-**Root cause:** Lifespan context manager shutdown (await proxy.shutdown()) races with fixture teardown (server.should_exit = True; await task). Uvicorn lifespan calls proxy.shutdown() which closes httpx.AsyncClient, but then fixture force-terminates server before async transports fully close.
+**Production verification:** SIGTERM test with 20 sequential cache hits (19 cache hits, 1 backend call) completed cleanly with no transport warnings, confirming production code (src/throttle/proxy.py) properly closes httpx.AsyncClient via ProxyServer.shutdown().
 
-**CI run 32661178349:** 3 failed, 343 passed, 3 skipped across all Python versions.
-
-**Not yet investigated.** Requires determining:
-1. Whether lifespan shutdown should wait for all transports to close
-2. Whether fixture should await server shutdown instead of forcing exit
-3. Whether httpx.AsyncClient.aclose() needs explicit transport drain
+**CI run 32669184879 (post-fix):** 346 passed, 3 skipped, 0 failed, 0 errors across all Python versions.
