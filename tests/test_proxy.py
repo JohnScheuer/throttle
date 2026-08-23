@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import socket
 import time
 from multiprocessing import Process
@@ -11,12 +12,16 @@ import pytest
 
 from throttle.proxy import create_app
 
+# Backend configuration from environment
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:11434")
+BACKEND_MODEL = os.getenv("BACKEND_MODEL", "llama3.2:1b")
+
 
 def run_proxy_server(port: int):
     """Run the proxy server in a separate process."""
     import uvicorn
     app = create_app(
-        backend_url="http://localhost:11434",  # Ollama backend
+        backend_url=BACKEND_URL,
         enable_cache=True,
         cache_ttl_seconds=3600.0,
         cache_max_size=100,
@@ -27,7 +32,7 @@ def run_proxy_server(port: int):
 
 @pytest.mark.skipif(
     getattr(socket, "_throttle_offline_guard_active", False),
-    reason="Integration test requires real Ollama backend at localhost:11434"
+    reason=f"Integration test requires real backend at {BACKEND_URL}"
 )
 @pytest.mark.asyncio
 async def test_proxy_cache_hit_with_real_http_client():
@@ -47,7 +52,7 @@ async def test_proxy_cache_hit_with_real_http_client():
 
             # First request - should be a cache miss, forwarded to backend
             request_body = {
-                "model": "llama3.2:1b",
+                "model": BACKEND_MODEL,
                 "messages": [
                     {"role": "user", "content": "What is the capital of France?"}
                 ],
@@ -181,7 +186,7 @@ async def test_proxy_cache_hit_with_real_http_client():
 
 @pytest.mark.skipif(
     getattr(socket, "_throttle_offline_guard_active", False),
-    reason="Integration test requires real Ollama backend at localhost:11434"
+    reason=f"Integration test requires real backend at {BACKEND_URL}"
 )
 @pytest.mark.asyncio
 async def test_proxy_streaming_with_cache():
@@ -200,7 +205,7 @@ async def test_proxy_streaming_with_cache():
 
             # First streaming request (cache miss)
             request_body = {
-                "model": "llama3.2:1b",
+                "model": BACKEND_MODEL,
                 "messages": [
                     {"role": "user", "content": "Count from 1 to 3"}
                 ],
