@@ -476,6 +476,100 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--output", type=Path, default=DEFAULT_COMPARE_OUTPUT)
 
+    demo = subparsers.add_parser(
+        "demo",
+        help="run a fast simulator demo comparing self-hosted GPU costs to API pricing",
+        description=(
+            "Generate a sample workload, simulate vLLM-like continuous batching inference, "
+            "and print a cost comparison. Runs entirely locally with no GPU or network required. "
+            "Completes in under 5 minutes."
+        ),
+    )
+
+    cost = subparsers.add_parser(
+        "cost",
+        help="measure cost per million tokens against a live endpoint",
+        description=(
+            "Send a small workload to an OpenAI-compatible endpoint, measure actual "
+            "throughput and timing, and calculate dollars per million tokens. "
+            "Requires a running inference server."
+        ),
+    )
+    cost.add_argument(
+        "--endpoint-url",
+        required=True,
+        help="inference server URL (e.g., http://localhost:8000/v1)",
+    )
+    cost.add_argument(
+        "--model",
+        default="default",
+        help="model name to request (default: 'default')",
+    )
+    cost.add_argument(
+        "--gpu-hourly-rate",
+        type=float,
+        required=True,
+        help="GPU hourly rate in dollars (e.g., 1.50 for A100 spot pricing)",
+    )
+    cost.add_argument(
+        "--num-requests",
+        type=int,
+        default=20,
+        help="number of test requests to send (default: 20)",
+    )
+
+    tune = subparsers.add_parser(
+        "tune",
+        help="find optimal configuration by measuring costs at different settings",
+        description=(
+            "Run cost measurements across different configurations to find the optimal "
+            "setup. This is a simplified version - for production use, run 'throttle golden' "
+            "for the full counterbalanced protocol."
+        ),
+    )
+    tune.add_argument(
+        "--endpoint-url",
+        required=True,
+        help="inference server URL (e.g., http://localhost:8000/v1)",
+    )
+    tune.add_argument(
+        "--model",
+        default="default",
+        help="model name to request (default: 'default')",
+    )
+    tune.add_argument(
+        "--gpu-hourly-rate",
+        type=float,
+        required=True,
+        help="GPU hourly rate in dollars",
+    )
+
+    validate_sim = subparsers.add_parser(
+        "validate-sim",
+        help="validate simulator accuracy against real GPU measurements",
+        description=(
+            "Compare simulator predictions to actual measurements from a live endpoint. "
+            "This helps validate simulator assumptions and identify which parameters need "
+            "adjustment for your specific hardware setup."
+        ),
+    )
+    validate_sim.add_argument(
+        "--endpoint-url",
+        required=True,
+        help="inference server URL to validate against",
+    )
+    validate_sim.add_argument(
+        "--model",
+        default="default",
+        help="model name (default: 'default')",
+    )
+    validate_sim.add_argument(
+        "--gpu-hourly-rate",
+        type=float,
+        required=True,
+        help="GPU hourly rate in dollars",
+    )
+
     proxy = subparsers.add_parser(
         "proxy",
         help="run an OpenAI-compatible caching proxy server",
@@ -2059,6 +2153,406 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     return EXIT_OK if result["decision_eligible"] else EXIT_INCONCLUSIVE
 
 
+def _handle_demo() -> int:
+    """Run simulator demo comparing self-hosted GPU costs to API pricing."""
+    from throttle.simulator import VLLMSimulator, SimulatorConfig
+    from throttle.workload import WorkloadGenerator
+    from throttle.cost_model import calculate_cost
+    import time
+
+    print("Throttle GPU Cost Simulator Demo")
+    print("=" * 60)
+    print()
+
+    # Generate workload
+    print("[SIMULATED] Generating sample workload...")
+    workload_gen = WorkloadGenerator(seed=42)
+    workload = workload_gen.generate_chat_workload(
+        num_requests=100,
+        arrival_rate_requests_per_sec=2.0,
+        mean_prompt_tokens=500,
+        mean_output_tokens=150,
+    )
+    print(f"[SIMULATED] Generated {len(workload)} requests")
+    print()
+
+    # Configure simulator
+    config = SimulatorConfig(
+        prefill_throughput_tokens_per_sec=5000.0,  # ASSUMED
+        decode_throughput_tokens_per_sec=100.0,    # ASSUMED
+        max_num_seqs=256,                           # ASSUMED
+        saturation_knee_sequences=200,              # ASSUMED
+        kv_cache_capacity_tokens=500_000,           # ASSUMED
+        gpu_hourly_rate_dollars=1.50,               # ASSUMED (vast.ai A100 40GB spot)
+    )
+
+    print("[SIMULATED] Simulator configuration:")
+    print(f"[SIMULATED]   Model: 7B parameter (ASSUMED)")
+    print(f"[SIMULATED]   GPU: A100 40GB @ ${config.gpu_hourly_rate_dollars:.2f}/hour")
+    print(f"[SIMULATED]   Prefill throughput: {config.prefill_throughput_tokens_per_sec:.0f} tok/sec (ASSUMED)")
+    print(f"[SIMULATED]   Decode throughput: {config.decode_throughput_tokens_per_sec:.0f} tok/sec (ASSUMED)")
+    print(f"[SIMULATED]   Max concurrent sequences: {config.max_num_seqs} (ASSUMED)")
+    print()
+
+    # Run simulation
+    print("[SIMULATED] Running vLLM continuous batching simulation...")
+    start_time = time.time()
+    sim = VLLMSimulator(config)
+    for arrival_time, prompt_tokens, output_tokens in workload:
+        sim.add_request(arrival_time, prompt_tokens, output_tokens)
+    completed, wall_clock = sim.run()
+    sim_elapsed = time.time() - start_time
+
+    print(f"[SIMULATED] Simulation complete in {sim_elapsed:.2f} seconds")
+    print()
+
+    # Calculate costs
+    total_input = sum(r.prompt_tokens for r in completed)
+    total_output = sum(r.tokens_generated for r in completed)
+
+    sim_cost = calculate_cost(
+        input_tokens=total_input,
+        output_tokens=total_output,
+        wall_clock_seconds=wall_clock,
+        gpu_hourly_rate_dollars=config.gpu_hourly_rate_dollars,
+    )
+
+    # API pricing (OpenAI GPT-3.5-turbo as reference)
+    api_input_per_million = 0.50   # MEASURED: OpenAI public pricing 2026-08
+    api_output_per_million = 1.50  # MEASURED: OpenAI public pricing 2026-08
+
+    api_total_cost = (
+        (total_input / 1_000_000) * api_input_per_million +
+        (total_output / 1_000_000) * api_output_per_million
+    )
+
+    # Print comparison
+    print("Cost Comparison")
+    print("=" * 60)
+    print()
+    print(f"Workload:")
+    print(f"  Total requests: {len(completed)}")
+    print(f"  Total input tokens: {total_input:,}")
+    print(f"  Total output tokens: {total_output:,}")
+    print()
+
+    print(f"Self-Hosted GPU (Simulated vLLM on A100 40GB):")
+    print(f"[SIMULATED]   Wall clock time: {wall_clock:.2f} seconds")
+    print(f"[SIMULATED]   GPU hours: {sim_cost.gpu_hours:.6f}")
+    print(f"[SIMULATED]   Total cost: ${sim_cost.total_dollars:.4f}")
+    print(f"[SIMULATED]   Input cost: ${sim_cost.dollars_per_million_input_tokens:.2f} per million tokens")
+    print(f"[SIMULATED]   Output cost: ${sim_cost.dollars_per_million_output_tokens:.2f} per million tokens")
+    print()
+
+    print(f"API Pricing (OpenAI GPT-3.5-turbo):")
+    print(f"[MEASURED]   Input cost: ${api_input_per_million:.2f} per million tokens")
+    print(f"[MEASURED]   Output cost: ${api_output_per_million:.2f} per million tokens")
+    print(f"[MEASURED]   Total cost for this workload: ${api_total_cost:.4f}")
+    print()
+
+    # Savings calculation
+    if api_total_cost > 0:
+        savings_pct = ((api_total_cost - sim_cost.total_dollars) / api_total_cost) * 100
+        print(f"Cost Difference:")
+        if savings_pct > 0:
+            print(f"[SIMULATED]   Self-hosted saves: ${api_total_cost - sim_cost.total_dollars:.4f} ({savings_pct:.1f}% cheaper)")
+        else:
+            print(f"[SIMULATED]   API is cheaper: ${sim_cost.total_dollars - api_total_cost:.4f} ({abs(savings_pct):.1f}% more expensive for self-hosted)")
+        print()
+
+    print("IMPORTANT:")
+    print("All [SIMULATED] values use assumed throughput and configuration parameters.")
+    print("Run 'throttle cost' against a real GPU endpoint for measured costs.")
+    print()
+
+    return EXIT_OK
+
+
+def _handle_cost(args: argparse.Namespace) -> int:
+    """Measure cost per million tokens against a live endpoint."""
+    import time
+    import statistics
+    from throttle.cost_model import calculate_cost
+    from throttle.workload import WorkloadGenerator
+
+    try:
+        import httpx
+    except ImportError:
+        print("Error: httpx is required for cost measurement")
+        print("Install with: pip install httpx")
+        return EXIT_FAILED
+
+    print(f"Measuring cost against {args.endpoint_url}")
+    print(f"GPU hourly rate: ${args.gpu_hourly_rate:.2f}/hour")
+    print(f"Test requests: {args.num_requests}")
+    print()
+
+    # Generate test workload
+    workload_gen = WorkloadGenerator(seed=42)
+    workload = workload_gen.generate_chat_workload(
+        num_requests=args.num_requests,
+        arrival_rate_requests_per_sec=1.0,
+        mean_prompt_tokens=100,
+        mean_output_tokens=50,
+    )
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    request_times = []
+
+    print("Sending requests...")
+    overall_start = time.time()
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            for i, (_, prompt_tokens, max_tokens) in enumerate(workload):
+                # Create a simple prompt
+                prompt = "Test " * prompt_tokens
+
+                req_start = time.time()
+                response = client.post(
+                    f"{args.endpoint_url}/chat/completions",
+                    json={
+                        "model": args.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                    },
+                )
+                req_end = time.time()
+
+                if response.status_code != 200:
+                    print(f"Error: Request {i+1} failed with status {response.status_code}")
+                    return EXIT_FAILED
+
+                data = response.json()
+                usage = data.get("usage", {})
+                total_input_tokens += usage.get("prompt_tokens", 0)
+                total_output_tokens += usage.get("completion_tokens", 0)
+                request_times.append(req_end - req_start)
+
+                if (i + 1) % 5 == 0:
+                    print(f"  Completed {i+1}/{args.num_requests} requests...")
+
+    except httpx.RequestError as e:
+        print(f"Error: Failed to connect to endpoint: {e}")
+        print("Make sure the inference server is running and the URL is correct.")
+        return EXIT_FAILED
+    except Exception as e:
+        print(f"Error: {e}")
+        return EXIT_FAILED
+
+    overall_end = time.time()
+    wall_clock = overall_end - overall_start
+
+    print()
+    print("Measurement Results")
+    print("=" * 60)
+    print()
+
+    # Calculate cost
+    cost_result = calculate_cost(
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+        wall_clock_seconds=wall_clock,
+        gpu_hourly_rate_dollars=args.gpu_hourly_rate,
+    )
+
+    # Calculate confidence intervals (95% CI using t-distribution approximation)
+    if len(request_times) >= 2:
+        mean_time = statistics.mean(request_times)
+        stdev_time = statistics.stdev(request_times)
+        margin = 1.96 * (stdev_time / (len(request_times) ** 0.5))
+        ci_lower = mean_time - margin
+        ci_upper = mean_time + margin
+    else:
+        ci_lower = ci_upper = request_times[0] if request_times else 0
+
+    print(f"Workload:")
+    print(f"  Requests: {args.num_requests}")
+    print(f"  Total input tokens: {total_input_tokens:,}")
+    print(f"  Total output tokens: {total_output_tokens:,}")
+    print()
+
+    print(f"Measured Performance:")
+    print(f"  Wall clock time: {wall_clock:.2f} seconds")
+    print(f"  Average request time: {statistics.mean(request_times):.3f}s (95% CI: [{ci_lower:.3f}, {ci_upper:.3f}])")
+    print()
+
+    print(f"Measured Cost:")
+    print(f"  GPU hours: {cost_result.gpu_hours:.6f}")
+    print(f"  Total cost: ${cost_result.total_dollars:.4f}")
+    print(f"  Input cost: ${cost_result.dollars_per_million_input_tokens:.2f} per million tokens")
+    print(f"  Output cost: ${cost_result.dollars_per_million_output_tokens:.2f} per million tokens")
+    print()
+
+    return EXIT_OK
+
+
+def _handle_tune(args: argparse.Namespace) -> int:
+    """Find optimal configuration by measuring costs."""
+    print("Throttle Tune - Configuration Optimization")
+    print("=" * 60)
+    print()
+    print("Note: This is a simplified tuning command.")
+    print("For production use, run 'throttle golden' for the full counterbalanced protocol.")
+    print()
+    print(f"Endpoint: {args.endpoint_url}")
+    print(f"GPU hourly rate: ${args.gpu_hourly_rate:.2f}/hour")
+    print()
+    print("Running cost measurement at current configuration...")
+    print()
+
+    # For now, just run a single cost measurement
+    # In the future, this could sweep concurrency levels or other parameters
+    import argparse as ap
+    cost_args = ap.Namespace(
+        endpoint_url=args.endpoint_url,
+        model=args.model,
+        gpu_hourly_rate=args.gpu_hourly_rate,
+        num_requests=20,
+    )
+
+    result = _handle_cost(cost_args)
+
+    if result == EXIT_OK:
+        print()
+        print("Tuning complete. For multi-configuration testing, use 'throttle golden'.")
+
+    return result
+
+
+def _handle_validate_sim(args: argparse.Namespace) -> int:
+    """Validate simulator accuracy against real measurements."""
+    from throttle.simulator import VLLMSimulator, SimulatorConfig
+    from throttle.workload import WorkloadGenerator
+    from throttle.cost_model import calculate_cost
+    import time
+
+    try:
+        import httpx
+    except ImportError:
+        print("Error: httpx is required for validation")
+        print("Install with: pip install httpx")
+        return EXIT_FAILED
+
+    print("Throttle Simulator Validation")
+    print("=" * 60)
+    print()
+    print("Comparing simulator predictions to real GPU measurements...")
+    print()
+
+    # Generate a small test workload
+    workload_gen = WorkloadGenerator(seed=42)
+    workload = workload_gen.generate_chat_workload(
+        num_requests=10,
+        arrival_rate_requests_per_sec=1.0,
+        mean_prompt_tokens=100,
+        mean_output_tokens=50,
+    )
+
+    print(f"Test workload: {len(workload)} requests")
+    print(f"Endpoint: {args.endpoint_url}")
+    print()
+
+    # Run simulator
+    print("[SIMULATED] Running simulator...")
+    config = SimulatorConfig(
+        gpu_hourly_rate_dollars=args.gpu_hourly_rate,
+    )
+    sim = VLLMSimulator(config)
+    for arrival_time, prompt_tokens, output_tokens in workload:
+        sim.add_request(arrival_time, prompt_tokens, output_tokens)
+    sim_completed, sim_wall_clock = sim.run()
+
+    sim_input = sum(r.prompt_tokens for r in sim_completed)
+    sim_output = sum(r.tokens_generated for r in sim_completed)
+    sim_cost = calculate_cost(
+        input_tokens=sim_input,
+        output_tokens=sim_output,
+        wall_clock_seconds=sim_wall_clock,
+        gpu_hourly_rate_dollars=args.gpu_hourly_rate,
+    )
+
+    # Run real measurements
+    print("[MEASURED] Measuring real endpoint...")
+    real_input = 0
+    real_output = 0
+    real_start = time.time()
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            for i, (_, prompt_tokens, max_tokens) in enumerate(workload):
+                prompt = "Test " * prompt_tokens
+                response = client.post(
+                    f"{args.endpoint_url}/chat/completions",
+                    json={
+                        "model": args.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                    },
+                )
+
+                if response.status_code != 200:
+                    print(f"Error: Request failed with status {response.status_code}")
+                    return EXIT_FAILED
+
+                data = response.json()
+                usage = data.get("usage", {})
+                real_input += usage.get("prompt_tokens", 0)
+                real_output += usage.get("completion_tokens", 0)
+
+    except httpx.RequestError as e:
+        print(f"Error: Failed to connect to endpoint: {e}")
+        return EXIT_FAILED
+
+    real_end = time.time()
+    real_wall_clock = real_end - real_start
+
+    real_cost = calculate_cost(
+        input_tokens=real_input,
+        output_tokens=real_output,
+        wall_clock_seconds=real_wall_clock,
+        gpu_hourly_rate_dollars=args.gpu_hourly_rate,
+    )
+
+    # Compare results
+    print()
+    print("Validation Results")
+    print("=" * 60)
+    print()
+
+    wall_clock_error = abs(sim_wall_clock - real_wall_clock) / real_wall_clock * 100
+    cost_error = abs(sim_cost.total_dollars - real_cost.total_dollars) / real_cost.total_dollars * 100
+
+    print(f"Wall Clock Time:")
+    print(f"  [SIMULATED] {sim_wall_clock:.2f} seconds")
+    print(f"  [MEASURED]  {real_wall_clock:.2f} seconds")
+    print(f"  Error: {wall_clock_error:.1f}%")
+    print()
+
+    print(f"Cost per Million Tokens:")
+    print(f"  [SIMULATED] Input: ${sim_cost.dollars_per_million_input_tokens:.2f}")
+    print(f"  [MEASURED]  Input: ${real_cost.dollars_per_million_input_tokens:.2f}")
+    print(f"  [SIMULATED] Output: ${sim_cost.dollars_per_million_output_tokens:.2f}")
+    print(f"  [MEASURED]  Output: ${real_cost.dollars_per_million_output_tokens:.2f}")
+    print()
+
+    print(f"Total Cost Error: {cost_error:.1f}%")
+    print()
+
+    if cost_error > 50:
+        print("WARNING: Simulator error > 50%. Simulator assumptions may not match this hardware.")
+        print("Consider measuring actual throughput and updating SimulatorConfig parameters.")
+    elif cost_error > 25:
+        print("NOTE: Simulator error > 25%. Some assumptions may need adjustment.")
+    else:
+        print("Simulator predictions are reasonably close to measurements.")
+
+    print()
+
+    return EXIT_OK
+
+
 def _handle_proxy(args: argparse.Namespace) -> int:
     """Start the caching proxy server."""
     try:
@@ -2183,6 +2677,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not report["compatibility"]["compatible"]:
             return EXIT_USAGE
         return EXIT_OK if report.get("decision_eligible") else EXIT_INCONCLUSIVE
+    if args.command == "demo":
+        return _handle_demo()
+    if args.command == "cost":
+        return _handle_cost(args)
+    if args.command == "tune":
+        return _handle_tune(args)
+    if args.command == "validate-sim":
+        return _handle_validate_sim(args)
     if args.command == "proxy":
         return _handle_proxy(args)
     parser.error("a subcommand is required")

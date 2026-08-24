@@ -521,6 +521,10 @@ class ParserAndPlanTests(unittest.TestCase):
                 "experimental-tuning",
                 "golden",
                 "compare",
+                "demo",
+                "cost",
+                "tune",
+                "validate-sim",
                 "proxy",
             },
         )

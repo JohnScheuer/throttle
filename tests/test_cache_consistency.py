@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(not NUMPY_AVAILABLE, reason="numpy required for 
 
 def _assert_matrix_consistent(cache):
     """Assert embedding matrix is consistent with store."""
-    if not cache.enable_embeddings or cache._embedder is None:
+    if not cache.enable_embeddings:
         assert cache._embedding_matrix is None
         assert cache._embedding_keys == []
         return
