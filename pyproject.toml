@@ -44,3 +44,7 @@ embeddings = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # huggingface-hub 0.36.2 uses deprecated hf-xet API internally
+    "ignore:hf_xet\\.download_files\\(\\) is deprecated:DeprecationWarning:huggingface_hub\\.file_download",
+]
