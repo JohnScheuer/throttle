@@ -526,10 +526,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.85,
         help="Jaccard similarity threshold (0.0-1.0, default: 0.85)",
     )
-    proxy.add_argument(
+    embeddings_group = proxy.add_mutually_exclusive_group()
+    embeddings_group.add_argument(
         "--enable-embeddings",
         action="store_true",
-        help="enable ONNX semantic embedding tier (requires embeddings extra)",
+        help="enable ONNX semantic embedding tier (requires embeddings extra); default: auto-enabled when cache is on and extra is installed",
+    )
+    embeddings_group.add_argument(
+        "--no-embeddings",
+        action="store_true",
+        help="force disable embeddings even if extra is installed",
     )
     proxy.add_argument(
         "--embedding-threshold",
@@ -2058,6 +2064,7 @@ def _handle_proxy(args: argparse.Namespace) -> int:
     try:
         import uvicorn
         from .proxy import create_app
+        from . import embeddings
     except ImportError as e:
         print(
             f"Error: FastAPI and uvicorn are required for proxy mode: {e}",
@@ -2069,6 +2076,16 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         )
         return EXIT_FAILED
 
+    # Resolve embeddings: --enable-cache implies embeddings when extra installed
+    # unless explicitly disabled with --no-embeddings
+    enable_embeddings_resolved = False
+    if args.no_embeddings:
+        enable_embeddings_resolved = False
+    elif args.enable_embeddings:
+        enable_embeddings_resolved = True
+    elif args.enable_cache and embeddings.EMBEDDINGS_AVAILABLE:
+        enable_embeddings_resolved = True
+
     print(f"Starting Throttle proxy server on {args.host}:{args.port}")
     print(f"Backend: {args.backend_url}")
     print(f"Backend timeout: {args.backend_timeout_seconds}s")
@@ -2077,6 +2094,21 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         print(f"  TTL: {args.cache_ttl_seconds}s")
         print(f"  Max size: {args.cache_max_size}")
         print(f"  Similarity threshold: {args.cache_similarity_threshold}")
+
+        # Startup diagnostics for embeddings
+        if enable_embeddings_resolved and embeddings.EMBEDDINGS_AVAILABLE:
+            # State a: embeddings active
+            print(f"  Embeddings: ACTIVE (model: sentence-transformers/all-MiniLM-L6-v2)")
+        elif enable_embeddings_resolved and not embeddings.EMBEDDINGS_AVAILABLE:
+            # State b: requested but extra missing
+            print(f"  Embeddings: REQUESTED BUT UNAVAILABLE")
+            print(f"    Install with: pip install throttle-bench[embeddings]")
+        elif not enable_embeddings_resolved:
+            # State c: disabled by explicit request or not applicable
+            if args.no_embeddings:
+                print(f"  Embeddings: DISABLED (explicit --no-embeddings)")
+            else:
+                print(f"  Embeddings: OFF (Jaccard lexical matching only)")
     print()
     print("Health endpoint: http://{args.host}:{args.port}/health")
     print("Chat completions: http://{args.host}:{args.port}/v1/chat/completions")
@@ -2090,7 +2122,7 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         cache_ttl_seconds=args.cache_ttl_seconds,
         cache_max_size=args.cache_max_size,
         cache_similarity_threshold=args.cache_similarity_threshold,
-        enable_embeddings=args.enable_embeddings,
+        enable_embeddings=enable_embeddings_resolved,
         embedding_threshold=args.embedding_threshold,
         embedding_max_entries_scanned=args.embedding_max_entries_scanned,
         backend_timeout_seconds=args.backend_timeout_seconds,
