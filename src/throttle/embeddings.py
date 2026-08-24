@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Module-level singleton state
 _embedder: Optional["_DirectEmbedder"] = None
 _load_lock = Lock()
+_failure_count = 0
 
 
 class _DirectEmbedder:
@@ -117,6 +118,8 @@ def get_embedding(text: str) -> Optional["np.ndarray"]:
 
     Returns None if embeddings unavailable or loading fails.
     """
+    global _failure_count
+
     embedder = _get_embedder()
     if embedder is None:
         return None
@@ -124,6 +127,7 @@ def get_embedding(text: str) -> Optional["np.ndarray"]:
     try:
         return embedder.embed_one(text)
     except Exception as e:
+        _failure_count += 1
         logger.warning(f"Embedding failed: {e}")
         return None
 
@@ -134,6 +138,8 @@ def get_embeddings(texts: list[str]) -> "np.ndarray":
     Returns (len(texts), 384) array. Failed rows filled with np.zeros((384,)).
     Never returns None - if embeddings unavailable, returns all zeros.
     """
+    global _failure_count
+
     if not EMBEDDINGS_AVAILABLE or not np:
         return np.zeros((len(texts), 384), dtype=np.float32)
 
@@ -144,5 +150,11 @@ def get_embeddings(texts: list[str]) -> "np.ndarray":
     try:
         return embedder.embed_batch(texts)
     except Exception as e:
+        _failure_count += 1
         logger.error(f"Batch embedding failed: {e}")
         return np.zeros((len(texts), 384), dtype=np.float32)
+
+
+def get_failure_count() -> int:
+    """Get the count of embedding failures since module load."""
+    return _failure_count
