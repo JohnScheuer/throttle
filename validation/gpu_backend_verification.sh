@@ -17,11 +17,13 @@ set -euo pipefail
 
 BACKEND="${1:-all}"
 MODEL="Qwen/Qwen2.5-0.5B-Instruct"  # Small model for testing
+MODEL_2="Qwen/Qwen2.5-1.5B-Instruct"  # Second model for cross-model isolation tests
 THROTTLE_REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "=== GPU Backend Verification ==="
 echo "Backend: $BACKEND"
 echo "Model: $MODEL"
+echo "Model 2: $MODEL_2"
 echo "Throttle repo: $THROTTLE_REPO_DIR"
 echo ""
 
@@ -43,36 +45,67 @@ test_vllm() {
     # Install vLLM
     pip install -q vllm
 
-    # Start vLLM server in background
+    # vLLM limitation: Single server instance can only serve one model
+    # Multi-model tests require two separate vLLM instances on different ports
+
+    # Start first vLLM server (primary model) in background
+    echo "Starting vLLM server 1 (model: $MODEL, port: 8100)..."
     python3 -m vllm.entrypoints.openai.api_server \
         --model "$MODEL" \
         --port 8100 \
         --dtype half \
         --max-model-len 512 \
-        > vllm.log 2>&1 &
+        --gpu-memory-utilization 0.45 \
+        > vllm_1.log 2>&1 &
 
-    VLLM_PID=$!
-    echo "vLLM PID: $VLLM_PID"
+    VLLM_PID_1=$!
+    echo "vLLM server 1 PID: $VLLM_PID_1"
 
-    # Wait for server to start
-    echo "Waiting for vLLM server..."
+    # Start second vLLM server (secondary model) in background
+    echo "Starting vLLM server 2 (model: $MODEL_2, port: 8101)..."
+    python3 -m vllm.entrypoints.openai.api_server \
+        --model "$MODEL_2" \
+        --port 8101 \
+        --dtype half \
+        --max-model-len 512 \
+        --gpu-memory-utilization 0.45 \
+        > vllm_2.log 2>&1 &
+
+    VLLM_PID_2=$!
+    echo "vLLM server 2 PID: $VLLM_PID_2"
+
+    # Wait for both servers to start
+    echo "Waiting for vLLM server 1..."
     for i in {1..60}; do
         if curl -s http://localhost:8100/health > /dev/null 2>&1; then
-            echo "vLLM server ready"
+            echo "vLLM server 1 ready"
             break
         fi
         sleep 1
     done
 
-    # Run integration tests
+    echo "Waiting for vLLM server 2..."
+    for i in {1..60}; do
+        if curl -s http://localhost:8101/v1/models > /dev/null 2>&1; then
+            echo "vLLM server 2 ready"
+            break
+        fi
+        sleep 1
+    done
+
+    # Run integration tests with per-model backend URLs
+    # Tests will use MODEL from server 1 (port 8100) and MODEL_2 from server 2 (port 8101)
     echo "Running integration tests against vLLM..."
     cd "$THROTTLE_REPO_DIR"
     BACKEND_URL="http://localhost:8100" \
+    BACKEND_URL_2="http://localhost:8101" \
     BACKEND_MODEL="$MODEL" \
+    BACKEND_MODEL_2="$MODEL_2" \
         python3 -m pytest tests/test_proxy_integration.py -v --tb=short
 
-    # Cleanup
-    kill $VLLM_PID 2>/dev/null || true
+    # Cleanup both servers
+    kill $VLLM_PID_1 2>/dev/null || true
+    kill $VLLM_PID_2 2>/dev/null || true
 
     echo "vLLM tests complete"
     echo ""

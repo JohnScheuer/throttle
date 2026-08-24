@@ -482,8 +482,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Start a lightweight HTTP proxy that sits in front of a real inference "
             "backend and caches responses using semantic similarity matching. "
-            "Compatible with vLLM, Ollama, SGLang, LMDeploy, and other OpenAI-compatible "
-            "servers."
+            "Verified compatible with Ollama. Expected compatible with vLLM, SGLang, "
+            "LMDeploy, and other OpenAI-compatible servers (GPU verification pending, "
+            "see validation/gpu_backend_verification.sh)."
         ),
     )
     proxy.add_argument(

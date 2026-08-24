@@ -26,6 +26,8 @@ This failure exists before the ITEM 3 commit (f5a5842). It is unrelated to the s
 
 **Test coverage:** test_backend_timeout_does_not_hang_waiters is skipped and documents that error paths are not tested.
 
+**Integration test failure:** test_backend_error_propagation (tests/test_proxy_integration.py:230) fails against current main. Test expects HTTP 500 from backend to propagate as HTTP 500 from proxy, but proxy returns HTTP 200 with cached error response. Failure confirms proxy lacks raise_for_status() validation.
+
 **Not yet investigated.** Requires determining:
 1. Which HTTP error codes should prevent caching
 2. Whether finish_reason values indicate error states
@@ -59,27 +61,40 @@ If the primary request to the backend hangs, all concurrent waiters for that sam
 2. Whether timed-out requests should retry or fail immediately
 3. Whether timeout configuration belongs in ProxyServer.__init__ or per-request
 
-## Phase 2: Async Transport Cleanup Warnings
+## Phase 2: Async Transport Cleanup Warnings (RESOLVED)
 
 **Finding:** Tests using proxy_to_mock fixture raise unraisable exception warnings in CI with PYTHONWARNINGS=error.
 
-**Error pattern:**
-```
-pytest.PytestUnraisableExceptionWarning: Exception ignored while calling deallocator <function _SelectorTransport.__del__ at ...>: None
-pytest.PytestUnraisableExceptionWarning: Exception ignored while finalizing socket <socket.socket fd=15, family=2, type=1, proto=6, laddr=('127.0.0.1', ...), raddr=('127.0.0.1', 58091)>: None
-```
+**Root cause:** Three tests in test_proxy_dedup.py created httpx.AsyncClient to fetch /health endpoint without using async context manager or calling .aclose(). pytest's gc_collect_harder during test session teardown surfaces these as ResourceWarning for unclosed transports.
 
-**Affected tests:**
-- test_ten_concurrent_paraphrases_current_behavior
-- test_sequential_identical_requests_hit_cache
-- test_cross_scope_hit_inflation_bug_regression (Python 3.11, 3.12)
-- test_safety_validation.py::AdversarialValidationTests::test_result_tampering_and_uninitialized_result_fail_projection (Python 3.13, 3.14)
+**Resolution (commit 3fb3464):** Wrapped all three unclosed client instantiations with async context manager:
+- test_five_concurrent_identical_requests_one_backend_call (line 184)
+- test_ten_concurrent_paraphrases_current_behavior (line 250)
+- test_concurrent_requests_with_mixed_prompts (line 461)
 
-**Root cause:** Lifespan context manager shutdown (await proxy.shutdown()) races with fixture teardown (server.should_exit = True; await task). Uvicorn lifespan calls proxy.shutdown() which closes httpx.AsyncClient, but then fixture force-terminates server before async transports fully close.
+**Production verification:** SIGTERM test with 20 sequential cache hits (19 cache hits, 1 backend call) completed cleanly with no transport warnings, confirming production code (src/throttle/proxy.py) properly closes httpx.AsyncClient via ProxyServer.shutdown().
 
-**CI run 32661178349:** 3 failed, 343 passed, 3 skipped across all Python versions.
+**CI run 32669184879 (post-fix):** 346 passed, 3 skipped, 0 failed, 0 errors across all Python versions.
 
-**Not yet investigated.** Requires determining:
-1. Whether lifespan shutdown should wait for all transports to close
-2. Whether fixture should await server shutdown instead of forcing exit
-3. Whether httpx.AsyncClient.aclose() needs explicit transport drain
+## Phase 3: Backend URL in Scope Key (Defensive)
+
+**Finding:** Commit da91565 adds backend URL to scope_key when model_backends is non-empty.
+
+**Purpose:** Prevents cache collision when same model name routes to different backends.
+
+**Reachability:** The collision this guards is **NOT reachable** with current implementation:
+- Cache is in-memory, per-process (no persistence across restarts)
+- model_backends is Dict[str, str] (dict keys must be unique)
+- Cannot map same model name to two different backends on one instance
+- No shared cache between ProxyServer instances
+
+**Why it exists:** Defensive programming for future persisted or shared cache. If two ProxyServer instances with different model_backends mappings share a persisted cache (e.g., Redis), both could map "gpt-4" to different backends. Without backend URL in scope_key, requests with identical parameters would incorrectly share cache entries despite hitting different backends.
+
+**Current impact:**
+- Scope key format changes for ALL users with model_backends configured
+- Before: `{"model": "gpt-4", "temperature": 0.7}`
+- After: `{"_backend_url": "http://backend-1:8000", "model": "gpt-4", "temperature": 0.7}`
+- Cache doesn't persist, so no orphaned entries on configuration change
+- Backwards compatible when model_backends is empty (test_legacy_scope_key_format verifies)
+
+**Code location:** src/throttle/proxy.py:134-148 (with full explanation in comments)

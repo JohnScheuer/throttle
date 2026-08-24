@@ -1,8 +1,10 @@
 """Throttle Proxy: OpenAI-compatible caching proxy for LLM inference backends.
 
 This module provides a lightweight HTTP proxy server that sits in front of real
-inference backends (vLLM, Ollama, SGLang, LMDeploy) and caches responses using
-semantic similarity matching.
+inference backends and caches responses using semantic similarity matching.
+
+Verified compatible with Ollama. Expected compatible with vLLM, SGLang, LMDeploy,
+and other OpenAI-compatible servers (GPU verification pending).
 
 IMPORTANT LIMITATION: The current implementation uses Jaccard token-overlap
 similarity (threshold 0.85) which is strict and may miss natural paraphrases.
@@ -46,9 +48,14 @@ class ProxyServer:
         cache_ttl_seconds: float = 3600.0,
         cache_max_size: int = 1000,
         cache_similarity_threshold: float = 0.85,
+        model_backends: Optional[Dict[str, str]] = None,
         lifespan=None,
     ):
         self.backend_url = backend_url.rstrip("/")
+        # IMPORTANT: _extract_scope_key() depends on this mapping. Mutating model_backends
+        # after construction changes scope keys for all subsequent requests, orphaning every
+        # existing cache entry.
+        self.model_backends = model_backends or {}
         self.enable_cache = enable_cache
         self.cache: Optional[SimilarityCache] = None
 
@@ -96,6 +103,14 @@ class ProxyServer:
             } if self.cache else None,
         }
 
+    def _get_backend_url(self, model: str) -> str:
+        """Get backend URL for a specific model.
+
+        If model_backends mapping is provided and contains the model,
+        returns the model-specific URL. Otherwise returns default backend_url.
+        """
+        return self.model_backends.get(model, self.backend_url).rstrip("/")
+
     def _extract_scope_key(self, request_body: Dict[str, Any]) -> str:
         """Extract scope parameters that must match exactly for cache hits.
 
@@ -106,12 +121,32 @@ class ProxyServer:
 
         All other fields (model, temperature, max_tokens, custom backend parameters, etc.)
         are included to prevent cache collisions between requests with different parameters.
+
+        When model_backends is non-empty, also includes the resolved backend URL to prevent
+        cache collisions when different backends serve models with the same name.
         """
         excluded = {"messages", "stream"}
         scope_params = {
             k: v for k, v in request_body.items()
             if k not in excluded
         }
+
+        # Include backend URL in scope when using per-model routing.
+        #
+        # NOTE: The collision this guards (same model name routing to different backends)
+        # is NOT reachable with the current in-memory, per-process cache and dict-based
+        # model_backends (dict keys must be unique, so one model name cannot map to two
+        # backends). This is defensive programming for a future persisted or shared cache.
+        #
+        # Without this field, two ProxyServer instances with different model_backends
+        # mappings sharing a persisted cache could collide: both map "gpt-4" to different
+        # backends, and requests with identical parameters would incorrectly share cache
+        # entries despite hitting different backends.
+        if self.model_backends:
+            model = request_body.get("model", "")
+            backend_url = self._get_backend_url(model)
+            scope_params["_backend_url"] = backend_url
+
         return json.dumps(scope_params, sort_keys=True)
 
     def _extract_prompt(self, request_body: Dict[str, Any]) -> str:
@@ -281,6 +316,10 @@ class ProxyServer:
         # only one actually reaches the backend (others wait on the same Future)
         self._backend_calls += 1
 
+        # Get model-specific backend URL
+        model = request_body.get("model", "")
+        backend_url = self._get_backend_url(model)
+
         if is_streaming:
             # For streaming, accumulate the complete response
             accumulated_content = []
@@ -288,7 +327,7 @@ class ProxyServer:
 
             async with self._client.stream(
                 "POST",
-                f"{self.backend_url}/v1/chat/completions",
+                f"{backend_url}/v1/chat/completions",
                 json=request_body,
                 headers=headers,
             ) as response:
@@ -335,7 +374,7 @@ class ProxyServer:
         else:
             # Non-streaming request
             response = await self._client.post(
-                f"{self.backend_url}/v1/chat/completions",
+                f"{backend_url}/v1/chat/completions",
                 json=request_body,
                 headers=headers,
             )
