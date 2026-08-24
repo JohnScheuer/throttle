@@ -310,6 +310,22 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     _add_manifest_options(parser)
     _add_cache_options(parser)
 
+
+def _get_api_key(args: argparse.Namespace) -> str | None:
+    """Get API key from args or environment, return None if not set."""
+    if hasattr(args, 'api_key') and args.api_key:
+        return args.api_key
+    return os.environ.get('OPENAI_API_KEY')
+
+
+def _build_headers(api_key: str | None) -> dict[str, str]:
+    """Build HTTP headers with optional Authorization bearer token."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="throttle",
@@ -522,6 +538,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="number of test requests to send (default: 20)",
     )
+    cost.add_argument(
+        "--api-key",
+        help="API key for authentication (also reads OPENAI_API_KEY env var)",
+    )
 
     tune = subparsers.add_parser(
         "tune",
@@ -548,6 +568,10 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="GPU hourly rate in dollars",
     )
+    tune.add_argument(
+        "--api-key",
+        help="API key for authentication (also reads OPENAI_API_KEY env var)",
+    )
 
     validate_sim = subparsers.add_parser(
         "validate-sim",
@@ -573,6 +597,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         required=True,
         help="GPU hourly rate in dollars",
+    )
+    validate_sim.add_argument(
+        "--api-key",
+        help="API key for authentication (also reads OPENAI_API_KEY env var)",
     )
 
     proxy = subparsers.add_parser(
@@ -2426,6 +2454,9 @@ def _handle_cost(args: argparse.Namespace) -> int:
         print("Install with: pip install httpx")
         return EXIT_FAILED
 
+    api_key = _get_api_key(args)
+    headers = _build_headers(api_key)
+
     print(f"Measuring cost against {args.endpoint_url}")
     print(f"GPU hourly rate: ${args.gpu_hourly_rate:.2f}/hour")
     print(f"Test requests: {args.num_requests}")
@@ -2456,6 +2487,7 @@ def _handle_cost(args: argparse.Namespace) -> int:
                 req_start = time.time()
                 response = client.post(
                     f"{args.endpoint_url}/chat/completions",
+                    headers=headers,
                     json={
                         "model": args.model,
                         "messages": [{"role": "user", "content": prompt}],
@@ -2554,6 +2586,7 @@ def _handle_tune(args: argparse.Namespace) -> int:
         model=args.model,
         gpu_hourly_rate=args.gpu_hourly_rate,
         num_requests=20,
+        api_key=args.api_key if hasattr(args, 'api_key') else None,
     )
 
     result = _handle_cost(cost_args)
@@ -2581,6 +2614,9 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
         print("Install with: pip install httpx")
         return EXIT_FAILED
 
+    api_key = _get_api_key(args)
+    headers = _build_headers(api_key)
+
     print("Throttle Simulator Validation")
     print("=" * 60)
     print()
@@ -2591,6 +2627,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
         with httpx.Client(timeout=10.0) as client:
             response = client.post(
                 f"{args.endpoint_url}/chat/completions",
+                headers=headers,
                 json={
                     "model": args.model,
                     "messages": [{"role": "user", "content": "test"}],
@@ -2674,59 +2711,104 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
             gpu_hourly_rate_dollars=args.gpu_hourly_rate,
         )
 
-        # Run real measurements
-        measured_requests = []
-        real_total_input = 0
-        real_total_output = 0
-        overall_start = time.perf_counter_ns()
-        first_token_times = []
+        # Run real measurements with concurrent requests respecting arrival times
+        async def run_concurrent_workload():
+            import asyncio
+            import threading
+
+            measured_requests = []
+            real_total_input = 0
+            real_total_output = 0
+            first_token_times = []
+            peak_concurrent = 0
+            current_in_flight = 0
+            lock = threading.Lock()
+
+            async def send_request(arrival_time, prompt_tokens, max_tokens, request_idx):
+                nonlocal real_total_input, real_total_output, peak_concurrent, current_in_flight
+
+                # Wait until scheduled arrival time
+                if arrival_time > 0:
+                    await asyncio.sleep(arrival_time)
+
+                # Track in-flight requests
+                with lock:
+                    current_in_flight += 1
+                    if current_in_flight > peak_concurrent:
+                        peak_concurrent = current_in_flight
+
+                prompt = "Test " * prompt_tokens
+                req_start = time.perf_counter_ns()
+
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    try:
+                        response = await client.post(
+                            f"{args.endpoint_url}/chat/completions",
+                            headers=headers,
+                            json={
+                                "model": args.model,
+                                "messages": [{"role": "user", "content": prompt}],
+                                "max_tokens": max_tokens,
+                            },
+                        )
+                        req_end = time.perf_counter_ns()
+
+                        if response.status_code != 200:
+                            raise Exception(f"Request {request_idx+1} failed with status {response.status_code}")
+
+                        data = response.json()
+                        usage = data.get("usage", {})
+                        actual_input = usage.get("prompt_tokens", 0)
+                        actual_output = usage.get("completion_tokens", 0)
+
+                        with lock:
+                            real_total_input += actual_input
+                            real_total_output += actual_output
+                            current_in_flight -= 1
+
+                        req_duration_ns = req_end - req_start
+                        result = {
+                            "prompt_tokens": actual_input,
+                            "completion_tokens": actual_output,
+                            "duration_seconds": req_duration_ns / 1e9,
+                        }
+
+                        # Estimate TTFT
+                        if actual_output > 0:
+                            est_ttft_ns = req_duration_ns // (actual_output + 1)
+                            with lock:
+                                first_token_times.append(est_ttft_ns / 1e9)
+
+                        return result
+                    except Exception as e:
+                        with lock:
+                            current_in_flight -= 1
+                        raise
+
+            # Launch all tasks concurrently
+            tasks = [
+                send_request(arrival_time, prompt_tokens, max_tokens, i)
+                for i, (arrival_time, prompt_tokens, max_tokens) in enumerate(workload)
+            ]
+
+            overall_start = time.perf_counter_ns()
+            measured_requests = await asyncio.gather(*tasks)
+            overall_end = time.perf_counter_ns()
+            real_wall_clock = (overall_end - overall_start) / 1e9
+
+            return measured_requests, real_total_input, real_total_output, first_token_times, real_wall_clock, peak_concurrent
 
         try:
-            with httpx.Client(timeout=120.0) as client:
-                for i, (_, prompt_tokens, max_tokens) in enumerate(workload):
-                    prompt = "Test " * prompt_tokens
-
-                    req_start = time.perf_counter_ns()
-                    response = client.post(
-                        f"{args.endpoint_url}/chat/completions",
-                        json={
-                            "model": args.model,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": max_tokens,
-                        },
-                    )
-                    req_end = time.perf_counter_ns()
-
-                    if response.status_code != 200:
-                        print(f"Error: Request {i+1} failed with status {response.status_code}")
-                        return EXIT_FAILED
-
-                    data = response.json()
-                    usage = data.get("usage", {})
-                    actual_input = usage.get("prompt_tokens", 0)
-                    actual_output = usage.get("completion_tokens", 0)
-
-                    real_total_input += actual_input
-                    real_total_output += actual_output
-
-                    req_duration_ns = req_end - req_start
-                    measured_requests.append({
-                        "prompt_tokens": actual_input,
-                        "completion_tokens": actual_output,
-                        "duration_seconds": req_duration_ns / 1e9,
-                    })
-
-                    # Estimate TTFT (crude: assume linear generation)
-                    if actual_output > 0:
-                        est_ttft_ns = req_duration_ns // (actual_output + 1)
-                        first_token_times.append(est_ttft_ns / 1e9)
-
-        except httpx.RequestError as e:
+            measured_requests, real_total_input, real_total_output, first_token_times, real_wall_clock, peak_concurrent = asyncio.run(run_concurrent_workload())
+        except Exception as e:
             print(f"Error: Request failed: {e}")
             return EXIT_FAILED
 
-        overall_end = time.perf_counter_ns()
-        real_wall_clock = (overall_end - overall_start) / 1e9
+        # Assert peak concurrency > 1 for load validation
+        if peak_concurrent == 1:
+            print(f"ERROR: Peak concurrent requests was 1 - harness is still serial!")
+            print(f"This invalidates the load level test. Arrival rate had no effect.")
+            return EXIT_FAILED
 
         real_cost = calculate_cost(
             input_tokens=real_total_input,
@@ -2757,6 +2839,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
         print(f"  Output tok/sec             {sim_output_throughput:11.1f}  {real_output_throughput:11.1f}  {output_throughput_error_pct:+7.1f}%")
         print(f"  TTFT (s)                   {'N/A':>11}  {avg_ttft:11.3f}  {'N/A':>8}")
         print(f"  $/M input tokens           {sim_cost.dollars_per_million_input_tokens:11.2f}  {real_cost.dollars_per_million_input_tokens:11.2f}  {cost_per_m_error_pct:+7.1f}%")
+        print(f"  Peak concurrent requests   {'N/A':>11}  {peak_concurrent:11d}  {'N/A':>8}")
         print()
 
         # Store results
@@ -2780,6 +2863,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
                 "dollars_per_million_input": real_cost.dollars_per_million_input_tokens,
                 "dollars_per_million_output": real_cost.dollars_per_million_output_tokens,
                 "total_dollars": real_cost.total_dollars,
+                "peak_concurrent_requests": peak_concurrent,
                 "per_request_timings": measured_requests,
             },
             "errors_pct": {

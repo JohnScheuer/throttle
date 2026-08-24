@@ -2,17 +2,28 @@
 
 Copy-paste these commands verbatim on a fresh RunPod A100 instance.
 
-## Step 1: Install Python and dependencies
+## Known RunPod Template Issues
+
+**The RunPod vLLM template has three surprises that will block validation:**
+
+1. **No git installed** - Cannot clone the repository without installing git first
+2. **VLLM_API_KEY set** - All requests return Unauthorized without an API key
+3. **--enforce-eager mode** - Disables CUDA graphs, significantly reduces decode throughput
+
+These instructions work around all three issues.
+
+## Step 1: Install Python, git, and dependencies
 
 ```bash
 # Update package list
 sudo apt-get update
 
-# Install Python 3.11 and pip
-sudo apt-get install -y python3.11 python3.11-venv python3-pip
+# Install Python 3.11, pip, and git
+sudo apt-get install -y python3.11 python3.11-venv python3-pip git
 
 # Verify installation
 python3.11 --version
+git --version
 ```
 
 ## Step 2: Install vLLM
@@ -80,10 +91,12 @@ throttle --help
 # Still in throttle-env
 # Run validator against local vLLM
 # GPU hourly rate: use your actual RunPod rate (typically $0.79-$1.14/hr for A100)
+# --api-key uses $VLLM_API_KEY set by the RunPod template
 throttle validate-sim \
   --endpoint-url http://localhost:8000/v1 \
   --model "Qwen/Qwen2.5-0.5B-Instruct" \
-  --gpu-hourly-rate 1.00
+  --gpu-hourly-rate 1.00 \
+  --api-key "$VLLM_API_KEY"
 
 # This will:
 # - Test connection to vLLM
