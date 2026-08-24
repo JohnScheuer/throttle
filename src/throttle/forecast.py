@@ -59,6 +59,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Optional
 
+from throttle.keys import extract_scope_key, extract_prompt
+
 # ---------------------------------------------------------------------------
 # Embedding availability check
 # ---------------------------------------------------------------------------
@@ -215,14 +217,24 @@ def is_extrapolated(cache_entries: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def load_prompts(path: Path) -> list[str]:
+_SINGLE_SCOPE = "__single_scope__"
+
+
+def load_prompts(path: Path) -> list[dict]:
     """
     Load prompts from JSONL or plain text.
-    JSONL: looks for 'prompt', 'content', or extracts text from 'messages'.
-    Plain text: one prompt per line.
+
+    Returns list of {"text": str, "scope_key": str}.
+
+    OpenAI chat-completions JSONL (has "messages" field):
+        scope_key via extract_scope_key() — same function the proxy
+        uses. One implementation, no divergence possible.
+
+    All other formats (plain text, prompt/query/content/instruction):
+        scope_key = _SINGLE_SCOPE (no scope info available).
     """
     lines = path.read_text(encoding="utf-8").splitlines()
-    prompts = []
+    requests = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -230,28 +242,25 @@ def load_prompts(path: Path) -> list[str]:
         if line.startswith("{"):
             try:
                 obj = json.loads(line)
-                if "prompt" in obj:
-                    prompts.append(str(obj["prompt"]))
-                elif "query" in obj:                          # ADD THIS
-                    prompts.append(str(obj["query"]))         # ADD THIS
+                if "messages" in obj:
+                    text = extract_prompt(obj)
+                    scope_key = extract_scope_key(obj)
+                    if text.strip():
+                        requests.append({"text": text, "scope_key": scope_key})
+                elif "prompt" in obj:
+                    requests.append({"text": str(obj["prompt"]), "scope_key": _SINGLE_SCOPE})
+                elif "query" in obj:
+                    requests.append({"text": str(obj["query"]), "scope_key": _SINGLE_SCOPE})
                 elif "content" in obj:
-                    prompts.append(str(obj["content"]))
-                elif "messages" in obj:
-                    parts = []
-                    for msg in obj["messages"]:
-                        if isinstance(msg, dict) and "content" in msg:
-                            parts.append(
-                                f"{msg.get('role','user')}: {msg['content']}"
-                            )
-                    if parts:
-                        prompts.append("\n".join(parts))
+                    requests.append({"text": str(obj["content"]), "scope_key": _SINGLE_SCOPE})
                 elif "instruction" in obj:
-                    prompts.append(str(obj["instruction"]))
+                    requests.append({"text": str(obj["instruction"]), "scope_key": _SINGLE_SCOPE})
             except json.JSONDecodeError:
-                prompts.append(line)
+                if line.strip():
+                    requests.append({"text": line, "scope_key": _SINGLE_SCOPE})
         else:
-            prompts.append(line)
-    return [p for p in prompts if p.strip()]
+            requests.append({"text": line, "scope_key": _SINGLE_SCOPE})
+    return [r for r in requests if r["text"].strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -260,28 +269,39 @@ def load_prompts(path: Path) -> list[str]:
 
 
 def run_simulation(
-    prompts: list[str],
+    requests: list[dict],
     embedding_available: bool,
 ) -> dict:
     """
     Simulate cache behavior on the prompt stream.
+
+    Each request is {"text": str, "scope_key": str}.
+    Matches are only made within the same scope_key — same logic as
+    the proxy. Single-scope input uses _SINGLE_SCOPE for all entries.
+
     Returns raw simulation results for report generation.
     """
-    cache: list[dict] = []  # each entry: {text, embedding}
+    # Per-scope cache: scope_key -> list[{text, embedding}]
+    cache: dict[str, list[dict]] = {}
     hits = []
     misses = []
+    distinct_scopes: set[str] = set()
 
-    for idx, prompt in enumerate(prompts):
-        prompt = prompt.strip()
+    for idx, req in enumerate(requests):
+        prompt = req["text"].strip()
+        scope_key = req["scope_key"]
         if not prompt:
             continue
 
+        distinct_scopes.add(scope_key)
+        scope_cache = cache.setdefault(scope_key, [])
+
         t0 = time.perf_counter()
 
-        # Tier 1: Jaccard scan
+        # Tier 1: Jaccard scan (within scope only)
         jaccard_match = None
         jaccard_score = 0.0
-        for entry in cache:
+        for entry in scope_cache:
             score = jaccard(prompt, entry["text"])
             if score >= JACCARD_THRESHOLD:
                 jaccard_match = entry
@@ -295,6 +315,7 @@ def run_simulation(
                 "stream_index": idx,
                 "query": prompt,
                 "matched_text": jaccard_match["text"],
+                "scope_key": scope_key,
                 "tier": "jaccard",
                 "similarity": round(jaccard_score, 4),
                 "lookup_ms": round(elapsed, 3),
@@ -302,13 +323,13 @@ def run_simulation(
             })
             continue
 
-        # Tier 2: Embedding scan
+        # Tier 2: Embedding scan (within scope only)
         if embedding_available:
             emb = _model.encode(prompt)
             if emb is not None:
                 emb_match = None
                 emb_score = 0.0
-                for entry in cache:
+                for entry in scope_cache:
                     if entry["embedding"] is None:
                         continue
                     score = _model.cosine(emb, entry["embedding"])
@@ -324,6 +345,7 @@ def run_simulation(
                         "stream_index": idx,
                         "query": prompt,
                         "matched_text": emb_match["text"],
+                        "scope_key": scope_key,
                         "tier": "embedding",
                         "similarity": round(emb_score, 4),
                         "lookup_ms": round(elapsed, 3),
@@ -331,22 +353,26 @@ def run_simulation(
                     })
                     continue
 
-                cache.append({"text": prompt, "embedding": emb})
-                misses.append({"stream_index": idx, "query": prompt})
+                scope_cache.append({"text": prompt, "embedding": emb})
+                misses.append({"stream_index": idx, "query": prompt, "scope_key": scope_key})
                 continue
 
         # Miss — Jaccard-only mode
-        cache.append({"text": prompt, "embedding": None})
-        misses.append({"stream_index": idx, "query": prompt})
+        scope_cache.append({"text": prompt, "embedding": None})
+        misses.append({"stream_index": idx, "query": prompt, "scope_key": scope_key})
 
-    # Sort hits by similarity ascending so riskiest pairs appear first
+    # Sort hits ascending by similarity — riskiest matches first
     hits.sort(key=lambda h: h["similarity"])
 
+    total_cache_entries = sum(len(v) for v in cache.values())
+
     return {
-        "total": len(prompts),
+        "total": len(requests),
         "hits": hits,
         "misses": misses,
-        "cache_size": len(cache),
+        "cache_size": total_cache_entries,
+        "distinct_scopes": len(distinct_scopes),
+        "is_multi_scope": len(distinct_scopes) > 1,
     }
 
 
@@ -528,12 +554,26 @@ def render_report(
         "no_verdict": "❓  NO VERDICT — INSTALL EMBEDDINGS",
     }
 
+    distinct_scopes = sim.get("distinct_scopes", 1)
+    is_multi_scope = sim.get("is_multi_scope", False)
+
     lines = [
         "=" * 70,
         "THROTTLE FORECAST — Cache Viability Report",
         "=" * 70,
         "",
     ]
+
+    if is_multi_scope:
+        lines += [
+            f"ℹ  MULTI-SCOPE INPUT DETECTED",
+            f"   Your log contains {distinct_scopes} distinct scopes (model/temperature",
+            f"   combinations). Hit rates are projected within scope — a prompt",
+            f"   from scope A will never match a cached response from scope B.",
+            f"   This means your actual hit rate may be lower than single-scope",
+            f"   traffic with the same paraphrase density.",
+            "",
+        ]
 
     if low_sample_warning:
         lines += [
@@ -822,11 +862,11 @@ def main() -> None:
         sys.exit(2)
 
     # Load prompts
-    prompts = load_prompts(args.file)
+    requests = load_prompts(args.file)
 
-    if len(prompts) < MIN_PROMPTS_HARD:
+    if len(requests) < MIN_PROMPTS_HARD:
         print(
-            f"Insufficient data: {len(prompts)} prompts found, "
+            f"Insufficient data: {len(requests)} prompts found, "
             f"{MIN_PROMPTS_HARD} required.\n"
             "Provide a larger sample for a meaningful projection.\n"
             "Exit 3: inconclusive.",
@@ -834,7 +874,7 @@ def main() -> None:
         )
         sys.exit(3)
 
-    low_sample_warning = len(prompts) < MIN_PROMPTS_WARN
+    low_sample_warning = len(requests) < MIN_PROMPTS_WARN
 
     # Load embedding model
     embedding_available = _model.load()
@@ -848,7 +888,7 @@ def main() -> None:
         )
 
     # Run simulation
-    sim = run_simulation(prompts, embedding_available)
+    sim = run_simulation(requests, embedding_available)
 
     # Classify domain
     domain, domain_rate, domain_explanation = classify_domain(sim["hits"])
@@ -879,7 +919,7 @@ def main() -> None:
 
     # Render
     render_report(
-        prompts=prompts,
+        prompts=requests,
         sim=sim,
         domain=domain,
         domain_rate=domain_rate,

@@ -19,6 +19,8 @@ balances precision (avoiding false positives) with recall (catching duplicates).
 
 import asyncio
 import json
+
+from throttle.keys import extract_scope_key as _extract_scope_key_fn, extract_prompt as _extract_prompt_fn
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Optional
@@ -126,57 +128,10 @@ class ProxyServer:
         return self.model_backends.get(model, self.backend_url).rstrip("/")
 
     def _extract_scope_key(self, request_body: Dict[str, Any]) -> str:
-        """Extract scope parameters that must match exactly for cache hits.
-
-        Includes all request fields EXCEPT:
-        - messages: used for semantic similarity matching, not scope differentiation
-        - stream: controls response format (SSE vs JSON), not content; cached responses
-                  can be served as either streaming or non-streaming
-
-        All other fields (model, temperature, max_tokens, custom backend parameters, etc.)
-        are included to prevent cache collisions between requests with different parameters.
-
-        When model_backends is non-empty, also includes the resolved backend URL to prevent
-        cache collisions when different backends serve models with the same name.
-        """
-        excluded = {"messages", "stream"}
-        scope_params = {
-            k: v for k, v in request_body.items()
-            if k not in excluded
-        }
-
-        # Include backend URL in scope when using per-model routing.
-        #
-        # NOTE: The collision this guards (same model name routing to different backends)
-        # is NOT reachable with the current in-memory, per-process cache and dict-based
-        # model_backends (dict keys must be unique, so one model name cannot map to two
-        # backends). This is defensive programming for a future persisted or shared cache.
-        #
-        # Without this field, two ProxyServer instances with different model_backends
-        # mappings sharing a persisted cache could collide: both map "gpt-4" to different
-        # backends, and requests with identical parameters would incorrectly share cache
-        # entries despite hitting different backends.
-        if self.model_backends:
-            model = request_body.get("model", "")
-            backend_url = self._get_backend_url(model)
-            scope_params["_backend_url"] = backend_url
-
-        return json.dumps(scope_params, sort_keys=True)
+        return _extract_scope_key_fn(request_body, model_backends=self.model_backends)
 
     def _extract_prompt(self, request_body: Dict[str, Any]) -> str:
-        """Extract semantic text from messages for similarity matching.
-
-        Includes role information to distinguish different conversation structures.
-        """
-        messages = request_body.get("messages", [])
-        prompt_parts = []
-        for msg in messages:
-            if isinstance(msg, dict) and "content" in msg:
-                role = msg.get("role", "user")
-                content = msg["content"]
-                # Include role to distinguish different conversation structures
-                prompt_parts.append(f"{role}: {content}")
-        return "\n".join(prompt_parts)
+        return _extract_prompt_fn(request_body)
 
     async def _fake_stream_response(
         self, cached_response: Dict[str, Any]
