@@ -48,6 +48,8 @@ class ProxyServer:
         cache_ttl_seconds: float = 3600.0,
         cache_max_size: int = 1000,
         cache_similarity_threshold: float = 0.85,
+        # NOTE: 120s default is not evidence-based. 30s risks killing cold model loads and long generations.
+        backend_timeout_seconds: float = 120.0,
         model_backends: Optional[Dict[str, str]] = None,
         lifespan=None,
     ):
@@ -58,6 +60,7 @@ class ProxyServer:
         self.model_backends = model_backends or {}
         self.enable_cache = enable_cache
         self.cache: Optional[SimilarityCache] = None
+        self.backend_timeout_seconds = backend_timeout_seconds
 
         if self.enable_cache:
             self.cache = SimilarityCache(
@@ -83,7 +86,7 @@ class ProxyServer:
 
     async def startup(self):
         """Initialize HTTP client."""
-        self._client = httpx.AsyncClient(timeout=120.0)
+        self._client = httpx.AsyncClient(timeout=self.backend_timeout_seconds)
 
     async def shutdown(self):
         """Cleanup HTTP client."""
@@ -452,6 +455,13 @@ class ProxyServer:
 
                     future.set_result(response_data)
 
+                except httpx.TimeoutException as e:
+                    # Timeout - propagate to waiters via future, return 504 for originator
+                    future.set_exception(e)
+                    return JSONResponse(
+                        status_code=504,
+                        content={"error": "Backend request timed out"}
+                    )
                 except Exception as e:
                     future.set_exception(e)
                     raise
@@ -459,7 +469,15 @@ class ProxyServer:
                     async with self._inflight_lock:
                         self._inflight.pop(dedup_key, None)
 
-            response_data = await future
+            # Waiters and successful originators reach here
+            try:
+                response_data = await future
+            except httpx.TimeoutException:
+                # Waiter receiving timeout from originator
+                return JSONResponse(
+                    status_code=504,
+                    content={"error": "Backend request timed out"}
+                )
 
             if is_streaming:
                 return StreamingResponse(
@@ -485,6 +503,8 @@ def create_app(
     cache_ttl_seconds: float = 3600.0,
     cache_max_size: int = 1000,
     cache_similarity_threshold: float = 0.85,
+    # NOTE: 120s default is not evidence-based. 30s risks killing cold model loads and long generations.
+    backend_timeout_seconds: float = 120.0,
 ) -> FastAPI:
     """Factory function to create a proxy app."""
     # ProxyServer will be captured by the lifespan closure
@@ -504,6 +524,7 @@ def create_app(
         cache_ttl_seconds=cache_ttl_seconds,
         cache_max_size=cache_max_size,
         cache_similarity_threshold=cache_similarity_threshold,
+        backend_timeout_seconds=backend_timeout_seconds,
         lifespan=lifespan,
     )
 
