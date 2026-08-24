@@ -108,6 +108,10 @@ class ProxyServer:
                 "hits": self.cache.metrics.hits if self.cache else 0,
                 "misses": self.cache.metrics.misses if self.cache else 0,
                 "evictions": self.cache.metrics.evictions if self.cache else 0,
+                "lexical_hits": self.cache.metrics.lexical_hits if self.cache else 0,
+                "embedding_hits": self.cache.metrics.embedding_hits if self.cache else 0,
+                "embedding_scans_attempted": self.cache.metrics.embedding_scans_attempted if self.cache else 0,
+                "embedding_comparisons_performed": self.cache.metrics.embedding_comparisons_performed if self.cache else 0,
                 "backend_calls": self._backend_calls,
             } if self.cache else None,
         }

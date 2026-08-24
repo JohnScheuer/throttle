@@ -111,23 +111,24 @@ async def test_embedding_hit_that_jaccard_misses():
 
         try:
             async with AsyncClient() as client:
+                # Pair: cosine=0.9762, jaccard=0.1667 (measured 2026-08-23 with direct ONNX)
                 resp1 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
                         "model": "test-model",
-                        "messages": [{"role": "user", "content": "How do I optimize PostgreSQL queries?"}],
+                        "messages": [{"role": "user", "content": "What are the benefits of using Docker containers?"}],
                         "temperature": 0.7,
                     },
                 )
                 assert resp1.status_code == 200
                 response1 = resp1.json()
 
-                # Second request: semantically similar but Jaccard dissimilar
+                # Second request: strong paraphrase (cosine > 0.95, jaccard < 0.85)
                 resp2 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
                         "model": "test-model",
-                        "messages": [{"role": "user", "content": "How can I improve database query performance in PostgreSQL?"}],
+                        "messages": [{"role": "user", "content": "What advantages do Docker containers provide?"}],
                         "temperature": 0.7,
                     },
                 )
@@ -139,6 +140,77 @@ async def test_embedding_hit_that_jaccard_misses():
                 assert proxy.cache.metrics.embedding_hits >= 1
                 # Responses should match (same cached content)
                 assert response2["choices"][0]["message"]["content"] == response1["choices"][0]["message"]["content"]
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
+
+
+@pytest.mark.asyncio
+async def test_weak_paraphrase_does_not_hit_at_threshold_095():
+    """Test that PostgreSQL pair (cosine=0.878) correctly misses at threshold 0.95."""
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with _fake_backend() as backend_url:
+            proxy.backend_url = backend_url
+            await proxy.startup()
+            yield
+        await proxy.shutdown()
+
+    proxy = ProxyServer(
+        backend_url="http://placeholder",
+        enable_cache=True,
+        enable_embeddings=True,
+        cache_max_size=10,
+        lifespan=lifespan,
+    )
+
+    async with lifespan(proxy.app):
+        from httpx import AsyncClient
+        import uvicorn
+        import socket
+
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
+        await asyncio.sleep(0.5)
+
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                # Pair: cosine=0.8783, jaccard<0.85 (measured 2026-08-23 with direct ONNX)
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "How do I optimize PostgreSQL queries?"}],
+                        "temperature": 0.7,
+                    },
+                )
+                assert resp1.status_code == 200
+
+                # Weak paraphrase - should NOT hit at threshold 0.95
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "How can I improve database query performance in PostgreSQL?"}],
+                        "temperature": 0.7,
+                    },
+                )
+                assert resp2.status_code == 200
+
+                # Should be MISS - cosine 0.878 < threshold 0.95
+                assert proxy.cache.metrics.misses >= 1
+                assert proxy.cache.metrics.embedding_hits == 0
+                # Verify embedding tier ran but found no match
+                assert proxy.cache.metrics.embedding_scans_attempted >= 1
         finally:
             proxy_server.should_exit = True
             await proxy_task
