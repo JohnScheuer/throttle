@@ -2102,7 +2102,7 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         elif enable_embeddings_resolved and not embeddings.EMBEDDINGS_AVAILABLE:
             # State b: requested but extra missing
             print(f"  Embeddings: REQUESTED BUT UNAVAILABLE")
-            print(f"    Install with: pip install throttle-bench[embeddings]")
+            print(f"    Install with: pip install throttle-pro[embeddings]")
         elif not enable_embeddings_resolved:
             # State c: disabled by explicit request or not applicable
             if args.no_embeddings:

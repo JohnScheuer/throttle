@@ -986,7 +986,7 @@ def _matrix_manifest(config: Any, prompt_tokens: int) -> dict[str, Any]:
     shape_hash = _canonical_hash(shape)
     return {
         "manifest_version": CURRENT_MANIFEST_VERSION,
-        "tool": {"name": "throttle-bench", "version": __version__},
+        "tool": {"name": "throttle-pro", "version": __version__},
         "engine": {
             "backend": "guidellm",
             "backend_version": GUIDELLM_VERSION,

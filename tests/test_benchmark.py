@@ -398,7 +398,7 @@ def _saved_report(
         "decision_eligible": False,
         "manifest": {
             "manifest_version": "1.0",
-            "tool": {"name": "throttle-bench", "version": __version__},
+            "tool": {"name": "throttle-pro", "version": __version__},
             "model": {"id": "model-a", "immutable_revision": "a" * 40},
             "runtime": {
                 "image_digest": "example/image@sha256:" + "b" * 64,

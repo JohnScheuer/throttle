@@ -1994,7 +1994,7 @@ def _manifest(
     )
     return {
         "manifest_version": CURRENT_MANIFEST_VERSION,
-        "tool": {"name": "throttle-bench", "version": __version__},
+        "tool": {"name": "throttle-pro", "version": __version__},
         "engine": {
             "backend": config.backend,
             "backend_version": "native-protocol-1",

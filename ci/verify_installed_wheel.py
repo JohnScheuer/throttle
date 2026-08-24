@@ -21,7 +21,7 @@ def main() -> None:
     if "site-packages" not in package_path.parts:
         raise SystemExit(f"clean install did not import from site-packages: {package_path}")
 
-    installed_version = importlib.metadata.version("throttle-bench")
+    installed_version = importlib.metadata.version("throttle-pro")
     if installed_version != throttle.__version__:
         raise SystemExit(
             "wheel metadata/package version mismatch: "

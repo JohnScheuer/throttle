@@ -93,7 +93,7 @@ class SimilarityCache:
                 logger.warning(
                     "Embeddings requested but dependencies not installed. "
                     "Falling back to Jaccard-only matching. "
-                    "Install with: pip install throttle-bench[embeddings]"
+                    "Install with: pip install throttle-pro[embeddings]"
                 )
                 self._embedding_fallback_logged = True
                 self.enable_embeddings = False

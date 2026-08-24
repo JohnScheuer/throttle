@@ -23,7 +23,7 @@ session.
 
 The following checks passed against the completed v1:
 
-- Python 3.14.6, `throttle-bench` 0.1.0, and `httpx` 0.28.1.
+- Python 3.14.6, `throttle-pro` 0.1.0, and `httpx` 0.28.1.
 - 12/12 `unittest` cases passed.
 - `compileall` passed for `src` and `tests`.
 - `pip check` reported no broken requirements.

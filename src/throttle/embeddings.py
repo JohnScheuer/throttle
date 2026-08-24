@@ -33,7 +33,7 @@ class _DirectEmbedder:
         if not EMBEDDINGS_AVAILABLE:
             raise ImportError(
                 "Embedding dependencies not installed. "
-                "Install with: pip install throttle-bench[embeddings]"
+                "Install with: pip install throttle-pro[embeddings]"
             )
 
         # Download pre-exported ONNX model and tokenizer
