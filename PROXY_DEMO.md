@@ -1,34 +1,46 @@
 # Throttle Proxy - OpenAI-Compatible Caching Proxy
 
-The Throttle proxy is a lightweight HTTP server that sits in front of real inference backends (vLLM, Ollama, SGLang, LMDeploy) and caches responses using semantic similarity matching.
+The Throttle proxy is a lightweight HTTP server that sits in front of real inference backends (vLLM, Ollama, SGLang, LMDeploy) and caches responses using lexical similarity matching (Jaccard token-overlap).
 
 ## Features
 
 - **OpenAI-Compatible API**: Drop-in replacement for `/v1/chat/completions` endpoint
-- **Semantic Caching**: Uses Jaccard similarity for prompt matching (not exact string matching)
+- **Similarity Caching**: Uses Jaccard token-overlap for prompt matching (lexical, not semantic - see Limitations)
 - **Streaming Support**: Handles both streaming and non-streaming requests
 - **Real-time Cache**: In-memory cache with configurable TTL and max size
 - **Zero Backend Changes**: Works with any OpenAI-compatible backend
 
 ## Quick Start
 
-### 1. Start the Proxy
+Follow these steps to go from clone to a verified cache hit:
+
+### 1. Install Throttle and Start Ollama
+
+```bash
+# Install Ollama from https://ollama.com/download if not already installed
+ollama pull llama3.2:1b
+ollama serve  # Leave running in background
+```
+
+### 2. Start the Proxy
+
+The proxy appends `/v1/chat/completions` to the backend URL automatically, so provide the base URL without `/v1`:
 
 ```bash
 throttle proxy \
   --backend-url http://localhost:11434 \
   --enable-cache \
-  --port 8080 \
-  --cache-ttl-seconds 3600 \
-  --cache-max-size 1000 \
-  --cache-similarity-threshold 0.85
+  --port 8080
 ```
 
-This starts a proxy server on `http://localhost:8080` that forwards requests to Ollama running on `http://localhost:11434`.
+You should see:
+```
+Starting Throttle proxy server on 127.0.0.1:8080
+Backend: http://localhost:11434
+Cache enabled: True
+```
 
-### 2. Send Requests Through the Proxy
-
-**Using curl (non-streaming):**
+### 3. Send First Request (Cache Miss)
 
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -36,57 +48,91 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{
     "model": "llama3.2:1b",
     "messages": [{"role": "user", "content": "What is the capital of France?"}],
-    "max_tokens": 50,
-    "stream": false
+    "max_tokens": 50
   }'
 ```
 
-**Using the OpenAI Python client:**
-
-```python
-from openai import OpenAI
-
-# Point the client to the proxy instead of the backend
-client = OpenAI(
-    base_url="http://localhost:8080/v1",
-    api_key="not-needed"  # Proxy passes through to backend
-)
-
-# First request - cache miss, goes to backend
-response1 = client.chat.completions.create(
-    model="llama3.2:1b",
-    messages=[{"role": "user", "content": "What is the capital of France?"}],
-    max_tokens=50
-)
-print(response1.choices[0].message.content)
-
-# Second request - cache hit, instant response
-response2 = client.chat.completions.create(
-    model="llama3.2:1b",
-    messages=[{"role": "user", "content": "What is the capital of France?"}],
-    max_tokens=50
-)
-print(response2.choices[0].message.content)
+Expected output (backend response):
+```json
+{
+  "id": "...",
+  "object": "chat.completion",
+  "created": ...,
+  "model": "llama3.2:1b",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "The capital of France is Paris."
+    },
+    "finish_reason": "stop"
+  }],
+  ...
+}
 ```
 
-### 3. Check Cache Stats
+### 4. Check Cache Stats (1 Miss)
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-Response:
+Expected output:
 ```json
 {
   "status": "ok",
   "cache_enabled": true,
   "cache_stats": {
-    "hits": 15,
-    "misses": 8,
-    "evictions": 0
+    "hits": 0,
+    "misses": 1,
+    "evictions": 0,
+    "backend_calls": 1
   }
 }
 ```
+
+### 5. Send Second IDENTICAL Request (Cache Hit)
+
+**IMPORTANT**: All scope parameters must match exactly for a cache hit:
+- Same `model`
+- Same `messages` (exact text)
+- Same `max_tokens`
+- Same `temperature` (if specified)
+- Any other sampling parameters
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:1b",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "max_tokens": 50
+  }'
+```
+
+Expected output: Same response as before, but served from cache (sub-millisecond latency).
+
+### 6. Verify Cache Hit
+
+```bash
+curl http://localhost:8080/health
+```
+
+Expected output shows `"hits": 1`:
+```json
+{
+  "status": "ok",
+  "cache_enabled": true,
+  "cache_stats": {
+    "hits": 1,
+    "misses": 1,
+    "evictions": 0,
+    "backend_calls": 1
+  }
+}
+```
+
+**Success!** You've verified a cache hit. The backend received only 1 request despite 2 client requests.
 
 ## Configuration Options
 
@@ -122,14 +168,7 @@ Response:
 
 ## Performance
 
-Validated test results with Ollama (llama3.2:1b) on 73-prompt realistic traffic:
-
-- **Cache hit latency**: 1.4ms median
-- **Cache miss latency**: 790.5ms median (backend inference time)
-- **Cache hit rate**: 10-11% baseline with Jaccard threshold 0.85
-
-Cache hits are served from memory without backend requests. Hit rate depends on
-traffic patterns and similarity threshold tuning.
+Cache hit latency is sub-millisecond (served from memory). Cache miss latency equals whatever the backend inference costs, since the request is forwarded to the backend. Hit rate depends on traffic patterns, similarity threshold tuning, and the Jaccard limitation on paraphrases (see Limitations below).
 
 ## Use Cases
 
@@ -140,10 +179,65 @@ traffic patterns and similarity threshold tuning.
 
 ## Limitations
 
+### Jaccard Similarity Cannot Match Paraphrases
+
+The cache uses **lexical** Jaccard token-overlap similarity (threshold 0.85), NOT semantic embeddings. This means **paraphrases will miss the cache** despite having identical meaning.
+
+**Concrete example that MISSES cache:**
+- Request 1: `"optimize PostgreSQL queries"`
+- Request 2: `"optimize database queries in PostgreSQL"`
+
+These have Jaccard similarity ~0.64 (below the 0.85 threshold) because the token sets differ significantly, even though the semantic meaning is identical. The second request will hit the backend.
+
+**What WILL hit cache:**
+- Request 1: `"What is the capital of France?"`
+- Request 2: `"What is the capital of France?"` (exact match)
+
+**Why not use semantic embeddings?** Lexical similarity is fast (sub-millisecond) and requires no model loading. A semantic embedding approach (ONNX-based two-tier matching) would catch paraphrases but adds latency and complexity.
+
+### Cache Scope: All Parameters Must Match Exactly
+
+Changing ANY of these parameters creates a NEW cache scope (no hit):
+- `model` - different models never share cache entries
+- `max_tokens` - affects response length, separate scope
+- `temperature` - affects randomness, separate scope
+- `top_p`, `frequency_penalty`, `presence_penalty` - all create separate scopes
+- Any custom backend parameters
+
+**Example scope miss:**
+```bash
+# Request 1: max_tokens=50
+curl ... -d '{"model": "llama3.2:1b", "messages": [...], "max_tokens": 50}'
+
+# Request 2: max_tokens=100 - MISSES cache despite same messages
+curl ... -d '{"model": "llama3.2:1b", "messages": [...], "max_tokens": 100}'
+```
+
+The `stream` parameter (true/false) does NOT create separate scopes - a cached response can be served as either streaming or non-streaming.
+
+### Error Behavior
+
+**Backend unreachable or timeout:**
+- Client receives HTTP 504 Gateway Timeout
+- Error message: `{"error": "Backend timeout: ..."}`
+- Failed responses are NOT cached
+
+**Backend returns error (4xx/5xx):**
+- Proxy forwards the exact status code and error body from backend
+- Error responses are NOT cached
+- Example: Backend 404 → Client sees 404 with backend's error message
+
+**Cache full (max_size reached):**
+- Oldest entries are evicted (FIFO)
+- No client-visible error
+- Check `/health` for `"evictions"` count
+
+### Other Limitations
+
 - **In-memory only**: Cache is lost when proxy restarts
 - **Single backend**: No multi-backend routing or load balancing
 - **No persistence**: No disk-based cache or distributed caching
-- **Similarity matching**: Jaccard threshold needs tuning for your use case
+- **No authentication**: Proxy does not validate API keys (passes through to backend)
 
 ## Difference from Benchmark Cache
 

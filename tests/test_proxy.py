@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import socket
 import time
 from multiprocessing import Process
 
@@ -24,6 +25,10 @@ def run_proxy_server(port: int):
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
 
 
+@pytest.mark.skipif(
+    getattr(socket, "_throttle_offline_guard_active", False),
+    reason="Integration test requires real Ollama backend at localhost:11434"
+)
 @pytest.mark.asyncio
 async def test_proxy_cache_hit_with_real_http_client():
     """Test that a real external HTTP client can get cache hits through the proxy."""
@@ -174,6 +179,10 @@ async def test_proxy_cache_hit_with_real_http_client():
             proxy_process.kill()
 
 
+@pytest.mark.skipif(
+    getattr(socket, "_throttle_offline_guard_active", False),
+    reason="Integration test requires real Ollama backend at localhost:11434"
+)
 @pytest.mark.asyncio
 async def test_proxy_streaming_with_cache():
     """Test that streaming responses work through the proxy with caching."""
