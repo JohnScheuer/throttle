@@ -514,6 +514,9 @@ def create_app(
     cache_ttl_seconds: float = 3600.0,
     cache_max_size: int = 1000,
     cache_similarity_threshold: float = 0.85,
+    enable_embeddings: bool = False,
+    embedding_threshold: float = 0.95,
+    embedding_max_entries_scanned: int = 256,
     # NOTE: 120s default is not evidence-based. 30s risks killing cold model loads and long generations.
     backend_timeout_seconds: float = 120.0,
 ) -> FastAPI:
@@ -535,6 +538,9 @@ def create_app(
         cache_ttl_seconds=cache_ttl_seconds,
         cache_max_size=cache_max_size,
         cache_similarity_threshold=cache_similarity_threshold,
+        enable_embeddings=enable_embeddings,
+        embedding_threshold=embedding_threshold,
+        embedding_max_entries_scanned=embedding_max_entries_scanned,
         backend_timeout_seconds=backend_timeout_seconds,
         lifespan=lifespan,
     )

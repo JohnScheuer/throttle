@@ -527,6 +527,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Jaccard similarity threshold (0.0-1.0, default: 0.85)",
     )
     proxy.add_argument(
+        "--enable-embeddings",
+        action="store_true",
+        help="enable ONNX semantic embedding tier (requires embeddings extra)",
+    )
+    proxy.add_argument(
+        "--embedding-threshold",
+        type=float,
+        default=0.95,
+        help="semantic embedding similarity threshold (0.0-1.0, default: 0.95)",
+    )
+    proxy.add_argument(
+        "--embedding-max-entries-scanned",
+        type=int,
+        default=256,
+        help="maximum cache entries scanned for embedding match (default: 256)",
+    )
+    proxy.add_argument(
         "--backend-timeout-seconds",
         type=float,
         default=120.0,
@@ -2073,6 +2090,9 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         cache_ttl_seconds=args.cache_ttl_seconds,
         cache_max_size=args.cache_max_size,
         cache_similarity_threshold=args.cache_similarity_threshold,
+        enable_embeddings=args.enable_embeddings,
+        embedding_threshold=args.embedding_threshold,
+        embedding_max_entries_scanned=args.embedding_max_entries_scanned,
         backend_timeout_seconds=args.backend_timeout_seconds,
     )
 
