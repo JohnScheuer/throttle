@@ -26,6 +26,7 @@ class CacheMetrics:
     hits: int = 0
     misses: int = 0
     evictions: int = 0
+    exact_hits: int = 0
     lexical_hits: int = 0
     embedding_hits: int = 0
     embedding_scans_attempted: int = 0
@@ -172,7 +173,7 @@ class SimilarityCache:
             # Fast-path: Exact match (O(1))
             if prompt in self._store:
                 self.metrics.hits += 1
-                self.metrics.lexical_hits += 1
+                self.metrics.exact_hits += 1
                 return (prompt, self._store[prompt].response_data)
 
             # Slow-path: Lexical match (O(N))
@@ -233,7 +234,7 @@ class SimilarityCache:
 
             # Fast-path: Exact match (O(1))
             if prompt in self._store:
-                self.metrics.lexical_hits += 1
+                self.metrics.exact_hits += 1
                 return (prompt, self._store[prompt].response_data)
 
             # Slow-path: Lexical match (O(N))

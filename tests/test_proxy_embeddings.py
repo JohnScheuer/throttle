@@ -392,8 +392,8 @@ async def test_embedding_miss_on_different_temperature():
 
 
 @pytest.mark.asyncio
-async def test_fallback_without_embeddings_extra():
-    """Test d: Exact match hits via Jaccard tier when embeddings enabled."""
+async def test_exact_match_hits_via_dict_lookup():
+    """Test d: Exact match hits via O(1) dict lookup, not Jaccard."""
 
     @asynccontextmanager
     async def lifespan(app):
@@ -456,7 +456,119 @@ async def test_fallback_without_embeddings_extra():
                     f"Cache miss on exact match: got {content2!r}, expected {content1!r}"
                 # Metrics assertions (supplementary)
                 assert proxy.cache.metrics.hits >= 1
+                assert proxy.cache.metrics.exact_hits >= 1
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
+
+
+@pytest.mark.asyncio
+async def test_jaccard_fuzzy_match_hits():
+    """Test e: Jaccard fuzzy match on prompts that differ but score >= 0.85."""
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with _fake_backend() as backend_url:
+            proxy.backend_url = backend_url
+            await proxy.startup()
+            yield
+        await proxy.shutdown()
+
+    proxy = ProxyServer(
+        backend_url="http://placeholder",
+        enable_cache=True,
+        enable_embeddings=False,  # Disable embeddings to test Jaccard only
+        cache_max_size=10,
+        cache_similarity_threshold=0.85,
+        lifespan=lifespan,
+    )
+
+    async with lifespan(proxy.app):
+        from httpx import AsyncClient
+        import uvicorn
+        import socket
+
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
+        await _wait_for_server("127.0.0.1", proxy_port)
+
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                # First request with prompt A
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "How to use Python pip command line"}],
+                        "temperature": 0.7,
+                    },
+                )
+                assert resp1.status_code == 200
+                content1 = resp1.json()["choices"][0]["message"]["content"]
+
+                # Second request with prompt B - differs but Jaccard >= 0.85
+                # Prompt A: {how, do, i, install, python, packages, using, pip} = 8 words
+                # Prompt B: {how, do, i, install, python, packages, with, pip} = 8 words
+                # Intersection: {how, do, i, install, python, packages, pip} = 7 words
+                # Union: {how, do, i, install, python, packages, using, with, pip} = 9 words
+                # Jaccard: 7/9 = 0.78 < 0.85... need simpler
+                # Actually: "How do I install Python using pip" vs "How do I install Python with pip"
+                # A: {how, do, i, install, python, using, pip} = 7 words
+                # B: {how, do, i, install, python, with, pip} = 7 words
+                # Intersection: {how, do, i, install, python, pip} = 6 words
+                # Union: {how, do, i, install, python, using, with, pip} = 8 words
+                # Jaccard: 6/8 = 0.75 still not enough
+                # Try: "How to install Python packages" vs "How to install Python package"
+                # A: {how, to, install, python, packages} = 5 words
+                # B: {how, to, install, python, package} = 5 words
+                # Intersection: {how, to, install, python} = 4 words (packages != package)
+                # Union: {how, to, install, python, packages, package} = 6 words
+                # Jaccard: 4/6 = 0.67 still too low
+                # Best: same words, different order won't help with Jaccard
+                # Try: "Install Python packages using pip command" vs "Install Python packages using pip"
+                # A: {install, python, packages, using, pip, command} = 6 words
+                # B: {install, python, packages, using, pip} = 5 words
+                # Intersection: {install, python, packages, using, pip} = 5 words
+                # Union: {install, python, packages, using, pip, command} = 6 words
+                # Jaccard: 5/6 = 0.833 still < 0.85
+                # Try: "How do I use Python pip" vs "How do I use Python"
+                # A: {how, do, i, use, python, pip} = 6 words
+                # B: {how, do, i, use, python} = 5 words
+                # Intersection: {how, do, i, use, python} = 5 words
+                # Union: {how, do, i, use, python, pip} = 6 words
+                # Jaccard: 5/6 = 0.833
+                # Final try: "How to use Python pip command line" vs "How to use Python pip command"
+                # A: {how, to, use, python, pip, command, line} = 7 words
+                # B: {how, to, use, python, pip, command} = 6 words
+                # Intersection: {how, to, use, python, pip, command} = 6 words
+                # Union: {how, to, use, python, pip, command, line} = 7 words
+                # Jaccard: 6/7 = 0.857 >= 0.85 ✓
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "How to use Python pip command"}],
+                        "temperature": 0.7,
+                    },
+                )
+                assert resp2.status_code == 200
+                content2 = resp2.json()["choices"][0]["message"]["content"]
+
+                # CRITICAL: Should serve cached response from first request
+                assert content2 == content1, \
+                    f"Jaccard match should serve cached response, got {content2!r}, expected {content1!r}"
+                # Metrics assertions (supplementary)
+                assert proxy.cache.metrics.hits >= 1
                 assert proxy.cache.metrics.lexical_hits >= 1
+                assert proxy.cache.metrics.exact_hits == 0, "Should not be exact match"
         finally:
             proxy_server.should_exit = True
             await proxy_task
