@@ -2329,6 +2329,10 @@ def _handle_demo(args: argparse.Namespace) -> int:
             pct_increase = (total_cost_delta / baseline_cost.total_dollars) * 100
             print(f"  Estimated increase: ${total_cost_delta:.4f} ({pct_increase:.1f}%)")
         print()
+        print(f"This result is for a workload with {arrival_rate:.0f} req/sec arrival rate")
+        print(f"and ~{mean_output} output tokens per request. The saving would be smaller")
+        print("under lighter traffic where neither configuration saturates.")
+        print()
         print("All estimates depend on ASSUMED throughput parameters.")
         print("Run 'throttle cost' against a real endpoint for measured costs.")
     print()
@@ -2562,11 +2566,13 @@ def _handle_tune(args: argparse.Namespace) -> int:
 
 
 def _handle_validate_sim(args: argparse.Namespace) -> int:
-    """Validate simulator accuracy against real measurements."""
+    """Validate simulator accuracy against real measurements at three load levels."""
     from throttle.simulator import VLLMSimulator, SimulatorConfig
     from throttle.workload import WorkloadGenerator
     from throttle.cost_model import calculate_cost
     import time
+    import json
+    from datetime import datetime
 
     try:
         import httpx
@@ -2578,116 +2584,218 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
     print("Throttle Simulator Validation")
     print("=" * 60)
     print()
-    print("Comparing simulator predictions to real GPU measurements...")
-    print()
 
-    # Generate a small test workload
-    workload_gen = WorkloadGenerator(seed=42)
-    workload = workload_gen.generate_chat_workload(
-        num_requests=10,
-        arrival_rate_requests_per_sec=1.0,
-        mean_prompt_tokens=100,
-        mean_output_tokens=50,
-    )
-
-    print(f"Test workload: {len(workload)} requests")
-    print(f"Endpoint: {args.endpoint_url}")
-    print()
-
-    # Run simulator
-    print("[SIMULATED] Running simulator...")
-    config = SimulatorConfig(
-        gpu_hourly_rate_dollars=args.gpu_hourly_rate,
-    )
-    sim = VLLMSimulator(config)
-    for arrival_time, prompt_tokens, output_tokens in workload:
-        sim.add_request(arrival_time, prompt_tokens, output_tokens)
-    sim_completed, sim_wall_clock = sim.run()
-
-    sim_input = sum(r.prompt_tokens for r in sim_completed)
-    sim_output = sum(r.tokens_generated for r in sim_completed)
-    sim_cost = calculate_cost(
-        input_tokens=sim_input,
-        output_tokens=sim_output,
-        wall_clock_seconds=sim_wall_clock,
-        gpu_hourly_rate_dollars=args.gpu_hourly_rate,
-    )
-
-    # Run real measurements
-    print("[MEASURED] Measuring real endpoint...")
-    real_input = 0
-    real_output = 0
-    real_start = time.time()
-
+    # Test endpoint connectivity first
+    print(f"Testing connection to {args.endpoint_url}...")
     try:
-        with httpx.Client(timeout=30.0) as client:
-            for i, (_, prompt_tokens, max_tokens) in enumerate(workload):
-                prompt = "Test " * prompt_tokens
-                response = client.post(
-                    f"{args.endpoint_url}/chat/completions",
-                    json={
-                        "model": args.model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens,
-                    },
-                )
-
-                if response.status_code != 200:
-                    print(f"Error: Request failed with status {response.status_code}")
-                    return EXIT_FAILED
-
-                data = response.json()
-                usage = data.get("usage", {})
-                real_input += usage.get("prompt_tokens", 0)
-                real_output += usage.get("completion_tokens", 0)
-
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                f"{args.endpoint_url}/chat/completions",
+                json={
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 1,
+                },
+            )
+            if response.status_code != 200:
+                print(f"Error: Endpoint returned status {response.status_code}")
+                print("Cannot reach endpoint. Check the URL and ensure the server is running.")
+                return EXIT_FAILED
     except httpx.RequestError as e:
-        print(f"Error: Failed to connect to endpoint: {e}")
+        print(f"Error: Cannot connect to endpoint: {e}")
+        print("Check that the endpoint URL is correct and the server is running.")
         return EXIT_FAILED
 
-    real_end = time.time()
-    real_wall_clock = real_end - real_start
+    print("Connection successful.")
+    print()
 
-    real_cost = calculate_cost(
-        input_tokens=real_input,
-        output_tokens=real_output,
-        wall_clock_seconds=real_wall_clock,
+    # Simulator config with all default parameters
+    sim_config = SimulatorConfig(
+        prefill_throughput_tokens_per_sec=5000.0,
+        decode_throughput_tokens_per_sec=100.0,
+        max_num_seqs=256,
+        saturation_knee_sequences=200,
+        kv_cache_capacity_tokens=500_000,
+        preemption_overhead_per_token_sec=0.0002,
+        saturation_penalty_at_max=2.0,
         gpu_hourly_rate_dollars=args.gpu_hourly_rate,
     )
 
-    # Compare results
-    print()
-    print("Validation Results")
-    print("=" * 60)
-    print()
+    # Test at three arrival rates to see if error grows with load
+    test_scenarios = [
+        {"name": "Light load", "arrival_rate": 1.0, "num_requests": 20},
+        {"name": "Medium load", "arrival_rate": 5.0, "num_requests": 50},
+        {"name": "Heavy load", "arrival_rate": 10.0, "num_requests": 100},
+    ]
 
-    wall_clock_error = abs(sim_wall_clock - real_wall_clock) / real_wall_clock * 100
-    cost_error = abs(sim_cost.total_dollars - real_cost.total_dollars) / real_cost.total_dollars * 100
+    validation_results = {
+        "endpoint_url": args.endpoint_url,
+        "model": args.model,
+        "gpu_hourly_rate": args.gpu_hourly_rate,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "simulator_config": {
+            "prefill_throughput_tokens_per_sec": sim_config.prefill_throughput_tokens_per_sec,
+            "decode_throughput_tokens_per_sec": sim_config.decode_throughput_tokens_per_sec,
+            "max_num_seqs": sim_config.max_num_seqs,
+            "saturation_knee_sequences": sim_config.saturation_knee_sequences,
+            "kv_cache_capacity_tokens": sim_config.kv_cache_capacity_tokens,
+            "preemption_overhead_per_token_sec": sim_config.preemption_overhead_per_token_sec,
+            "saturation_penalty_at_max": sim_config.saturation_penalty_at_max,
+        },
+        "scenarios": []
+    }
 
-    print(f"Wall Clock Time:")
-    print(f"  [SIMULATED] {sim_wall_clock:.2f} seconds")
-    print(f"  [MEASURED]  {real_wall_clock:.2f} seconds")
-    print(f"  Error: {wall_clock_error:.1f}%")
-    print()
+    workload_gen = WorkloadGenerator(seed=42)
 
-    print(f"Cost per Million Tokens:")
-    print(f"  [SIMULATED] Input: ${sim_cost.dollars_per_million_input_tokens:.2f}")
-    print(f"  [MEASURED]  Input: ${real_cost.dollars_per_million_input_tokens:.2f}")
-    print(f"  [SIMULATED] Output: ${sim_cost.dollars_per_million_output_tokens:.2f}")
-    print(f"  [MEASURED]  Output: ${real_cost.dollars_per_million_output_tokens:.2f}")
-    print()
+    for scenario in test_scenarios:
+        print(f"Running {scenario['name']} ({scenario['arrival_rate']:.0f} req/sec, {scenario['num_requests']} requests)...")
+        print()
 
-    print(f"Total Cost Error: {cost_error:.1f}%")
-    print()
+        # Generate workload
+        workload = workload_gen.generate_chat_workload(
+            num_requests=scenario['num_requests'],
+            arrival_rate_requests_per_sec=scenario['arrival_rate'],
+            mean_prompt_tokens=200,
+            mean_output_tokens=150,
+        )
 
-    if cost_error > 50:
-        print("WARNING: Simulator error > 50%. Simulator assumptions may not match this hardware.")
-        print("Consider measuring actual throughput and updating SimulatorConfig parameters.")
-    elif cost_error > 25:
-        print("NOTE: Simulator error > 25%. Some assumptions may need adjustment.")
-    else:
-        print("Simulator predictions are reasonably close to measurements.")
+        # Run simulator
+        sim = VLLMSimulator(sim_config)
+        for arrival_time, prompt_tokens, output_tokens in workload:
+            sim.add_request(arrival_time, prompt_tokens, output_tokens)
+        sim_completed, sim_wall_clock = sim.run()
 
+        sim_total_input = sum(r.prompt_tokens for r in sim_completed)
+        sim_total_output = sum(r.tokens_generated for r in sim_completed)
+        sim_cost = calculate_cost(
+            input_tokens=sim_total_input,
+            output_tokens=sim_total_output,
+            wall_clock_seconds=sim_wall_clock,
+            gpu_hourly_rate_dollars=args.gpu_hourly_rate,
+        )
+
+        # Run real measurements
+        measured_requests = []
+        real_total_input = 0
+        real_total_output = 0
+        overall_start = time.perf_counter_ns()
+        first_token_times = []
+
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                for i, (_, prompt_tokens, max_tokens) in enumerate(workload):
+                    prompt = "Test " * prompt_tokens
+
+                    req_start = time.perf_counter_ns()
+                    response = client.post(
+                        f"{args.endpoint_url}/chat/completions",
+                        json={
+                            "model": args.model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": max_tokens,
+                        },
+                    )
+                    req_end = time.perf_counter_ns()
+
+                    if response.status_code != 200:
+                        print(f"Error: Request {i+1} failed with status {response.status_code}")
+                        return EXIT_FAILED
+
+                    data = response.json()
+                    usage = data.get("usage", {})
+                    actual_input = usage.get("prompt_tokens", 0)
+                    actual_output = usage.get("completion_tokens", 0)
+
+                    real_total_input += actual_input
+                    real_total_output += actual_output
+
+                    req_duration_ns = req_end - req_start
+                    measured_requests.append({
+                        "prompt_tokens": actual_input,
+                        "completion_tokens": actual_output,
+                        "duration_seconds": req_duration_ns / 1e9,
+                    })
+
+                    # Estimate TTFT (crude: assume linear generation)
+                    if actual_output > 0:
+                        est_ttft_ns = req_duration_ns // (actual_output + 1)
+                        first_token_times.append(est_ttft_ns / 1e9)
+
+        except httpx.RequestError as e:
+            print(f"Error: Request failed: {e}")
+            return EXIT_FAILED
+
+        overall_end = time.perf_counter_ns()
+        real_wall_clock = (overall_end - overall_start) / 1e9
+
+        real_cost = calculate_cost(
+            input_tokens=real_total_input,
+            output_tokens=real_total_output,
+            wall_clock_seconds=real_wall_clock,
+            gpu_hourly_rate_dollars=args.gpu_hourly_rate,
+        )
+
+        # Calculate metrics
+        sim_input_throughput = sim_total_input / sim_wall_clock if sim_wall_clock > 0 else 0
+        sim_output_throughput = sim_total_output / sim_wall_clock if sim_wall_clock > 0 else 0
+        real_input_throughput = real_total_input / real_wall_clock if real_wall_clock > 0 else 0
+        real_output_throughput = real_total_output / real_wall_clock if real_wall_clock > 0 else 0
+
+        avg_ttft = sum(first_token_times) / len(first_token_times) if first_token_times else 0
+
+        # Calculate errors
+        wall_clock_error_pct = ((sim_wall_clock - real_wall_clock) / real_wall_clock) * 100 if real_wall_clock > 0 else 0
+        input_throughput_error_pct = ((sim_input_throughput - real_input_throughput) / real_input_throughput) * 100 if real_input_throughput > 0 else 0
+        output_throughput_error_pct = ((sim_output_throughput - real_output_throughput) / real_output_throughput) * 100 if real_output_throughput > 0 else 0
+        cost_per_m_error_pct = ((sim_cost.dollars_per_million_input_tokens - real_cost.dollars_per_million_input_tokens) / real_cost.dollars_per_million_input_tokens) * 100 if real_cost.dollars_per_million_input_tokens > 0 else 0
+
+        # Print comparison
+        print(f"  Metric                      Simulated      Measured    Error")
+        print(f"  -------------------------  -----------  -----------  --------")
+        print(f"  Wall clock (s)             {sim_wall_clock:11.2f}  {real_wall_clock:11.2f}  {wall_clock_error_pct:+7.1f}%")
+        print(f"  Input tok/sec              {sim_input_throughput:11.1f}  {real_input_throughput:11.1f}  {input_throughput_error_pct:+7.1f}%")
+        print(f"  Output tok/sec             {sim_output_throughput:11.1f}  {real_output_throughput:11.1f}  {output_throughput_error_pct:+7.1f}%")
+        print(f"  TTFT (s)                   {'N/A':>11}  {avg_ttft:11.3f}  {'N/A':>8}")
+        print(f"  $/M input tokens           {sim_cost.dollars_per_million_input_tokens:11.2f}  {real_cost.dollars_per_million_input_tokens:11.2f}  {cost_per_m_error_pct:+7.1f}%")
+        print()
+
+        # Store results
+        validation_results["scenarios"].append({
+            "name": scenario["name"],
+            "arrival_rate_req_per_sec": scenario["arrival_rate"],
+            "num_requests": scenario["num_requests"],
+            "simulated": {
+                "wall_clock_seconds": sim_wall_clock,
+                "input_throughput_tok_per_sec": sim_input_throughput,
+                "output_throughput_tok_per_sec": sim_output_throughput,
+                "dollars_per_million_input": sim_cost.dollars_per_million_input_tokens,
+                "dollars_per_million_output": sim_cost.dollars_per_million_output_tokens,
+                "total_dollars": sim_cost.total_dollars,
+            },
+            "measured": {
+                "wall_clock_seconds": real_wall_clock,
+                "input_throughput_tok_per_sec": real_input_throughput,
+                "output_throughput_tok_per_sec": real_output_throughput,
+                "avg_ttft_seconds": avg_ttft,
+                "dollars_per_million_input": real_cost.dollars_per_million_input_tokens,
+                "dollars_per_million_output": real_cost.dollars_per_million_output_tokens,
+                "total_dollars": real_cost.total_dollars,
+                "per_request_timings": measured_requests,
+            },
+            "errors_pct": {
+                "wall_clock": wall_clock_error_pct,
+                "input_throughput": input_throughput_error_pct,
+                "output_throughput": output_throughput_error_pct,
+                "cost_per_million_input": cost_per_m_error_pct,
+            }
+        })
+
+    # Write JSON output
+    output_file = f"validation_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(output_file, 'w') as f:
+        json.dump(validation_results, f, indent=2)
+
+    print(f"Full results written to: {output_file}")
     print()
 
     return EXIT_OK
