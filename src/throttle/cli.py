@@ -530,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     embeddings_group.add_argument(
         "--enable-embeddings",
         action="store_true",
-        help="enable ONNX semantic embedding tier (requires embeddings extra); default: auto-enabled when cache is on and extra is installed",
+        help="enable ONNX semantic embedding tier (requires embeddings extra); default: OFF",
     )
     embeddings_group.add_argument(
         "--no-embeddings",
@@ -2076,14 +2076,11 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         )
         return EXIT_FAILED
 
-    # Resolve embeddings: --enable-cache implies embeddings when extra installed
-    # unless explicitly disabled with --no-embeddings
+    # Resolve embeddings: only enabled if explicitly requested with --enable-embeddings
     enable_embeddings_resolved = False
     if args.no_embeddings:
         enable_embeddings_resolved = False
     elif args.enable_embeddings:
-        enable_embeddings_resolved = True
-    elif args.enable_cache and embeddings.EMBEDDINGS_AVAILABLE:
         enable_embeddings_resolved = True
 
     print(f"Starting Throttle proxy server on {args.host}:{args.port}")
