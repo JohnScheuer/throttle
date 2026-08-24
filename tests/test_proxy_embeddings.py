@@ -20,14 +20,15 @@ async def _wait_for_server(host: str, port: int, timeout: float = 5.0):
     interval = 0.05  # 50ms between attempts
 
     while time.time() - start < timeout:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(0.5)
             sock.connect((host, port))
-            sock.close()
             return  # Success
         except (ConnectionRefusedError, OSError):
             await asyncio.sleep(interval)
+        finally:
+            sock.close()
 
     raise TimeoutError(f"Server at {host}:{port} did not accept connections within {timeout}s")
 
