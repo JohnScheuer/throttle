@@ -113,7 +113,6 @@ async def test_embedding_hit_that_jaccard_misses():
 
     async with lifespan(proxy.app):
         from httpx import AsyncClient
-        from starlette.testclient import TestClient
         import socket
 
         # Start proxy on real port
