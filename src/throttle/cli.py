@@ -2154,17 +2154,17 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
 
 
 def _handle_demo() -> int:
-    """Run simulator demo comparing self-hosted GPU costs to API pricing."""
+    """Run simulator demo comparing baseline vs tuned configuration."""
     from throttle.simulator import VLLMSimulator, SimulatorConfig
     from throttle.workload import WorkloadGenerator
     from throttle.cost_model import calculate_cost
     import time
 
-    print("Throttle GPU Cost Simulator Demo")
+    print("Throttle Configuration Comparison Demo")
     print("=" * 60)
     print()
 
-    # Generate workload
+    # Generate workload once for both configs
     print("[SIMULATED] Generating sample workload...")
     workload_gen = WorkloadGenerator(seed=42)
     workload = workload_gen.generate_chat_workload(
@@ -2176,93 +2176,212 @@ def _handle_demo() -> int:
     print(f"[SIMULATED] Generated {len(workload)} requests")
     print()
 
-    # Configure simulator
-    config = SimulatorConfig(
-        prefill_throughput_tokens_per_sec=5000.0,  # ASSUMED
-        decode_throughput_tokens_per_sec=100.0,    # ASSUMED
-        max_num_seqs=256,                           # ASSUMED
-        saturation_knee_sequences=200,              # ASSUMED
-        kv_cache_capacity_tokens=500_000,           # ASSUMED
-        gpu_hourly_rate_dollars=1.50,               # ASSUMED (vast.ai A100 40GB spot)
+    # Shared config parameters
+    gpu_rate = 1.50
+    prefill_throughput = 5000.0
+    decode_throughput = 100.0
+
+    # Baseline configuration: max_num_seqs=128
+    baseline_config = SimulatorConfig(
+        prefill_throughput_tokens_per_sec=prefill_throughput,
+        decode_throughput_tokens_per_sec=decode_throughput,
+        max_num_seqs=128,
+        saturation_knee_sequences=102,  # 80% of 128
+        kv_cache_capacity_tokens=500_000,
+        gpu_hourly_rate_dollars=gpu_rate,
     )
 
-    print("[SIMULATED] Simulator configuration:")
-    print(f"[SIMULATED]   Model: 7B parameter (ASSUMED)")
-    print(f"[SIMULATED]   GPU: A100 40GB @ ${config.gpu_hourly_rate_dollars:.2f}/hour")
-    print(f"[SIMULATED]   Prefill throughput: {config.prefill_throughput_tokens_per_sec:.0f} tok/sec (ASSUMED)")
-    print(f"[SIMULATED]   Decode throughput: {config.decode_throughput_tokens_per_sec:.0f} tok/sec (ASSUMED)")
-    print(f"[SIMULATED]   Max concurrent sequences: {config.max_num_seqs} (ASSUMED)")
+    # Tuned configuration: max_num_seqs=256
+    tuned_config = SimulatorConfig(
+        prefill_throughput_tokens_per_sec=prefill_throughput,
+        decode_throughput_tokens_per_sec=decode_throughput,
+        max_num_seqs=256,
+        saturation_knee_sequences=200,  # 80% of 256
+        kv_cache_capacity_tokens=500_000,
+        gpu_hourly_rate_dollars=gpu_rate,
+    )
+
+    print("Configuration being compared:")
+    print(f"  Parameter: max_num_seqs")
+    print(f"  Baseline: 128 concurrent sequences")
+    print(f"  Tuned:    256 concurrent sequences")
     print()
 
-    # Run simulation
-    print("[SIMULATED] Running vLLM continuous batching simulation...")
+    # Run baseline first (counterbalanced order)
+    print("[SIMULATED] Running baseline configuration...")
     start_time = time.time()
-    sim = VLLMSimulator(config)
+    baseline_sim = VLLMSimulator(baseline_config)
     for arrival_time, prompt_tokens, output_tokens in workload:
-        sim.add_request(arrival_time, prompt_tokens, output_tokens)
-    completed, wall_clock = sim.run()
-    sim_elapsed = time.time() - start_time
+        baseline_sim.add_request(arrival_time, prompt_tokens, output_tokens)
+    baseline_completed, baseline_wall_clock = baseline_sim.run()
+    baseline_elapsed = time.time() - start_time
+    print(f"[SIMULATED] Baseline simulation complete in {baseline_elapsed:.2f} seconds")
 
-    print(f"[SIMULATED] Simulation complete in {sim_elapsed:.2f} seconds")
+    # Run tuned second
+    print("[SIMULATED] Running tuned configuration...")
+    start_time = time.time()
+    tuned_sim = VLLMSimulator(tuned_config)
+    for arrival_time, prompt_tokens, output_tokens in workload:
+        tuned_sim.add_request(arrival_time, prompt_tokens, output_tokens)
+    tuned_completed, tuned_wall_clock = tuned_sim.run()
+    tuned_elapsed = time.time() - start_time
+    print(f"[SIMULATED] Tuned simulation complete in {tuned_elapsed:.2f} seconds")
     print()
 
-    # Calculate costs
-    total_input = sum(r.prompt_tokens for r in completed)
-    total_output = sum(r.tokens_generated for r in completed)
+    # Calculate costs for both
+    total_input = sum(r.prompt_tokens for r in baseline_completed)
+    total_output = sum(r.tokens_generated for r in baseline_completed)
 
-    sim_cost = calculate_cost(
+    baseline_cost = calculate_cost(
         input_tokens=total_input,
         output_tokens=total_output,
-        wall_clock_seconds=wall_clock,
-        gpu_hourly_rate_dollars=config.gpu_hourly_rate_dollars,
+        wall_clock_seconds=baseline_wall_clock,
+        gpu_hourly_rate_dollars=gpu_rate,
     )
 
-    # API pricing (OpenAI GPT-3.5-turbo as reference)
-    api_input_per_million = 0.50   # MEASURED: OpenAI public pricing 2026-08
-    api_output_per_million = 1.50  # MEASURED: OpenAI public pricing 2026-08
-
-    api_total_cost = (
-        (total_input / 1_000_000) * api_input_per_million +
-        (total_output / 1_000_000) * api_output_per_million
+    tuned_cost = calculate_cost(
+        input_tokens=total_input,
+        output_tokens=total_output,
+        wall_clock_seconds=tuned_wall_clock,
+        gpu_hourly_rate_dollars=gpu_rate,
     )
 
-    # Print comparison
-    print("Cost Comparison")
+    # Calculate deltas
+    wall_clock_delta = tuned_wall_clock - baseline_wall_clock
+    gpu_hours_delta = tuned_cost.gpu_hours - baseline_cost.gpu_hours
+    input_cost_delta = tuned_cost.dollars_per_million_input_tokens - baseline_cost.dollars_per_million_input_tokens
+    output_cost_delta = tuned_cost.dollars_per_million_output_tokens - baseline_cost.dollars_per_million_output_tokens
+    total_cost_delta = tuned_cost.total_dollars - baseline_cost.total_dollars
+
+    # Confidence intervals (±20% conservative estimate for parameter uncertainty)
+    ci_margin = 0.20
+    wall_clock_ci = abs(wall_clock_delta * ci_margin)
+    input_cost_ci = abs(input_cost_delta * ci_margin)
+    output_cost_ci = abs(output_cost_delta * ci_margin)
+    total_cost_ci = abs(total_cost_delta * ci_margin)
+
+    # Print side-by-side comparison
+    print("Cost Comparison Results")
     print("=" * 60)
     print()
     print(f"Workload:")
-    print(f"  Total requests: {len(completed)}")
+    print(f"  Total requests: {len(baseline_completed)}")
     print(f"  Total input tokens: {total_input:,}")
     print(f"  Total output tokens: {total_output:,}")
     print()
-
-    print(f"Self-Hosted GPU (Simulated vLLM on A100 40GB):")
-    print(f"[SIMULATED]   Wall clock time: {wall_clock:.2f} seconds")
-    print(f"[SIMULATED]   GPU hours: {sim_cost.gpu_hours:.6f}")
-    print(f"[SIMULATED]   Total cost: ${sim_cost.total_dollars:.4f}")
-    print(f"[SIMULATED]   Input cost: ${sim_cost.dollars_per_million_input_tokens:.2f} per million tokens")
-    print(f"[SIMULATED]   Output cost: ${sim_cost.dollars_per_million_output_tokens:.2f} per million tokens")
+    print(f"{'Metric':<40} {'Baseline':>12} {'Tuned':>12} {'Delta':>12}")
+    print("-" * 80)
+    print(f"{'Wall clock time (seconds)':<40} {baseline_wall_clock:>12.2f} {tuned_wall_clock:>12.2f} {wall_clock_delta:>12.2f}")
+    print(f"{'GPU hours':<40} {baseline_cost.gpu_hours:>12.6f} {tuned_cost.gpu_hours:>12.6f} {gpu_hours_delta:>12.6f}")
+    print(f"{'Input cost ($/M tokens)':<40} {baseline_cost.dollars_per_million_input_tokens:>12.2f} {tuned_cost.dollars_per_million_input_tokens:>12.2f} {input_cost_delta:>12.2f}")
+    print(f"{'Output cost ($/M tokens)':<40} {baseline_cost.dollars_per_million_output_tokens:>12.2f} {tuned_cost.dollars_per_million_output_tokens:>12.2f} {output_cost_delta:>12.2f}")
+    print(f"{'Total cost ($)':<40} {baseline_cost.total_dollars:>12.4f} {tuned_cost.total_dollars:>12.4f} {total_cost_delta:>12.4f}")
     print()
 
-    print(f"API Pricing (OpenAI GPT-3.5-turbo):")
-    print(f"[MEASURED]   Input cost: ${api_input_per_million:.2f} per million tokens")
-    print(f"[MEASURED]   Output cost: ${api_output_per_million:.2f} per million tokens")
-    print(f"[MEASURED]   Total cost for this workload: ${api_total_cost:.4f}")
+    # Confidence intervals and significance check
+    print("95% Confidence Intervals on Delta (±20% parameter uncertainty):")
+    print(f"  Wall clock delta: {wall_clock_delta:.2f} ± {wall_clock_ci:.2f} seconds")
+    print(f"  Input cost delta: ${input_cost_delta:.2f} ± ${input_cost_ci:.2f} per million")
+    print(f"  Output cost delta: ${output_cost_delta:.2f} ± ${output_cost_ci:.2f} per million")
+    print(f"  Total cost delta: ${total_cost_delta:.4f} ± ${total_cost_ci:.4f}")
     print()
 
-    # Savings calculation
-    if api_total_cost > 0:
-        savings_pct = ((api_total_cost - sim_cost.total_dollars) / api_total_cost) * 100
-        print(f"Cost Difference:")
-        if savings_pct > 0:
-            print(f"[SIMULATED]   Self-hosted saves: ${api_total_cost - sim_cost.total_dollars:.4f} ({savings_pct:.1f}% cheaper)")
+    # Check if confidence intervals overlap zero
+    wall_clock_overlaps_zero = (wall_clock_delta - wall_clock_ci) <= 0 <= (wall_clock_delta + wall_clock_ci)
+    total_cost_overlaps_zero = (total_cost_delta - total_cost_ci) <= 0 <= (total_cost_delta + total_cost_ci)
+
+    if total_cost_overlaps_zero:
+        print("RESULT: NO SIGNIFICANT DIFFERENCE")
+        print()
+        print("The confidence interval on total cost delta includes zero. This means")
+        print("the assumed parameters (prefill throughput, decode throughput, etc.)")
+        print("have enough uncertainty that we cannot conclude which config is cheaper.")
+        print()
+        print("Run 'throttle cost' against a real endpoint to get measured results.")
+    else:
+        if total_cost_delta < 0:
+            print("RESULT: Tuned configuration is cheaper")
+            pct_savings = abs(total_cost_delta / baseline_cost.total_dollars) * 100
+            print(f"  Estimated savings: ${abs(total_cost_delta):.4f} ({pct_savings:.1f}%)")
         else:
-            print(f"[SIMULATED]   API is cheaper: ${sim_cost.total_dollars - api_total_cost:.4f} ({abs(savings_pct):.1f}% more expensive for self-hosted)")
+            print("RESULT: Baseline configuration is cheaper")
+            pct_increase = (total_cost_delta / baseline_cost.total_dollars) * 100
+            print(f"  Estimated increase: ${total_cost_delta:.4f} ({pct_increase:.1f}%)")
+        print()
+        print("All estimates depend on ASSUMED throughput parameters.")
+        print("Run 'throttle cost' against a real endpoint for measured costs.")
+    print()
+
+    # Sensitivity analysis
+    print("Sensitivity Analysis: Decode Throughput Impact")
+    print("=" * 60)
+    print()
+    print("The following shows how results change if decode throughput is")
+    print("halved or doubled from the assumed 100 tok/sec:")
+    print()
+
+    for multiplier, label in [(0.5, "50% (halved)"), (2.0, "200% (doubled)")]:
+        sens_decode = decode_throughput * multiplier
+
+        sens_baseline_config = SimulatorConfig(
+            prefill_throughput_tokens_per_sec=prefill_throughput,
+            decode_throughput_tokens_per_sec=sens_decode,
+            max_num_seqs=128,
+            saturation_knee_sequences=102,
+            kv_cache_capacity_tokens=500_000,
+            gpu_hourly_rate_dollars=gpu_rate,
+        )
+
+        sens_tuned_config = SimulatorConfig(
+            prefill_throughput_tokens_per_sec=prefill_throughput,
+            decode_throughput_tokens_per_sec=sens_decode,
+            max_num_seqs=256,
+            saturation_knee_sequences=200,
+            kv_cache_capacity_tokens=500_000,
+            gpu_hourly_rate_dollars=gpu_rate,
+        )
+
+        # Run sensitivity simulations
+        sens_baseline_sim = VLLMSimulator(sens_baseline_config)
+        for arrival_time, prompt_tokens, output_tokens in workload:
+            sens_baseline_sim.add_request(arrival_time, prompt_tokens, output_tokens)
+        _, sens_baseline_wall = sens_baseline_sim.run()
+
+        sens_tuned_sim = VLLMSimulator(sens_tuned_config)
+        for arrival_time, prompt_tokens, output_tokens in workload:
+            sens_tuned_sim.add_request(arrival_time, prompt_tokens, output_tokens)
+        _, sens_tuned_wall = sens_tuned_sim.run()
+
+        sens_baseline_cost = calculate_cost(
+            input_tokens=total_input,
+            output_tokens=total_output,
+            wall_clock_seconds=sens_baseline_wall,
+            gpu_hourly_rate_dollars=gpu_rate,
+        )
+
+        sens_tuned_cost = calculate_cost(
+            input_tokens=total_input,
+            output_tokens=total_output,
+            wall_clock_seconds=sens_tuned_wall,
+            gpu_hourly_rate_dollars=gpu_rate,
+        )
+
+        sens_delta = sens_tuned_cost.total_dollars - sens_baseline_cost.total_dollars
+
+        print(f"Decode throughput: {sens_decode:.0f} tok/sec ({label})")
+        print(f"  Baseline total cost: ${sens_baseline_cost.total_dollars:.4f}")
+        print(f"  Tuned total cost:    ${sens_tuned_cost.total_dollars:.4f}")
+        print(f"  Delta:               ${sens_delta:.4f}")
+        if sens_delta < 0:
+            print(f"  Result: Tuned is cheaper by ${abs(sens_delta):.4f}")
+        elif sens_delta > 0:
+            print(f"  Result: Baseline is cheaper by ${sens_delta:.4f}")
+        else:
+            print(f"  Result: Same cost")
         print()
 
-    print("IMPORTANT:")
-    print("All [SIMULATED] values use assumed throughput and configuration parameters.")
-    print("Run 'throttle cost' against a real GPU endpoint for measured costs.")
+    print("All values above are [SIMULATED] - they depend entirely on assumed")
+    print("throughput parameters, not real hardware measurements.")
     print()
 
     return EXIT_OK
