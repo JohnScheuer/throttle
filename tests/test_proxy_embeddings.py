@@ -42,6 +42,7 @@ async def _fake_backend():
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
     import uvicorn
+    import socket
 
     app = FastAPI()
 
@@ -50,15 +51,16 @@ async def _fake_backend():
         response = await handler(request)
         return JSONResponse(response)
 
-    # Port 0: auto-assign available port
-    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+    # Bind socket to loopback with auto-assigned port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
     server = uvicorn.Server(config)
 
-    task = asyncio.create_task(server.serve())
+    task = asyncio.create_task(server.serve(sockets=[sock]))
     await asyncio.sleep(0.5)  # Let server start
-
-    # Extract assigned port from server
-    port = server.servers[0].sockets[0].getsockname()[1]
 
     try:
         yield f"http://127.0.0.1:{port}"
@@ -90,15 +92,21 @@ async def test_embedding_hit_that_jaccard_misses():
     async with lifespan(proxy.app):
         from httpx import AsyncClient
         from starlette.testclient import TestClient
+        import socket
 
         # Start proxy on real port
         import uvicorn
-        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
-        proxy_task = asyncio.create_task(proxy_server.serve())
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
         await asyncio.sleep(0.5)
 
-        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
         try:
@@ -159,13 +167,18 @@ async def test_embedding_miss_on_different_model():
     async with lifespan(proxy.app):
         from httpx import AsyncClient
         import uvicorn
+        import socket
 
-        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
-        proxy_task = asyncio.create_task(proxy_server.serve())
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
         await asyncio.sleep(0.5)
 
-        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
         try:
@@ -217,13 +230,18 @@ async def test_embedding_miss_on_different_temperature():
     async with lifespan(proxy.app):
         from httpx import AsyncClient
         import uvicorn
+        import socket
 
-        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
-        proxy_task = asyncio.create_task(proxy_server.serve())
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
         await asyncio.sleep(0.5)
 
-        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
         try:
@@ -277,13 +295,18 @@ async def test_fallback_without_embeddings_extra():
     async with lifespan(proxy.app):
         from httpx import AsyncClient
         import uvicorn
+        import socket
 
-        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
-        proxy_task = asyncio.create_task(proxy_server.serve())
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
         await asyncio.sleep(0.5)
 
-        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
         try:
@@ -336,13 +359,18 @@ async def test_embedding_miss_on_cross_scope():
     async with lifespan(proxy.app):
         from httpx import AsyncClient
         import uvicorn
+        import socket
 
-        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
-        proxy_task = asyncio.create_task(proxy_server.serve())
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
         await asyncio.sleep(0.5)
 
-        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
         try:
