@@ -131,8 +131,17 @@ class ProxyServer:
             if k not in excluded
         }
 
-        # Include backend URL in scope when using per-model routing
-        # This prevents cache collisions when different backends serve same model name
+        # Include backend URL in scope when using per-model routing.
+        #
+        # NOTE: The collision this guards (same model name routing to different backends)
+        # is NOT reachable with the current in-memory, per-process cache and dict-based
+        # model_backends (dict keys must be unique, so one model name cannot map to two
+        # backends). This is defensive programming for a future persisted or shared cache.
+        #
+        # Without this field, two ProxyServer instances with different model_backends
+        # mappings sharing a persisted cache could collide: both map "gpt-4" to different
+        # backends, and requests with identical parameters would incorrectly share cache
+        # entries despite hitting different backends.
         if self.model_backends:
             model = request_body.get("model", "")
             backend_url = self._get_backend_url(model)

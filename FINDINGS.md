@@ -75,3 +75,26 @@ If the primary request to the backend hangs, all concurrent waiters for that sam
 **Production verification:** SIGTERM test with 20 sequential cache hits (19 cache hits, 1 backend call) completed cleanly with no transport warnings, confirming production code (src/throttle/proxy.py) properly closes httpx.AsyncClient via ProxyServer.shutdown().
 
 **CI run 32669184879 (post-fix):** 346 passed, 3 skipped, 0 failed, 0 errors across all Python versions.
+
+## Phase 3: Backend URL in Scope Key (Defensive)
+
+**Finding:** Commit da91565 adds backend URL to scope_key when model_backends is non-empty.
+
+**Purpose:** Prevents cache collision when same model name routes to different backends.
+
+**Reachability:** The collision this guards is **NOT reachable** with current implementation:
+- Cache is in-memory, per-process (no persistence across restarts)
+- model_backends is Dict[str, str] (dict keys must be unique)
+- Cannot map same model name to two different backends on one instance
+- No shared cache between ProxyServer instances
+
+**Why it exists:** Defensive programming for future persisted or shared cache. If two ProxyServer instances with different model_backends mappings share a persisted cache (e.g., Redis), both could map "gpt-4" to different backends. Without backend URL in scope_key, requests with identical parameters would incorrectly share cache entries despite hitting different backends.
+
+**Current impact:**
+- Scope key format changes for ALL users with model_backends configured
+- Before: `{"model": "gpt-4", "temperature": 0.7}`
+- After: `{"_backend_url": "http://backend-1:8000", "model": "gpt-4", "temperature": 0.7}`
+- Cache doesn't persist, so no orphaned entries on configuration change
+- Backwards compatible when model_backends is empty (test_legacy_scope_key_format verifies)
+
+**Code location:** src/throttle/proxy.py:134-148 (with full explanation in comments)

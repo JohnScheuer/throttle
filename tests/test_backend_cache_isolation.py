@@ -11,18 +11,19 @@ from throttle.proxy import ProxyServer
 class TestBackendCacheIsolation(unittest.IsolatedAsyncioTestCase):
     """Test that same model name on different backends maintains cache isolation."""
 
-    async def test_same_model_different_backends_isolated_responses(self):
-        """Same model name on different backends should not share cache entries.
+    async def test_different_models_different_backends_isolated_responses(self):
+        """Different model names routed to different backends each get their own response.
 
-        This test verifies the fix for cache collision when:
-        - Two backends both serve a model with the same name
-        - Same prompt sent to each backend via model_backends routing
+        This test verifies that:
+        - Two different model names in model_backends route to different backends
+        - Same prompt sent to each model via model_backends routing
         - Each caller receives its own backend's response, not the other's
 
-        Without the fix: Caller B receives backend A's cached response.
-        With the fix: Each backend's responses are isolated by backend URL in scope_key.
+        This ensures basic routing and cache isolation work correctly when model
+        names differ. Note: the collision scenario (same model name, different backends)
+        is not reachable with a dict-based model_backends mapping.
         """
-        # Setup: Two backends serving model "shared-model" with different responses
+        # Setup: Two different model names routed to different backends
         model_backends = {
             "model-a": "http://backend-1:8000",
             "model-b": "http://backend-2:9000",
