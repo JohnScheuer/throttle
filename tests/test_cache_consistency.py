@@ -121,3 +121,32 @@ def test_matrix_consistency_on_fifo_eviction():
     # prompt1 should have been evicted (FIFO)
     assert "prompt1" not in cache._store
     assert "prompt4" in cache._store
+
+
+@pytest.mark.skipif(
+    not pytest.importorskip("torch", reason="embeddings extra not installed"),
+    reason="embeddings extra not installed"
+)
+def test_matrix_not_rebuilt_during_get():
+    """Assert matrix is never rebuilt during a get operation."""
+    cache = SimilarityCache(
+        ttl_seconds=3600.0,
+        max_size=100,
+        enable_embeddings=True,
+    )
+
+    # Add entries
+    for i in range(10):
+        cache.put(f"prompt{i}", {"response": f"data{i}"})
+
+    # Capture matrix id before get
+    matrix_id_before = id(cache._embedding_matrix)
+
+    # Perform get that will miss
+    result = cache.get_with_key_no_metrics("query that will not match")
+
+    # Matrix object should be the same instance (not rebuilt)
+    matrix_id_after = id(cache._embedding_matrix)
+
+    assert matrix_id_before == matrix_id_after, "Matrix was rebuilt during get"
+    assert result is None  # Confirm it was a miss

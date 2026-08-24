@@ -152,28 +152,32 @@ class SimilarityCache:
         """Cosine similarity for L2-normalized vectors (== dot product)."""
         return float(np.dot(a, b))
 
-    def _rebuild_embedding_matrix(self):
-        """Rebuild stacked embedding matrix from current store state."""
-        if not self.enable_embeddings or not self._embedder:
-            self._embedding_matrix = None
-            self._embedding_keys = []
+    def _append_embedding_row(self, key: str, embedding: "np.ndarray"):
+        """Append one embedding row to the matrix."""
+        if self._embedding_matrix is None:
+            self._embedding_matrix = embedding.reshape(1, -1)
+            self._embedding_keys = [key]
+        else:
+            self._embedding_matrix = np.vstack([self._embedding_matrix, embedding])
+            self._embedding_keys.append(key)
+
+    def _remove_embedding_rows(self, keys_to_remove: set):
+        """Remove rows for evicted keys without full rebuild."""
+        if self._embedding_matrix is None or not keys_to_remove:
             return
 
-        # Collect all entries with embeddings
-        keys_with_embeddings = []
-        embeddings_list = []
+        # Find indices to keep
+        indices_to_keep = [
+            i for i, key in enumerate(self._embedding_keys)
+            if key not in keys_to_remove
+        ]
 
-        for key, entry in self._store.items():
-            if entry.embedding is not None:
-                keys_with_embeddings.append(key)
-                embeddings_list.append(entry.embedding)
-
-        if embeddings_list:
-            self._embedding_matrix = np.vstack(embeddings_list)
-            self._embedding_keys = keys_with_embeddings
-        else:
+        if not indices_to_keep:
             self._embedding_matrix = None
             self._embedding_keys = []
+        else:
+            self._embedding_matrix = self._embedding_matrix[indices_to_keep, :]
+            self._embedding_keys = [self._embedding_keys[i] for i in indices_to_keep]
 
     def _evict_expired_unsafe(self, current_time: float):
         expired_keys = [
@@ -184,8 +188,9 @@ class SimilarityCache:
             for k in expired_keys:
                 del self._store[k]
                 self.metrics.evictions += 1
-            # Rebuild embedding matrix after TTL eviction
-            self._rebuild_embedding_matrix()
+            # Remove evicted keys from embedding matrix
+            if self.enable_embeddings:
+                self._remove_embedding_rows(set(expired_keys))
 
     def _embed_prompt(self, prompt: str) -> "np.ndarray":
         """Generate embedding for prompt. Caller must hold lock."""
@@ -280,16 +285,6 @@ class SimilarityCache:
             if self.enable_embeddings and self._embedder is not None and self._store:
                 query_emb = self._embed_prompt(prompt)
 
-                # Ensure all entries have embeddings and matrix is current
-                needs_rebuild = False
-                for key, entry in self._store.items():
-                    if entry.embedding is None:
-                        entry.embedding = self._embed_prompt(key)
-                        needs_rebuild = True
-
-                if needs_rebuild or self._embedding_matrix is None:
-                    self._rebuild_embedding_matrix()
-
                 if self._embedding_matrix is not None and len(self._embedding_keys) > 0:
                     # Scan last N entries (window)
                     scan_start = max(0, len(self._embedding_keys) - self.embedding_max_entries_scanned)
@@ -320,12 +315,13 @@ class SimilarityCache:
             self._evict_expired_unsafe(now)
 
             # Evict oldest (FIFO) if we hit the size limit
-            fifo_evicted = False
             if len(self._store) >= self.max_size and prompt not in self._store:
                 oldest_key = next(iter(self._store))
                 del self._store[oldest_key]
                 self.metrics.evictions += 1
-                fifo_evicted = True
+                # Remove evicted key from embedding matrix
+                if self.enable_embeddings:
+                    self._remove_embedding_rows({oldest_key})
 
             # Eager embed on write if embeddings enabled
             embedding = None
@@ -339,6 +335,6 @@ class SimilarityCache:
                 embedding=embedding,
             )
 
-            # Rebuild embedding matrix after store modification
-            if self.enable_embeddings and (fifo_evicted or embedding is not None):
-                self._rebuild_embedding_matrix()
+            # Append embedding row after adding to store
+            if self.enable_embeddings and embedding is not None:
+                self._append_embedding_row(prompt, embedding)
