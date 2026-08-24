@@ -233,11 +233,13 @@ class SimilarityCache:
 
             # Fast-path: Exact match (O(1))
             if prompt in self._store:
+                self.metrics.lexical_hits += 1
                 return (prompt, self._store[prompt].response_data)
 
             # Slow-path: Lexical match (O(N))
             for cached_prompt, entry in self._store.items():
                 if self._jaccard_similarity(prompt, cached_prompt) >= self.similarity_threshold:
+                    self.metrics.lexical_hits += 1
                     return (cached_prompt, entry.response_data)
 
             # Embedding tier: Semantic match (optional, vectorized)
@@ -263,6 +265,7 @@ class SimilarityCache:
                     logger.debug(f"Embedding scan: best_score={best_score:.4f}, threshold={self.embedding_threshold}, hit={best_score >= self.embedding_threshold}")
 
                     if best_score >= self.embedding_threshold:
+                        self.metrics.embedding_hits += 1
                         best_key = scan_keys[best_idx]
                         best_data = self._store[best_key].response_data
                         # DELIBERATE: Best match wins, then scope gate applies in proxy.

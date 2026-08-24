@@ -402,7 +402,8 @@ async def test_fallback_without_embeddings_extra():
                 assert resp2.status_code == 200
 
                 assert proxy.cache.metrics.hits >= 1
-                assert proxy.cache.enable_embeddings == False
+                # Embeddings are now available with direct ONNX, but exact match hits via Jaccard tier
+                assert proxy.cache.metrics.lexical_hits >= 1
         finally:
             proxy_server.should_exit = True
             await proxy_task
