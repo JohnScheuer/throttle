@@ -13,7 +13,7 @@ from throttle.proxy import ProxyServer
 
 @asynccontextmanager
 async def _fake_backend():
-    """Mock backend that returns fixed responses."""
+    """Mock backend that returns fixed responses on loopback."""
     responses = {}
 
     async def handler(request):
@@ -50,14 +50,18 @@ async def _fake_backend():
         response = await handler(request)
         return JSONResponse(response)
 
-    config = uvicorn.Config(app, host="127.0.0.1", port=9999, log_level="error")
+    # Port 0: auto-assign available port
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
     server = uvicorn.Server(config)
 
     task = asyncio.create_task(server.serve())
     await asyncio.sleep(0.5)  # Let server start
 
+    # Extract assigned port from server
+    port = server.servers[0].sockets[0].getsockname()[1]
+
     try:
-        yield "http://127.0.0.1:9999"
+        yield f"http://127.0.0.1:{port}"
     finally:
         server.should_exit = True
         await task
@@ -84,41 +88,52 @@ async def test_embedding_hit_that_jaccard_misses():
     )
 
     async with lifespan(proxy.app):
-        # First request: cache miss
         from httpx import AsyncClient
-        async with AsyncClient() as client:
-            resp1 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "How do I optimize PostgreSQL queries?"}],
-                    "temperature": 0.7,
-                },
-                headers={"host": "test"},
-            )
-            assert resp1.status_code == 200
-            response1 = resp1.json()
+        from starlette.testclient import TestClient
 
-            # Second request: semantically similar but Jaccard dissimilar
-            # Jaccard("How do I optimize PostgreSQL queries?", "How can I improve database query performance in PostgreSQL?")
-            # is below 0.85 threshold
-            resp2 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "How can I improve database query performance in PostgreSQL?"}],
-                    "temperature": 0.7,
-                },
-                headers={"host": "test"},
-            )
-            assert resp2.status_code == 200
-            response2 = resp2.json()
+        # Start proxy on real port
+        import uvicorn
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve())
+        await asyncio.sleep(0.5)
 
-            # Should be cache hit via embedding tier
-            assert proxy.cache.metrics.hits >= 1
-            assert proxy.cache.metrics.embedding_hits >= 1
-            # Responses should match (same cached content)
-            assert response2["choices"][0]["message"]["content"] == response1["choices"][0]["message"]["content"]
+        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "How do I optimize PostgreSQL queries?"}],
+                        "temperature": 0.7,
+                    },
+                )
+                assert resp1.status_code == 200
+                response1 = resp1.json()
+
+                # Second request: semantically similar but Jaccard dissimilar
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "How can I improve database query performance in PostgreSQL?"}],
+                        "temperature": 0.7,
+                    },
+                )
+                assert resp2.status_code == 200
+                response2 = resp2.json()
+
+                # Should be cache hit via embedding tier
+                assert proxy.cache.metrics.hits >= 1
+                assert proxy.cache.metrics.embedding_hits >= 1
+                # Responses should match (same cached content)
+                assert response2["choices"][0]["message"]["content"] == response1["choices"][0]["message"]["content"]
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
 
 
 @pytest.mark.asyncio
@@ -143,31 +158,40 @@ async def test_embedding_miss_on_different_model():
 
     async with lifespan(proxy.app):
         from httpx import AsyncClient
-        async with AsyncClient() as client:
-            # First request with model-a
-            resp1 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "model-a",
-                    "messages": [{"role": "user", "content": "What is machine learning?"}],
-                },
-                headers={"host": "test"},
-            )
-            assert resp1.status_code == 200
+        import uvicorn
 
-            # Same prompt, different model
-            resp2 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "model-b",
-                    "messages": [{"role": "user", "content": "What is machine learning?"}],
-                },
-                headers={"host": "test"},
-            )
-            assert resp2.status_code == 200
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve())
+        await asyncio.sleep(0.5)
 
-            # Should be cache miss (different scope)
-            assert proxy.cache.metrics.misses >= 1
+        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "model-a",
+                        "messages": [{"role": "user", "content": "What is machine learning?"}],
+                    },
+                )
+                assert resp1.status_code == 200
+
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "model-b",
+                        "messages": [{"role": "user", "content": "What is machine learning?"}],
+                    },
+                )
+                assert resp2.status_code == 200
+
+                assert proxy.cache.metrics.misses >= 1
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
 
 
 @pytest.mark.asyncio
@@ -192,41 +216,47 @@ async def test_embedding_miss_on_different_temperature():
 
     async with lifespan(proxy.app):
         from httpx import AsyncClient
-        async with AsyncClient() as client:
-            # First request with temperature 0.7
-            resp1 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "Explain quantum computing"}],
-                    "temperature": 0.7,
-                },
-                headers={"host": "test"},
-            )
-            assert resp1.status_code == 200
+        import uvicorn
 
-            # Same prompt, different temperature
-            resp2 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "Explain quantum computing"}],
-                    "temperature": 0.9,
-                },
-                headers={"host": "test"},
-            )
-            assert resp2.status_code == 200
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve())
+        await asyncio.sleep(0.5)
 
-            # Should be cache miss (different scope)
-            assert proxy.cache.metrics.misses >= 1
+        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Explain quantum computing"}],
+                        "temperature": 0.7,
+                    },
+                )
+                assert resp1.status_code == 200
+
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Explain quantum computing"}],
+                        "temperature": 0.9,
+                    },
+                )
+                assert resp2.status_code == 200
+
+                assert proxy.cache.metrics.misses >= 1
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
 
 
 @pytest.mark.asyncio
 async def test_fallback_without_embeddings_extra():
     """Test d: Embeddings requested with extra absent falls back to Jaccard."""
-
-    # This test runs in environment WITHOUT embeddings extra installed
-    # Cache should fall back to Jaccard-only mode and still serve responses
 
     @asynccontextmanager
     async def lifespan(app):
@@ -239,40 +269,48 @@ async def test_fallback_without_embeddings_extra():
     proxy = ProxyServer(
         backend_url="http://placeholder",
         enable_cache=True,
-        enable_embeddings=True,  # Request embeddings
+        enable_embeddings=True,
         cache_max_size=10,
         lifespan=lifespan,
     )
 
     async with lifespan(proxy.app):
         from httpx import AsyncClient
-        async with AsyncClient() as client:
-            # First request
-            resp1 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "Test prompt"}],
-                },
-                headers={"host": "test"},
-            )
-            assert resp1.status_code == 200
+        import uvicorn
 
-            # Exact repeat - should hit via Jaccard
-            resp2 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "test-model",
-                    "messages": [{"role": "user", "content": "Test prompt"}],
-                },
-                headers={"host": "test"},
-            )
-            assert resp2.status_code == 200
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve())
+        await asyncio.sleep(0.5)
 
-            # Should work (fallback to Jaccard)
-            assert proxy.cache.metrics.hits >= 1
-            # If embeddings unavailable, enable_embeddings should be False after init
-            assert proxy.cache.enable_embeddings == False
+        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Test prompt"}],
+                    },
+                )
+                assert resp1.status_code == 200
+
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": "Test prompt"}],
+                    },
+                )
+                assert resp2.status_code == 200
+
+                assert proxy.cache.metrics.hits >= 1
+                assert proxy.cache.enable_embeddings == False
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
 
 
 @pytest.mark.asyncio
@@ -297,32 +335,40 @@ async def test_embedding_miss_on_cross_scope():
 
     async with lifespan(proxy.app):
         from httpx import AsyncClient
-        async with AsyncClient() as client:
-            # First request with model-a
-            resp1 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "model-a",
-                    "messages": [{"role": "user", "content": "Optimize database performance"}],
-                },
-                headers={"host": "test"},
-            )
-            assert resp1.status_code == 200
-            response1_content = resp1.json()["choices"][0]["message"]["content"]
+        import uvicorn
 
-            # Semantically similar prompt but different scope (model-b)
-            resp2 = await client.post(
-                "http://test/v1/chat/completions",
-                json={
-                    "model": "model-b",
-                    "messages": [{"role": "user", "content": "Improve database query efficiency"}],
-                },
-                headers={"host": "test"},
-            )
-            assert resp2.status_code == 200
-            response2_content = resp2.json()["choices"][0]["message"]["content"]
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=0, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve())
+        await asyncio.sleep(0.5)
 
-            # Should be cache miss (best embedding match is under different scope)
-            # Response should NOT match model-a's response
-            assert response2_content != response1_content
-            assert proxy.cache.metrics.misses >= 1
+        proxy_port = proxy_server.servers[0].sockets[0].getsockname()[1]
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "model-a",
+                        "messages": [{"role": "user", "content": "Optimize database performance"}],
+                    },
+                )
+                assert resp1.status_code == 200
+                response1_content = resp1.json()["choices"][0]["message"]["content"]
+
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "model-b",
+                        "messages": [{"role": "user", "content": "Improve database query efficiency"}],
+                    },
+                )
+                assert resp2.status_code == 200
+                response2_content = resp2.json()["choices"][0]["message"]["content"]
+
+                assert response2_content != response1_content
+                assert proxy.cache.metrics.misses >= 1
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
