@@ -434,6 +434,10 @@ class ProxyServer:
 
                     if self.enable_cache and self.cache:
                         choices = response_data.get("choices", [])
+                        # Note: HTTP 200 with populated choices AND an error field
+                        # is not guarded here. No Throttle-verified backend (Ollama,
+                        # vLLM, SGLang) produces this shape — they use proper HTTP
+                        # error codes. Revisit if a concrete backend case is found.
                         if choices:
                             existing_scope_dict = self.cache.get_exact_no_metrics(prompt)
                             if existing_scope_dict is not None and isinstance(existing_scope_dict, dict):
@@ -472,18 +476,6 @@ class ProxyServer:
                 error_body = {"error": e.response.text or str(e)}
             return JSONResponse(content=error_body, status_code=e.response.status_code)
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
-            return JSONResponse(content={"error": f"Backend timeout: {str(e)}"}, status_code=504)
-
-
-        except httpx.HTTPStatusError as e:
-            # Preserve backend error status and body
-            try:
-                error_body = e.response.json()
-            except Exception:
-                error_body = {"error": e.response.text or str(e)}
-            return JSONResponse(content=error_body, status_code=e.response.status_code)
-        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
-            # Return timeout error to client
             return JSONResponse(content={"error": f"Backend timeout: {str(e)}"}, status_code=504)
 
 
