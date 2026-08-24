@@ -478,12 +478,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     demo = subparsers.add_parser(
         "demo",
-        help="run a fast simulator demo comparing self-hosted GPU costs to API pricing",
+        help="run a fast simulator demo comparing baseline vs tuned configuration",
         description=(
-            "Generate a sample workload, simulate vLLM-like continuous batching inference, "
-            "and print a cost comparison. Runs entirely locally with no GPU or network required. "
-            "Completes in under 5 minutes."
+            "Generate a sample workload, simulate vLLM-like continuous batching inference "
+            "for two configurations (baseline and tuned), and print a side-by-side cost comparison. "
+            "Runs entirely locally with no GPU or network required. Completes in under 5 minutes."
         ),
+    )
+    demo.add_argument(
+        "--light-load",
+        action="store_true",
+        help="use a light workload that does not saturate either configuration (demonstrates NO SIGNIFICANT DIFFERENCE path)",
     )
 
     cost = subparsers.add_parser(
@@ -2153,7 +2158,7 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     return EXIT_OK if result["decision_eligible"] else EXIT_INCONCLUSIVE
 
 
-def _handle_demo() -> int:
+def _handle_demo(args: argparse.Namespace) -> int:
     """Run simulator demo comparing baseline vs tuned configuration."""
     from throttle.simulator import VLLMSimulator, SimulatorConfig
     from throttle.workload import WorkloadGenerator
@@ -2164,14 +2169,30 @@ def _handle_demo() -> int:
     print("=" * 60)
     print()
 
+    # Choose workload parameters based on --light-load flag
+    if args.light_load:
+        # Light load: does not saturate either config (demonstrates NO SIGNIFICANT DIFFERENCE)
+        num_requests = 100
+        arrival_rate = 2.0
+        mean_prompt = 500
+        mean_output = 150
+        load_desc = "light (2 req/sec, ~150 output tokens)"
+    else:
+        # Default: saturating load that differentiates configs
+        num_requests = 300
+        arrival_rate = 30.0
+        mean_prompt = 300
+        mean_output = 1000
+        load_desc = "high concurrency (30 req/sec, ~1000 output tokens)"
+
     # Generate workload once for both configs
-    print("[SIMULATED] Generating sample workload...")
+    print(f"[SIMULATED] Generating sample workload ({load_desc})...")
     workload_gen = WorkloadGenerator(seed=42)
     workload = workload_gen.generate_chat_workload(
-        num_requests=100,
-        arrival_rate_requests_per_sec=2.0,
-        mean_prompt_tokens=500,
-        mean_output_tokens=150,
+        num_requests=num_requests,
+        arrival_rate_requests_per_sec=arrival_rate,
+        mean_prompt_tokens=mean_prompt,
+        mean_output_tokens=mean_output,
     )
     print(f"[SIMULATED] Generated {len(workload)} requests")
     print()
@@ -2797,7 +2818,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_USAGE
         return EXIT_OK if report.get("decision_eligible") else EXIT_INCONCLUSIVE
     if args.command == "demo":
-        return _handle_demo()
+        return _handle_demo(args)
     if args.command == "cost":
         return _handle_cost(args)
     if args.command == "tune":
