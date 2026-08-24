@@ -67,8 +67,8 @@ deactivate
 python3.11 -m venv ~/throttle-env
 source ~/throttle-env/bin/activate
 
-# Install throttle from PyPI (or from wheel if testing locally)
-pip install throttle-pro
+# Install throttle directly from GitHub
+pip install git+https://github.com/KushagraKanaujia/throttle.git
 
 # Verify installation
 throttle --help
