@@ -35,31 +35,33 @@ async def _wait_for_server(host: str, port: int, timeout: float = 5.0):
 
 @asynccontextmanager
 async def _fake_backend():
-    """Mock backend that returns fixed responses on loopback."""
-    responses = {}
-
+    """Mock backend that returns responses encoding scope parameters."""
     async def handler(request):
         import json
         body = await request.json()
         prompt_text = " ".join(m["content"] for m in body.get("messages", []))
 
-        # Return cached response if exists, otherwise generate new
-        if prompt_text not in responses:
-            responses[prompt_text] = {
-                "id": f"chatcmpl-{len(responses)}",
-                "object": "chat.completion",
-                "model": body.get("model", "test-model"),
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": f"Response to: {prompt_text[:50]}"
-                    },
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
-            }
-        return responses[prompt_text]
+        # Encode scope in response content so tests can validate correct scope
+        model = body.get("model", "unknown-model")
+        temperature = body.get("temperature", "no-temperature")
+
+        # Response content encodes the scope it was called with
+        content = f"Response from model={model} temperature={temperature} to prompt: {prompt_text[:50]}"
+
+        return {
+            "id": f"chatcmpl-{hash(content)}",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+        }
 
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
@@ -239,7 +241,7 @@ async def test_weak_paraphrase_does_not_hit_at_threshold_095():
 
 @pytest.mark.asyncio
 async def test_embedding_miss_on_different_model():
-    """Test b: Same prompts under different model values produce MISS."""
+    """Test b: Same prompts under different model values return scope-correct responses."""
 
     @asynccontextmanager
     async def lifespan(app):
@@ -276,6 +278,7 @@ async def test_embedding_miss_on_different_model():
 
         try:
             async with AsyncClient() as client:
+                # Request under scope A (model-a)
                 resp1 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
@@ -284,7 +287,11 @@ async def test_embedding_miss_on_different_model():
                     },
                 )
                 assert resp1.status_code == 200
+                content1 = resp1.json()["choices"][0]["message"]["content"]
+                # Verify response encodes scope A
+                assert "model=model-a" in content1
 
+                # Request under scope B (model-b) with identical prompt
                 resp2 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
@@ -293,8 +300,13 @@ async def test_embedding_miss_on_different_model():
                     },
                 )
                 assert resp2.status_code == 200
+                content2 = resp2.json()["choices"][0]["message"]["content"]
 
-                assert proxy.cache.metrics.misses >= 1
+                # CRITICAL: Response must match scope B, not scope A
+                assert "model=model-b" in content2, \
+                    f"Cross-scope contamination: got {content2!r}, expected model=model-b"
+                assert content2 != content1, \
+                    "Responses from different scopes must differ"
         finally:
             proxy_server.should_exit = True
             await proxy_task
@@ -302,7 +314,7 @@ async def test_embedding_miss_on_different_model():
 
 @pytest.mark.asyncio
 async def test_embedding_miss_on_different_temperature():
-    """Test c: Same prompts under different temperature values produce MISS."""
+    """Test c: Same prompts under different temperature values return scope-correct responses."""
 
     @asynccontextmanager
     async def lifespan(app):
@@ -339,6 +351,7 @@ async def test_embedding_miss_on_different_temperature():
 
         try:
             async with AsyncClient() as client:
+                # Request under scope A (temperature=0.7)
                 resp1 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
@@ -348,7 +361,11 @@ async def test_embedding_miss_on_different_temperature():
                     },
                 )
                 assert resp1.status_code == 200
+                content1 = resp1.json()["choices"][0]["message"]["content"]
+                # Verify response encodes scope A
+                assert "temperature=0.7" in content1
 
+                # Request under scope B (temperature=0.9) with identical prompt
                 resp2 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
@@ -358,8 +375,13 @@ async def test_embedding_miss_on_different_temperature():
                     },
                 )
                 assert resp2.status_code == 200
+                content2 = resp2.json()["choices"][0]["message"]["content"]
 
-                assert proxy.cache.metrics.misses >= 1
+                # CRITICAL: Response must match scope B, not scope A
+                assert "temperature=0.9" in content2, \
+                    f"Cross-scope contamination: got {content2!r}, expected temperature=0.9"
+                assert content2 != content1, \
+                    "Responses from different scopes must differ"
         finally:
             proxy_server.should_exit = True
             await proxy_task
@@ -432,7 +454,7 @@ async def test_fallback_without_embeddings_extra():
 
 @pytest.mark.asyncio
 async def test_embedding_miss_on_cross_scope():
-    """Test e: Embedding hit whose best match exists only under another scope returns MISS."""
+    """Test e: Semantically similar prompts under different scopes return scope-correct responses."""
 
     @asynccontextmanager
     async def lifespan(app):
@@ -469,28 +491,125 @@ async def test_embedding_miss_on_cross_scope():
 
         try:
             async with AsyncClient() as client:
+                # Request under scope A (model-a) - use Docker pair that triggers embedding hits
                 resp1 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
                         "model": "model-a",
-                        "messages": [{"role": "user", "content": "Optimize database performance"}],
+                        "messages": [{"role": "user", "content": "What are the benefits of using Docker containers?"}],
                     },
                 )
                 assert resp1.status_code == 200
-                response1_content = resp1.json()["choices"][0]["message"]["content"]
+                content1 = resp1.json()["choices"][0]["message"]["content"]
+                # Verify response encodes scope A
+                assert "model=model-a" in content1
 
+                # Request under scope B (model-b) with semantically similar prompt
                 resp2 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
                         "model": "model-b",
-                        "messages": [{"role": "user", "content": "Improve database query efficiency"}],
+                        "messages": [{"role": "user", "content": "What advantages do Docker containers provide?"}],
                     },
                 )
                 assert resp2.status_code == 200
-                response2_content = resp2.json()["choices"][0]["message"]["content"]
+                content2 = resp2.json()["choices"][0]["message"]["content"]
 
-                assert response2_content != response1_content
-                assert proxy.cache.metrics.misses >= 1
+                # CRITICAL: Response must match scope B, not scope A
+                assert "model=model-b" in content2, \
+                    f"Cross-scope contamination: got {content2!r}, expected model=model-b"
+                assert content2 != content1, \
+                    "Responses from different scopes must differ"
+        finally:
+            proxy_server.should_exit = True
+            await proxy_task
+
+@pytest.mark.asyncio
+async def test_embedding_hit_with_multiple_scopes_returns_requesting_scope():
+    """Test: Embedding hit with cached entries under multiple scopes returns requesting scope's response.
+
+    Scenario: Two scopes (model-a, model-b) both cache responses to near-identical prompts.
+    The responses differ only by scope encoding. A third request under model-a with a
+    paraphrase should hit via embeddings and return model-a's cached response, not model-b's.
+    """
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with _fake_backend() as backend_url:
+            proxy.backend_url = backend_url
+            await proxy.startup()
+            yield
+        await proxy.shutdown()
+
+    proxy = ProxyServer(
+        backend_url="http://placeholder",
+        enable_cache=True,
+        enable_embeddings=True,
+        cache_max_size=10,
+        lifespan=lifespan,
+    )
+
+    async with lifespan(proxy.app):
+        from httpx import AsyncClient
+        import uvicorn
+        import socket
+
+        # Bind socket to loopback with auto-assigned port
+        proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_sock.bind(("127.0.0.1", 0))
+        proxy_port = proxy_sock.getsockname()[1]
+
+        proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
+        proxy_server = uvicorn.Server(proxy_config)
+        proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
+        await _wait_for_server("127.0.0.1", proxy_port)
+
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+
+        try:
+            async with AsyncClient() as client:
+                # Populate cache under scope A (model-a)
+                resp1 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "model-a",
+                        "messages": [{"role": "user", "content": "What are the benefits of using Docker containers?"}],
+                    },
+                )
+                assert resp1.status_code == 200
+                content_a = resp1.json()["choices"][0]["message"]["content"]
+                assert "model=model-a" in content_a
+
+                # Populate cache under scope B (model-b) with IDENTICAL prompt
+                resp2 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "model-b",
+                        "messages": [{"role": "user", "content": "What are the benefits of using Docker containers?"}],
+                    },
+                )
+                assert resp2.status_code == 200
+                content_b = resp2.json()["choices"][0]["message"]["content"]
+                assert "model=model-b" in content_b
+
+                # Now request under scope A with paraphrase - should hit via embeddings and return scope A response
+                resp3 = await client.post(
+                    f"{proxy_url}/v1/chat/completions",
+                    json={
+                        "model": "model-a",
+                        "messages": [{"role": "user", "content": "What advantages do Docker containers provide?"}],
+                    },
+                )
+                assert resp3.status_code == 200
+                content3 = resp3.json()["choices"][0]["message"]["content"]
+
+                # CRITICAL: Must return scope A's cached response, not scope B's
+                assert "model=model-a" in content3, \
+                    f"Cross-scope contamination: got {content3!r}, expected model=model-a"
+                assert content3 == content_a, \
+                    f"Embedding hit should return cached response from requesting scope, got {content3!r}"
+                assert proxy.cache.metrics.embedding_hits >= 1, \
+                    "Third request should have hit via embedding tier"
         finally:
             proxy_server.should_exit = True
             await proxy_task
