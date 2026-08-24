@@ -17,13 +17,7 @@ try:
 except ImportError:
     np = None  # type: ignore
 
-try:
-    import torch
-    from optimum.onnxruntime import ORTModelForFeatureExtraction
-    from transformers import AutoTokenizer
-    _EMBEDDINGS_AVAILABLE = True
-except ImportError:
-    _EMBEDDINGS_AVAILABLE = False
+from . import embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -34,41 +28,6 @@ class CacheMetrics:
     evictions: int = 0
     lexical_hits: int = 0
     embedding_hits: int = 0
-
-class _OnnxEmbedder:
-    """Lazy ONNX embedder for semantic similarity matching.
-
-    Uses sentence-transformers/all-MiniLM-L6-v2 model via ONNX Runtime.
-    Produces 384-dimensional L2-normalized float32 embeddings.
-    """
-
-    def __init__(self, model_id: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        if not _EMBEDDINGS_AVAILABLE:
-            raise ImportError(
-                "Embedding dependencies not installed. "
-                "Install with: pip install throttle-bench[embeddings]"
-            )
-        self.model = ORTModelForFeatureExtraction.from_pretrained(model_id, export=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    def embed(self, text: str) -> "np.ndarray":
-        """Generate L2-normalized 384-dim float32 embedding."""
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
-        # Mean pooling with attention mask
-        token_embeddings = outputs.last_hidden_state
-        attention_mask = inputs["attention_mask"].unsqueeze(-1).expand(token_embeddings.size()).float()
-        summed = torch.sum(token_embeddings * attention_mask, dim=1)
-        counts = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
-        emb = (summed / counts)[0].detach().cpu().numpy().astype("float32")
-
-        # L2 normalize for cosine via dot product
-        norm = float(np.linalg.norm(emb))
-        if norm > 0:
-            emb = emb / norm
-        return emb
 
 @dataclass
 class _CacheEntry:
@@ -119,7 +78,6 @@ class SimilarityCache:
         # Response data is scope dict when used via proxy, raw response otherwise
         self._store: Dict[str, _CacheEntry] = {}
         self._lock = Lock()
-        self._embedder: Optional[_OnnxEmbedder] = None
         self._embedding_fallback_logged = False
 
         # Stacked embeddings: (N, 384) array for vectorized scan
@@ -128,7 +86,7 @@ class SimilarityCache:
         self._embedding_keys: list[str] = []
 
         if self.enable_embeddings:
-            if not _EMBEDDINGS_AVAILABLE:
+            if not embeddings.EMBEDDINGS_AVAILABLE:
                 logger.warning(
                     "Embeddings requested but dependencies not installed. "
                     "Falling back to Jaccard-only matching. "
@@ -136,8 +94,6 @@ class SimilarityCache:
                 )
                 self._embedding_fallback_logged = True
                 self.enable_embeddings = False
-            else:
-                self._embedder = _OnnxEmbedder(model_id=self.embedding_model_id)
 
     def _jaccard_similarity(self, prompt_a: str, prompt_b: str) -> float:
         set_a = set(prompt_a.lower().split())
@@ -192,10 +148,9 @@ class SimilarityCache:
             if self.enable_embeddings:
                 self._remove_embedding_rows(set(expired_keys))
 
-    def _embed_prompt(self, prompt: str) -> "np.ndarray":
+    def _embed_prompt(self, prompt: str) -> Optional["np.ndarray"]:
         """Generate embedding for prompt. Caller must hold lock."""
-        assert self._embedder is not None
-        return self._embedder.embed(prompt)
+        return embeddings.get_embedding(prompt)
 
     def get(self, prompt: str) -> Optional[Any]:
         """Retrieves structured response data if an exact or similarity match is found."""
@@ -226,31 +181,33 @@ class SimilarityCache:
                     return (cached_prompt, entry.response_data)
 
             # Embedding tier: Semantic match (optional)
-            if self.enable_embeddings and self._embedder is not None and self._store:
+            if self.enable_embeddings and self._store:
                 query_emb = self._embed_prompt(prompt)
-                best_score = -1.0
-                best_key = None
-                best_data = None
+                if query_emb is not None:
+                    best_score = -1.0
+                    best_key = None
+                    best_data = None
 
-                # Scan last N entries (most recent in insertion order)
-                entries_list = list(self._store.items())
-                scan_start = max(0, len(entries_list) - self.embedding_max_entries_scanned)
-                candidates = entries_list[scan_start:]
+                    # Scan last N entries (most recent in insertion order)
+                    entries_list = list(self._store.items())
+                    scan_start = max(0, len(entries_list) - self.embedding_max_entries_scanned)
+                    candidates = entries_list[scan_start:]
 
-                for cached_prompt, entry in candidates:
-                    if entry.embedding is None:
-                        entry.embedding = self._embed_prompt(cached_prompt)
+                    for cached_prompt, entry in candidates:
+                        if entry.embedding is None:
+                            entry.embedding = self._embed_prompt(cached_prompt)
 
-                    score = self._cosine_normalized(query_emb, entry.embedding)
-                    if score > best_score:
-                        best_score = score
-                        best_key = cached_prompt
-                        best_data = entry.response_data
+                        if entry.embedding is not None:
+                            score = self._cosine_normalized(query_emb, entry.embedding)
+                            if score > best_score:
+                                best_score = score
+                                best_key = cached_prompt
+                                best_data = entry.response_data
 
-                if best_score >= self.embedding_threshold and best_data is not None:
-                    self.metrics.hits += 1
-                    self.metrics.embedding_hits += 1
-                    return (best_key, best_data)
+                    if best_score >= self.embedding_threshold and best_data is not None:
+                        self.metrics.hits += 1
+                        self.metrics.embedding_hits += 1
+                        return (best_key, best_data)
 
             self.metrics.misses += 1
             return None
@@ -282,10 +239,10 @@ class SimilarityCache:
                     return (cached_prompt, entry.response_data)
 
             # Embedding tier: Semantic match (optional, vectorized)
-            if self.enable_embeddings and self._embedder is not None and self._store:
+            if self.enable_embeddings and self._store:
                 query_emb = self._embed_prompt(prompt)
 
-                if self._embedding_matrix is not None and len(self._embedding_keys) > 0:
+                if query_emb is not None and self._embedding_matrix is not None and len(self._embedding_keys) > 0:
                     # Scan last N entries (window)
                     scan_start = max(0, len(self._embedding_keys) - self.embedding_max_entries_scanned)
                     scan_keys = self._embedding_keys[scan_start:]
@@ -325,7 +282,7 @@ class SimilarityCache:
 
             # Eager embed on write if embeddings enabled
             embedding = None
-            if self.enable_embeddings and self._embedder is not None:
+            if self.enable_embeddings:
                 embedding = self._embed_prompt(prompt)
 
             self._store[prompt] = _CacheEntry(
