@@ -122,6 +122,11 @@ class SimilarityCache:
         self._embedder: Optional[_OnnxEmbedder] = None
         self._embedding_fallback_logged = False
 
+        # Stacked embeddings: (N, 384) array for vectorized scan
+        # Keys list maintains same order as rows in stacked array
+        self._embedding_matrix: Optional["np.ndarray"] = None
+        self._embedding_keys: list[str] = []
+
         if self.enable_embeddings:
             if not _EMBEDDINGS_AVAILABLE:
                 logger.warning(
@@ -147,14 +152,40 @@ class SimilarityCache:
         """Cosine similarity for L2-normalized vectors (== dot product)."""
         return float(np.dot(a, b))
 
+    def _rebuild_embedding_matrix(self):
+        """Rebuild stacked embedding matrix from current store state."""
+        if not self.enable_embeddings or not self._embedder:
+            self._embedding_matrix = None
+            self._embedding_keys = []
+            return
+
+        # Collect all entries with embeddings
+        keys_with_embeddings = []
+        embeddings_list = []
+
+        for key, entry in self._store.items():
+            if entry.embedding is not None:
+                keys_with_embeddings.append(key)
+                embeddings_list.append(entry.embedding)
+
+        if embeddings_list:
+            self._embedding_matrix = np.vstack(embeddings_list)
+            self._embedding_keys = keys_with_embeddings
+        else:
+            self._embedding_matrix = None
+            self._embedding_keys = []
+
     def _evict_expired_unsafe(self, current_time: float):
         expired_keys = [
             k for k, entry in self._store.items()
             if current_time - entry.timestamp > self.ttl_seconds
         ]
-        for k in expired_keys:
-            del self._store[k]
-            self.metrics.evictions += 1
+        if expired_keys:
+            for k in expired_keys:
+                del self._store[k]
+                self.metrics.evictions += 1
+            # Rebuild embedding matrix after TTL eviction
+            self._rebuild_embedding_matrix()
 
     def _embed_prompt(self, prompt: str) -> "np.ndarray":
         """Generate embedding for prompt. Caller must hold lock."""
@@ -245,33 +276,40 @@ class SimilarityCache:
                 if self._jaccard_similarity(prompt, cached_prompt) >= self.similarity_threshold:
                     return (cached_prompt, entry.response_data)
 
-            # Embedding tier: Semantic match (optional)
+            # Embedding tier: Semantic match (optional, vectorized)
             if self.enable_embeddings and self._embedder is not None and self._store:
                 query_emb = self._embed_prompt(prompt)
-                best_score = -1.0
-                best_key = None
-                best_data = None
 
-                # Scan last N entries (most recent in insertion order)
-                entries_list = list(self._store.items())
-                scan_start = max(0, len(entries_list) - self.embedding_max_entries_scanned)
-                candidates = entries_list[scan_start:]
-
-                for cached_prompt, entry in candidates:
+                # Ensure all entries have embeddings and matrix is current
+                needs_rebuild = False
+                for key, entry in self._store.items():
                     if entry.embedding is None:
-                        entry.embedding = self._embed_prompt(cached_prompt)
+                        entry.embedding = self._embed_prompt(key)
+                        needs_rebuild = True
 
-                    score = self._cosine_normalized(query_emb, entry.embedding)
-                    if score > best_score:
-                        best_score = score
-                        best_key = cached_prompt
-                        best_data = entry.response_data
+                if needs_rebuild or self._embedding_matrix is None:
+                    self._rebuild_embedding_matrix()
 
-                # DELIBERATE: Best match wins, then scope gate applies in proxy.
-                # If scope dict lacks requesting scope, proxy will mark miss.
-                # Do not fall through to next candidate - fail safe.
-                if best_score >= self.embedding_threshold and best_data is not None:
-                    return (best_key, best_data)
+                if self._embedding_matrix is not None and len(self._embedding_keys) > 0:
+                    # Scan last N entries (window)
+                    scan_start = max(0, len(self._embedding_keys) - self.embedding_max_entries_scanned)
+                    scan_keys = self._embedding_keys[scan_start:]
+                    scan_matrix = self._embedding_matrix[scan_start:, :]
+
+                    # Vectorized cosine: (N,384) @ (384,) = (N,)
+                    similarities = scan_matrix @ query_emb
+
+                    # Find best match
+                    best_idx = int(np.argmax(similarities))
+                    best_score = float(similarities[best_idx])
+
+                    if best_score >= self.embedding_threshold:
+                        best_key = scan_keys[best_idx]
+                        best_data = self._store[best_key].response_data
+                        # DELIBERATE: Best match wins, then scope gate applies in proxy.
+                        # If scope dict lacks requesting scope, proxy will mark miss.
+                        # Do not fall through to next candidate - fail safe.
+                        return (best_key, best_data)
 
             return None
 
@@ -282,10 +320,12 @@ class SimilarityCache:
             self._evict_expired_unsafe(now)
 
             # Evict oldest (FIFO) if we hit the size limit
+            fifo_evicted = False
             if len(self._store) >= self.max_size and prompt not in self._store:
                 oldest_key = next(iter(self._store))
                 del self._store[oldest_key]
                 self.metrics.evictions += 1
+                fifo_evicted = True
 
             # Eager embed on write if embeddings enabled
             embedding = None
@@ -298,3 +338,7 @@ class SimilarityCache:
                 timestamp=now,
                 embedding=embedding,
             )
+
+            # Rebuild embedding matrix after store modification
+            if self.enable_embeddings and (fifo_evicted or embedding is not None):
+                self._rebuild_embedding_matrix()
