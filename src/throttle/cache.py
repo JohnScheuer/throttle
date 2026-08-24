@@ -111,6 +111,75 @@ class SimilarityCache:
         """Cosine similarity for L2-normalized vectors (== dot product)."""
         return float(np.dot(a, b))
 
+    @staticmethod
+    def _has_negation_or_version_conflict(prompt_a: str, prompt_b: str) -> bool:
+        """Check if two prompts differ on negation, antonyms, or version/number tokens.
+
+        Returns True if the prompts should NOT match (conflict detected).
+
+        This guard prevents catastrophic semantic cache failures where:
+        - "How to enable X?" matches "How to disable X?"
+        - "Is X safe?" matches "Is X dangerous?"
+        - "Install pandas 1.5" matches "Install pandas 2.0"
+
+        Measured 2026-08-24: cosine similarity encodes topic, not polarity.
+        At threshold 0.95, "Is it safe to use eval?" vs "Is it dangerous to use eval?"
+        scored 0.9874. This is structural, not tunable.
+        """
+        import re
+        # Normalize: lowercase, remove punctuation, split into tokens
+        def normalize(text):
+            text = text.lower()
+            text = re.sub(r'[^\w\s]', ' ', text)  # Replace punctuation with space
+            return set(text.split())
+
+        tokens_a = normalize(prompt_a)
+        tokens_b = normalize(prompt_b)
+
+        # Negation words
+        negations = {"not", "no", "never", "without", "don't", "doesn't", "can't",
+                     "won't", "shouldn't", "wouldn't", "couldn't", "isn't", "aren't",
+                     "wasn't", "weren't", "haven't", "hasn't", "hadn't"}
+
+        # Check for negation presence difference
+        has_neg_a = bool(tokens_a & negations)
+        has_neg_b = bool(tokens_b & negations)
+        if has_neg_a != has_neg_b:
+            return True  # One has negation, other doesn't - conflict
+
+        # Antonym pairs (if one appears in A and its antonym in B, reject)
+        antonym_pairs = [
+            ("enable", "disable"),
+            ("safe", "dangerous"),
+            ("safe", "risky"),
+            ("secure", "insecure"),
+            ("secure", "vulnerable"),
+            ("max", "min"),
+            ("maximum", "minimum"),
+            ("increase", "decrease"),
+            ("start", "stop"),
+            ("install", "uninstall"),
+            ("allow", "block"),
+            ("benefits", "limitations"),
+            ("benefits", "drawbacks"),
+        ]
+
+        for word1, word2 in antonym_pairs:
+            if (word1 in tokens_a and word2 in tokens_b) or (word2 in tokens_a and word1 in tokens_b):
+                return True  # Antonym conflict
+
+        # Version/number tokens: extract all tokens that contain digits
+        # If they differ, it's a version/number conflict
+        version_tokens_a = {t for t in tokens_a if re.search(r'\d', t)}
+        version_tokens_b = {t for t in tokens_b if re.search(r'\d', t)}
+
+        # If version tokens exist in both and they differ, reject
+        if version_tokens_a and version_tokens_b:
+            if version_tokens_a != version_tokens_b:
+                return True  # Version/number conflict
+
+        return False  # No conflict detected
+
     def _append_embedding_row(self, key: str, embedding: "np.ndarray"):
         """Append one embedding row to the matrix."""
         if self._embedding_matrix is None:
@@ -201,6 +270,10 @@ class SimilarityCache:
                             entry.embedding = self._embed_prompt(cached_prompt)
 
                         if entry.embedding is not None:
+                            # Apply negation/version guard before accepting semantic match
+                            if self._has_negation_or_version_conflict(prompt, cached_prompt):
+                                continue  # Skip this candidate - conflict detected
+
                             score = self._cosine_normalized(query_emb, entry.embedding)
                             if score > best_score:
                                 best_score = score
