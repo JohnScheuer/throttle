@@ -526,6 +526,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.85,
         help="Jaccard similarity threshold (0.0-1.0, default: 0.85)",
     )
+    proxy.add_argument(
+        "--backend-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="backend request timeout in seconds (default: 120.0). NOTE: this value is not evidence-based; 30 seconds risks killing cold model loads and long generations.",
+    )
 
     return parser
 
@@ -2048,6 +2054,7 @@ def _handle_proxy(args: argparse.Namespace) -> int:
 
     print(f"Starting Throttle proxy server on {args.host}:{args.port}")
     print(f"Backend: {args.backend_url}")
+    print(f"Backend timeout: {args.backend_timeout_seconds}s")
     print(f"Cache enabled: {args.enable_cache}")
     if args.enable_cache:
         print(f"  TTL: {args.cache_ttl_seconds}s")
@@ -2066,6 +2073,7 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         cache_ttl_seconds=args.cache_ttl_seconds,
         cache_max_size=args.cache_max_size,
         cache_similarity_threshold=args.cache_similarity_threshold,
+        backend_timeout_seconds=args.backend_timeout_seconds,
     )
 
     try:

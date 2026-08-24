@@ -255,16 +255,42 @@ async def test_ten_concurrent_paraphrases_current_behavior(proxy_to_mock, mock_b
 
 
 async def test_backend_error_propagates_to_all_waiters(mock_backend_server):
-    """Backend error during in-flight request returns error to all concurrent waiters."""
+    """Backend error during in-flight request returns same HTTP status to all concurrent waiters.
+
+    This test verifies that:
+    1. The originator raises the exception after setting it on the future (per PR #16)
+    2. All waiters receive the same HTTPStatusError with the correct status code
+    3. No requests hang waiting for results
+
+    This is load-bearing for the exception handling in proxy.py:465-467.
+    """
+    import uvicorn
+
     mock = mock_backend_server
-    mock.configure_error()
+    mock.configure_error()  # Returns HTTP 500
+
+    # ProxyServer will be captured by the lifespan closure
+    proxy = None
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        await proxy.startup()
+        yield
+        # Shutdown
+        await proxy.shutdown()
 
     proxy = ProxyServer(
         backend_url="http://127.0.0.1:58090",
         enable_cache=True,
+        lifespan=lifespan,
     )
 
-    await proxy.startup()
+    # Start proxy HTTP server on port 58092
+    config = uvicorn.Config(proxy.app, host="127.0.0.1", port=58092, log_level="error")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
+    await asyncio.sleep(1)  # Wait for server to start
 
     try:
         payload = {
@@ -274,43 +300,71 @@ async def test_backend_error_propagates_to_all_waiters(mock_backend_server):
         }
 
         async def send_request(client_id: int):
+            """Send request through HTTP client and capture status code."""
             try:
-                response = await proxy.chat_completions(
-                    type("Request", (), {
-                        "json": lambda: asyncio.coroutine(lambda: payload)(),
-                        "headers": {},
-                    })()
-                )
-                return client_id, "success", response
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.post(
+                        "http://127.0.0.1:58092/v1/chat/completions",
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    return client_id, "success", response.status_code
+            except httpx.HTTPStatusError as e:
+                return client_id, "http_error", e.response.status_code
             except Exception as e:
-                return client_id, "error", str(e)
+                return client_id, "error", str(type(e).__name__)
 
-        # Send 3 concurrent requests that will all encounter the error
-        tasks = [send_request(i) for i in range(3)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Send 5 concurrent requests that will all encounter the error
+        tasks = [send_request(i) for i in range(5)]
+        results = await asyncio.gather(*tasks)
 
-        # All should encounter error (either exception or 500 response)
-        # The important thing is none should hang
-        assert len(results) == 3
-        # At least verify we got results for all 3 requests
-        for i, result in enumerate(results):
-            assert result is not None, f"Request {i} returned None (likely hung)"
+        # All 5 waiters should receive HTTP 500 (the backend's error status)
+        assert len(results) == 5, "All 5 requests should complete (no hangs)"
+        for client_id, status, code in results:
+            assert status == "http_error", (
+                f"Client {client_id} got {status} instead of http_error"
+            )
+            assert code == 500, (
+                f"Client {client_id} should receive HTTP 500 from backend error, "
+                f"got {code}"
+            )
 
     finally:
-        await proxy.shutdown()
+        # Shutdown server
+        server.should_exit = True
+        await server_task
 
 
 async def test_backend_timeout_does_not_hang_waiters(mock_backend_server):
     """Backend timeout during in-flight request doesn't leave waiters hanging."""
+    import uvicorn
+
     mock = mock_backend_server
     mock.configure_timeout(duration=0.5)
+
+    # ProxyServer will be captured by the lifespan closure
+    proxy = None
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        await proxy.startup()
+        yield
+        # Shutdown
+        await proxy.shutdown()
 
     proxy = ProxyServer(
         backend_url="http://127.0.0.1:58090",
         enable_cache=True,
+        backend_timeout_seconds=0.3,  # Short timeout to trigger before mock's 0.5s
+        lifespan=lifespan,
     )
 
-    await proxy.startup()
+    # Start proxy HTTP server on port 58091
+    config = uvicorn.Config(proxy.app, host="127.0.0.1", port=58091, log_level="error")
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
+    await asyncio.sleep(1)  # Wait for server to start
 
     try:
         payload = {
@@ -321,25 +375,36 @@ async def test_backend_timeout_does_not_hang_waiters(mock_backend_server):
 
         async def send_request(client_id: int):
             try:
-                # Use a short timeout to test timeout behavior
-                async with httpx.AsyncClient(timeout=0.3) as client:
+                # Client timeout longer than proxy's backend timeout
+                async with httpx.AsyncClient(timeout=2.0) as client:
                     # Call through proxy's HTTP endpoint
                     response = await client.post(
                         "http://127.0.0.1:58091/v1/chat/completions",
                         json=payload,
                     )
+                    response.raise_for_status()  # Raise exception for 4xx/5xx
                     return client_id, "success", response.status_code
             except httpx.TimeoutException:
                 return client_id, "timeout", None
+            except httpx.HTTPStatusError as e:
+                return client_id, "http_error", e.response.status_code
             except Exception as e:
-                return client_id, "error", str(e)
+                return client_id, "error", str(type(e).__name__)
 
-        # This test needs the actual HTTP server, skip for now since it requires
-        # complex fixture setup. Keeping as placeholder for when needed.
-        pytest.skip("Timeout test requires full HTTP server fixture")
+        # Send 5 concurrent identical requests
+        tasks = [send_request(i) for i in range(5)]
+        results = await asyncio.gather(*tasks)
+
+        # All requests should get timeout errors without hanging
+        # Proxy should return 504 Gateway Timeout when backend times out
+        for client_id, status, code in results:
+            assert status == "http_error", f"Client {client_id} got {status} (code={code}) instead of http_error"
+            assert code == 504, f"Client {client_id} got status {code} instead of 504"
 
     finally:
-        await proxy.shutdown()
+        # Shutdown server
+        server.should_exit = True
+        await server_task
 
 
 async def test_sequential_identical_requests_hit_cache(proxy_to_mock, mock_backend_server):
