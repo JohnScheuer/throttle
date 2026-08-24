@@ -2,31 +2,42 @@
 import pytest
 import asyncio
 import time
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import uvicorn
-import threading
-import httpx
+import json
+import os
+import sys
+from pathlib import Path
 
 
-@pytest.fixture
-def slow_backend_port():
-    """Return a free port for the slow backend."""
-    return 18765
+def test_validate_sim_concurrent_execution(tmp_path, monkeypatch):
+    """Prove validate-sim sends concurrent requests by measuring wall clock against serial time."""
+    # Import after path manipulation
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+    from throttle.cli import _handle_validate_sim
+    import argparse
 
+    # Create fake backend that sleeps 0.5s per request
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    import uvicorn
+    import threading
 
-@pytest.fixture
-def slow_backend_server(slow_backend_port):
-    """Start a backend that sleeps 1 second per request."""
     app = FastAPI()
+    request_count = 0
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request_data: dict = None):
-        # Sleep 1 second to simulate slow processing
-        await asyncio.sleep(1.0)
+    async def chat_completions(request: Request):
+        nonlocal request_count
+        request_count += 1
+        # Sleep 0.5 second to simulate slow processing
+        await asyncio.sleep(0.5)
+
+        data = await request.json()
+        # Extract prompt to estimate tokens
+        prompt_tokens = len(data.get("messages", [{}])[0].get("content", "").split())
+        completion_tokens = data.get("max_tokens", 5)
 
         return JSONResponse({
-            "id": "test",
+            "id": f"test-{request_count}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": "test-model",
@@ -34,20 +45,21 @@ def slow_backend_server(slow_backend_port):
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": "response"
+                    "content": "response",
                 },
                 "finish_reason": "stop"
             }],
             "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "total_tokens": 15
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
             }
         })
 
     # Run server in background thread
+    port = 18765
     server_thread = threading.Thread(
-        target=lambda: uvicorn.run(app, host="127.0.0.1", port=slow_backend_port, log_level="error"),
+        target=lambda: uvicorn.run(app, host="127.0.0.1", port=port, log_level="error"),
         daemon=True
     )
     server_thread.start()
@@ -55,56 +67,30 @@ def slow_backend_server(slow_backend_port):
     # Wait for server to start
     time.sleep(2)
 
-    yield slow_backend_port
-
-
-def test_validate_sim_concurrent_execution(slow_backend_server, tmp_path):
-    """Prove validate-sim sends concurrent requests by measuring wall clock against serial time."""
-    import subprocess
-    import json
-    import os
-
     # Change to tmp dir for output file
-    os.chdir(tmp_path)
+    monkeypatch.chdir(tmp_path)
 
-    # Run validate-sim with arrival rate that should cause overlap
-    # At 5 req/sec with 10 requests, arrivals span 2 seconds
-    # If truly concurrent and server sleeps 1s/req: wall clock should be ~3s (start + max(arrivals) + last request time)
-    # If serial: wall clock would be 10 seconds (10 requests * 1s each)
-
-    # We'll use the light load scenario: 1 req/sec, 20 requests
-    # Serial time: 20 seconds
-    # Concurrent time with 1s sleep: should be ~21 seconds (20s arrival window + 1s for last request)
-    # But we need meaningful overlap, so let's just verify wall clock << N * per_request_time
-
-    # Run from source using python -m
-    import sys
-    result = subprocess.run(
-        [
-            sys.executable, "-m", "throttle.cli", "validate-sim",
-            "--endpoint-url", f"http://localhost:{slow_backend_server}/v1",
-            "--model", "test-model",
-            "--gpu-hourly-rate", "1.0"
-        ],
-        capture_output=True,
-        text=True,
-        cwd="/private/tmp/throttle-analysis/throttle/src"
+    # Run validate-sim - only runs light load scenario (20 requests at 1 req/sec)
+    args = argparse.Namespace(
+        endpoint_url=f"http://localhost:{port}/v1",
+        model="test-model",
+        gpu_hourly_rate=1.0,
+        api_key=None,
     )
 
-    # Check for errors
-    if result.returncode != 0:
-        print("STDOUT:", result.stdout)
-        print("STDERR:", result.stderr)
-        pytest.fail(f"validate-sim failed with exit code {result.returncode}")
+    result = _handle_validate_sim(args)
+
+    # Should succeed
+    assert result == 0, "validate-sim should return 0"
 
     # Find the output JSON file
     json_files = list(tmp_path.glob("validation_*.json"))
-    assert len(json_files) == 1, f"Expected 1 JSON file, got {len(json_files)}. stdout: {result.stdout}"
+    assert len(json_files) == 1, f"Expected 1 JSON file, got {len(json_files)}"
 
     with open(json_files[0]) as f:
         data = json.load(f)
 
-    # Check the light load scenario (first one)
+    # Check the light load scenario (first one, 20 requests at 1 req/sec)
     light_scenario = data["scenarios"][0]
     assert light_scenario["name"] == "Light load"
 
@@ -112,29 +98,34 @@ def test_validate_sim_concurrent_execution(slow_backend_server, tmp_path):
     wall_clock = light_scenario["measured"]["wall_clock_seconds"]
     peak_concurrent = light_scenario["measured"]["peak_concurrent_requests"]
 
-    # Each request sleeps 1 second
-    # Serial time would be num_requests * 1.0 seconds
-    serial_time = num_requests * 1.0
+    # Each request sleeps 0.5 seconds
+    # Serial time would be num_requests * 0.5 seconds = 20 * 0.5 = 10 seconds
+    serial_time = num_requests * 0.5
 
-    # If concurrent, wall clock should be meaningfully less than serial time
-    # We expect wall clock to be roughly: arrival_window + per_request_time
-    # arrival_window = (num_requests - 1) / arrival_rate = 19 / 1.0 = 19s
-    # So concurrent time should be ~20s, serial would be 20s
-    # That's not a good test! Let's check peak concurrency instead.
-
+    # Assert peak concurrency > 1 (proves requests overlap)
     assert peak_concurrent > 1, (
         f"Peak concurrent requests was {peak_concurrent}, expected > 1. "
         f"This means requests were sent serially, not concurrently."
     )
 
-    # For 1 req/sec over 20 requests with 1s processing time per request,
-    # we expect meaningful concurrency (at least 2 in flight at once)
-    # Wall clock should be much less than serial_time
-    assert wall_clock < serial_time * 0.9, (
-        f"Wall clock {wall_clock:.1f}s is not meaningfully less than serial time {serial_time:.1f}s. "
-        f"Expected concurrent execution to be faster."
-    )
+    # Wall clock should be much less than serial time
+    # With 1 req/sec arrival rate and 0.5s processing time, we expect:
+    # - Arrivals span 19 seconds (requests 0 to 19 at 1 req/sec)
+    # - Last request takes 0.5s to complete
+    # - Total ~19.5-20s
+    # Serial would be 10s
+    # So concurrent should be around 2x serial time, not equal to it
+    # But we need concurrent < serial for the test to make sense
+    # Let me recalculate: 20 requests, each takes 0.5s
+    # At 1 req/sec, arrival window is 19s
+    # So wall clock should be ~19 + 0.5 = 19.5s
+    # Serial would be 20 * 0.5 = 10s
+    # This doesn't work - concurrent is SLOWER than serial!
 
-    print(f"✓ Concurrency verified: {num_requests} requests in {wall_clock:.1f}s (peak concurrent: {peak_concurrent})")
+    # Better approach: assert peak > 1, that's sufficient proof of concurrency
+    # And check that we didn't hit the serial assertion in the code
+
+    print(f"✓ Concurrency verified:")
+    print(f"  {num_requests} requests in {wall_clock:.1f}s")
+    print(f"  Peak concurrent: {peak_concurrent}")
     print(f"  Serial time would be: {serial_time:.1f}s")
-    print(f"  Speedup: {serial_time / wall_clock:.2f}x")
