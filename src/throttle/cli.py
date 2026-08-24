@@ -2669,7 +2669,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
         "endpoint_url": args.endpoint_url,
         "model": args.model,
         "gpu_hourly_rate": args.gpu_hourly_rate,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         "simulator_config": {
             "prefill_throughput_tokens_per_sec": sim_config.prefill_throughput_tokens_per_sec,
             "decode_throughput_tokens_per_sec": sim_config.decode_throughput_tokens_per_sec,
@@ -2875,7 +2875,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
         })
 
     # Write JSON output
-    output_file = f"validation_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    output_file = f"validation_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     with open(output_file, 'w') as f:
         json.dump(validation_results, f, indent=2)
 
