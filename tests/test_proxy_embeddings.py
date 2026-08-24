@@ -11,6 +11,27 @@ from contextlib import asynccontextmanager
 from throttle.proxy import ProxyServer
 
 
+async def _wait_for_server(host: str, port: int, timeout: float = 5.0):
+    """Poll TCP connection until server accepts connections or timeout."""
+    import socket
+    import time
+
+    start = time.time()
+    interval = 0.05  # 50ms between attempts
+
+    while time.time() - start < timeout:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            sock.connect((host, port))
+            sock.close()
+            return  # Success
+        except (ConnectionRefusedError, OSError):
+            await asyncio.sleep(interval)
+
+    raise TimeoutError(f"Server at {host}:{port} did not accept connections within {timeout}s")
+
+
 @asynccontextmanager
 async def _fake_backend():
     """Mock backend that returns fixed responses on loopback."""
@@ -60,7 +81,7 @@ async def _fake_backend():
     server = uvicorn.Server(config)
 
     task = asyncio.create_task(server.serve(sockets=[sock]))
-    await asyncio.sleep(0.5)  # Let server start
+    await _wait_for_server("127.0.0.1", port)
 
     try:
         yield f"http://127.0.0.1:{port}"
@@ -105,7 +126,7 @@ async def test_embedding_hit_that_jaccard_misses():
         proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
         proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
-        await asyncio.sleep(0.5)
+        await _wait_for_server("127.0.0.1", proxy_port)
 
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
@@ -178,7 +199,7 @@ async def test_weak_paraphrase_does_not_hit_at_threshold_095():
         proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
         proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
-        await asyncio.sleep(0.5)
+        await _wait_for_server("127.0.0.1", proxy_port)
 
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
@@ -249,7 +270,7 @@ async def test_embedding_miss_on_different_model():
         proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
         proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
-        await asyncio.sleep(0.5)
+        await _wait_for_server("127.0.0.1", proxy_port)
 
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
@@ -312,7 +333,7 @@ async def test_embedding_miss_on_different_temperature():
         proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
         proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
-        await asyncio.sleep(0.5)
+        await _wait_for_server("127.0.0.1", proxy_port)
 
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
@@ -377,7 +398,7 @@ async def test_fallback_without_embeddings_extra():
         proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
         proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
-        await asyncio.sleep(0.5)
+        await _wait_for_server("127.0.0.1", proxy_port)
 
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
@@ -442,7 +463,7 @@ async def test_embedding_miss_on_cross_scope():
         proxy_config = uvicorn.Config(proxy.app, host="127.0.0.1", port=proxy_port, log_level="error")
         proxy_server = uvicorn.Server(proxy_config)
         proxy_task = asyncio.create_task(proxy_server.serve(sockets=[proxy_sock]))
-        await asyncio.sleep(0.5)
+        await _wait_for_server("127.0.0.1", proxy_port)
 
         proxy_url = f"http://127.0.0.1:{proxy_port}"
 
