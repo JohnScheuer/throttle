@@ -65,14 +65,16 @@ from throttle.keys import extract_scope_key, extract_prompt
 # Embedding availability check
 # ---------------------------------------------------------------------------
 
+from throttle.embeddings import (
+    EMBEDDINGS_AVAILABLE,
+    get_embedding,
+    get_embeddings,
+    get_failure_count,
+)
 try:
     import numpy as np
-    from optimum.onnxruntime import ORTModelForFeatureExtraction
-    from transformers import AutoTokenizer
-    import torch
-    EMBEDDINGS_AVAILABLE = True
 except ImportError:
-    EMBEDDINGS_AVAILABLE = False
+    np = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -89,7 +91,6 @@ BOUNDED_DOMAIN_THRESHOLD = 0.05  # <5% → bounded
 _SLOPE_US = (1313 - 15) / (1000 - 10)
 _INTERCEPT_US = 15 - _SLOPE_US * 10
 
-MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 
 # ---------------------------------------------------------------------------
 # Entity fingerprint (from entity guard work)
@@ -153,51 +154,6 @@ def jaccard(a: str, b: str) -> float:
 # ---------------------------------------------------------------------------
 
 
-class _EmbeddingModel:
-    def __init__(self):
-        self._tok = None
-        self._mdl = None
-        self._loaded = False
-
-    def load(self) -> bool:
-        if self._loaded:
-            return True
-        if not EMBEDDINGS_AVAILABLE:
-            return False
-        try:
-            self._tok = AutoTokenizer.from_pretrained(MODEL_ID)
-            self._mdl = ORTModelForFeatureExtraction.from_pretrained(
-                MODEL_ID, export=False
-            )
-            self._loaded = True
-            return True
-        except Exception as e:
-            print(f"Warning: could not load embedding model: {e}",
-                  file=sys.stderr)
-            return False
-
-    def encode(self, text: str) -> Optional["np.ndarray"]:
-        if not self._loaded:
-            return None
-        inputs = self._tok(
-            text, return_tensors="pt", truncation=True, max_length=128
-        )
-        with torch.no_grad():
-            out = self._mdl(**inputs)
-        te = out.last_hidden_state
-        mask = inputs["attention_mask"].unsqueeze(-1).expand(
-            te.size()
-        ).float()
-        v = (te * mask).sum(1) / mask.sum(1)
-        v = v[0].numpy()
-        norm = np.linalg.norm(v)
-        return v / norm if norm > 0 else v
-
-    def cosine(self, a: "np.ndarray", b: "np.ndarray") -> float:
-        return float(np.dot(a, b))
-
-
-_model = _EmbeddingModel()
 
 # ---------------------------------------------------------------------------
 # Lookup cost model
@@ -325,14 +281,15 @@ def run_simulation(
 
         # Tier 2: Embedding scan (within scope only)
         if embedding_available:
-            emb = _model.encode(prompt)
-            if emb is not None:
+            emb = get_embedding(prompt)
+            if emb is not None and np.any(emb != 0):
                 emb_match = None
                 emb_score = 0.0
                 for entry in scope_cache:
-                    if entry["embedding"] is None:
+                    entry_emb = entry.get("embedding")
+                    if entry_emb is None or not np.any(entry_emb != 0):
                         continue
-                    score = _model.cosine(emb, entry["embedding"])
+                    score = float(np.dot(emb, entry_emb))
                     if score >= EMBEDDING_THRESHOLD:
                         emb_match = entry
                         emb_score = score
@@ -586,6 +543,8 @@ def render_report(
     lines += [
         "INPUT",
         f"  Prompts supplied      : {total:,}",
+        f"  Embedding encode failures : {encode_failures:,}" + (" ⚠" if encode_failures else ""),
+        f"  Effective sample size : {effective_sample:,}",
         f"  Unique in cache       : {cache_size:,}",
         f"  Embedding tier        : {'available' if embedding_available else 'NOT AVAILABLE — Jaccard-only run'}",
         "",
@@ -754,8 +713,11 @@ def validate(dataset: str) -> None:
         print(f"Unknown dataset: {dataset}. Use 'bitext' or 'qqp'.")
         sys.exit(2)
 
-    embedding_ok = _model.load()
-    sim = run_simulation(prompts, embedding_ok)
+    embedding_ok = EMBEDDINGS_AVAILABLE
+    sim = run_simulation(
+        [{"text": p, "scope_key": "__single_scope__"} for p in prompts],
+        embedding_ok,
+    )
     hits = sim["hits"]
     total = sim["total"]
     actual_hit_rate = len(hits) / total if total else 0.0
@@ -838,12 +800,10 @@ def main() -> None:
     args = parse_args()
 
     if args.validate_bitext:
-        _model.load()
         validate("bitext")
         return
 
     if args.validate_qqp:
-        _model.load()
         validate("qqp")
         return
 
@@ -876,8 +836,8 @@ def main() -> None:
 
     low_sample_warning = len(requests) < MIN_PROMPTS_WARN
 
-    # Load embedding model
-    embedding_available = _model.load()
+    # Check embedding availability
+    embedding_available = EMBEDDINGS_AVAILABLE
     if not embedding_available:
         print(
             "Note: embedding dependencies not found. Running Jaccard-only "
