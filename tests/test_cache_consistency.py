@@ -1,8 +1,18 @@
 """Test embedding matrix consistency with store operations."""
 import time
 import pytest
-import numpy as np
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+    np = None
+
 from throttle.cache import SimilarityCache
+
+# Skip all tests in this module if numpy is not available
+pytestmark = pytest.mark.skipif(not NUMPY_AVAILABLE, reason="numpy required for embedding tests")
 
 
 def _assert_matrix_consistent(cache):
