@@ -165,7 +165,7 @@ class _EmbeddingModel:
         try:
             self._tok = AutoTokenizer.from_pretrained(MODEL_ID)
             self._mdl = ORTModelForFeatureExtraction.from_pretrained(
-                MODEL_ID, export=True
+                MODEL_ID, export=False
             )
             self._loaded = True
             return True
@@ -232,6 +232,8 @@ def load_prompts(path: Path) -> list[str]:
                 obj = json.loads(line)
                 if "prompt" in obj:
                     prompts.append(str(obj["prompt"]))
+                elif "query" in obj:                          # ADD THIS
+                    prompts.append(str(obj["query"]))         # ADD THIS
                 elif "content" in obj:
                     prompts.append(str(obj["content"]))
                 elif "messages" in obj:
