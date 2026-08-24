@@ -217,6 +217,7 @@ async def test_weak_paraphrase_does_not_hit_at_threshold_095():
                     },
                 )
                 assert resp1.status_code == 200
+                content1 = resp1.json()["choices"][0]["message"]["content"]
 
                 # Weak paraphrase - should NOT hit at threshold 0.95
                 resp2 = await client.post(
@@ -228,11 +229,14 @@ async def test_weak_paraphrase_does_not_hit_at_threshold_095():
                     },
                 )
                 assert resp2.status_code == 200
+                content2 = resp2.json()["choices"][0]["message"]["content"]
 
-                # Should be MISS - cosine 0.878 < threshold 0.95
+                # CRITICAL: Responses must be DIFFERENT (not cached)
+                assert content2 != content1, \
+                    f"Weak paraphrase incorrectly served cached response: {content2!r}"
+                # Metrics assertions (supplementary)
                 assert proxy.cache.metrics.misses >= 1
                 assert proxy.cache.metrics.embedding_hits == 0
-                # Verify embedding tier ran but found no match
                 assert proxy.cache.metrics.embedding_scans_attempted >= 1
         finally:
             proxy_server.should_exit = True
@@ -389,7 +393,7 @@ async def test_embedding_miss_on_different_temperature():
 
 @pytest.mark.asyncio
 async def test_fallback_without_embeddings_extra():
-    """Test d: Embeddings requested with extra absent falls back to Jaccard."""
+    """Test d: Exact match hits via Jaccard tier when embeddings enabled."""
 
     @asynccontextmanager
     async def lifespan(app):
@@ -434,7 +438,9 @@ async def test_fallback_without_embeddings_extra():
                     },
                 )
                 assert resp1.status_code == 200
+                content1 = resp1.json()["choices"][0]["message"]["content"]
 
+                # Identical request should hit cache
                 resp2 = await client.post(
                     f"{proxy_url}/v1/chat/completions",
                     json={
@@ -443,9 +449,13 @@ async def test_fallback_without_embeddings_extra():
                     },
                 )
                 assert resp2.status_code == 200
+                content2 = resp2.json()["choices"][0]["message"]["content"]
 
+                # CRITICAL: Second response must match first (cached)
+                assert content2 == content1, \
+                    f"Cache miss on exact match: got {content2!r}, expected {content1!r}"
+                # Metrics assertions (supplementary)
                 assert proxy.cache.metrics.hits >= 1
-                # Embeddings are now available with direct ONNX, but exact match hits via Jaccard tier
                 assert proxy.cache.metrics.lexical_hits >= 1
         finally:
             proxy_server.should_exit = True
