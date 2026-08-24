@@ -41,6 +41,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Cache HuggingFace Hub directory
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-hub-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2
+
       - name: Install locked test dependencies
         run: |
           python -m pip install --require-hashes \
@@ -49,10 +55,17 @@ jobs:
           python -m pip install --no-build-isolation --no-deps --editable .
           python -m pip check
 
+      - name: Install embeddings extra and pre-download model weights
+        run: |
+          python -m pip install 'onnxruntime>=1.16.0,<2' 'tokenizers>=0.15.0,<1' 'numpy>=1.24.0,<3' 'huggingface-hub>=0.20.0,<1'
+          python -m pip check
+          python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='sentence-transformers/all-MiniLM-L6-v2', filename='onnx/model.onnx'); hf_hub_download(repo_id='sentence-transformers/all-MiniLM-L6-v2', filename='tokenizer.json')"
+
       - name: Verify the offline guard and run the full suite
         env:
           PYTHONPATH: ${{ github.workspace }}/ci/offline_guard
           PYTHONWARNINGS: error
+          HF_HUB_OFFLINE: "1"
         run: |
           python ci/verify_offline_guard.py
           python -m compileall -q -f src tests ci
@@ -74,6 +87,12 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.14"
+
+      - name: Cache HuggingFace Hub directory
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-hub-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2
 
       - name: Install locked build dependencies
         run: |
@@ -116,6 +135,11 @@ jobs:
             exit 1
           fi
 
+          # Install embeddings extra and pre-download model weights
+          "${clean_env}/bin/python" -m pip install 'onnxruntime>=1.16.0,<2' 'tokenizers>=0.15.0,<1' 'numpy>=1.24.0,<3' 'huggingface-hub>=0.20.0,<1'
+          "${clean_env}/bin/python" -m pip check
+          "${clean_env}/bin/python" -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='sentence-transformers/all-MiniLM-L6-v2', filename='onnx/model.onnx'); hf_hub_download(repo_id='sentence-transformers/all-MiniLM-L6-v2', filename='tokenizer.json')"
+
           cd "${RUNNER_TEMP}"
           PYTHONPATH="${GITHUB_WORKSPACE}/ci/offline_guard" \
             "${clean_env}/bin/python" "${GITHUB_WORKSPACE}/ci/verify_installed_wheel.py" \
@@ -123,6 +147,7 @@ jobs:
           PYTHONPATH="${GITHUB_WORKSPACE}/ci/offline_guard" \
             "${clean_env}/bin/python" "${GITHUB_WORKSPACE}/ci/verify_offline_guard.py"
           PYTHONPATH="${GITHUB_WORKSPACE}/ci/offline_guard" \
+            HF_HUB_OFFLINE=1 \
             "${clean_env}/bin/python" "${GITHUB_WORKSPACE}/ci/run_tests.py" \
             --start-directory "${GITHUB_WORKSPACE}/tests"
 
