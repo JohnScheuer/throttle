@@ -28,6 +28,8 @@ class CacheMetrics:
     evictions: int = 0
     lexical_hits: int = 0
     embedding_hits: int = 0
+    embedding_scans_attempted: int = 0
+    embedding_comparisons_performed: int = 0
 
 @dataclass
 class _CacheEntry:
@@ -240,6 +242,7 @@ class SimilarityCache:
 
             # Embedding tier: Semantic match (optional, vectorized)
             if self.enable_embeddings and self._store:
+                self.metrics.embedding_scans_attempted += 1
                 query_emb = self._embed_prompt(prompt)
 
                 if query_emb is not None and self._embedding_matrix is not None and len(self._embedding_keys) > 0:
@@ -254,6 +257,10 @@ class SimilarityCache:
                     # Find best match
                     best_idx = int(np.argmax(similarities))
                     best_score = float(similarities[best_idx])
+
+                    self.metrics.embedding_comparisons_performed += len(scan_keys)
+
+                    logger.debug(f"Embedding scan: best_score={best_score:.4f}, threshold={self.embedding_threshold}, hit={best_score >= self.embedding_threshold}")
 
                     if best_score >= self.embedding_threshold:
                         best_key = scan_keys[best_idx]
