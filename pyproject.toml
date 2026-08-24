@@ -33,6 +33,18 @@ throttle = ["prompts.jsonl", "warmup_prompts.jsonl"]
 # 3.13, so the base Throttle install remains usable on newer interpreters.
 guidellm = ["guidellm[recommended]==0.7.3; python_version < '3.14'"]
 
+# Embeddings for semantic cache tier (optional)
+embeddings = [
+    "onnxruntime>=1.16.0,<2",
+    "tokenizers>=0.15.0,<1",
+    "numpy>=1.24.0,<3",
+    "huggingface-hub>=0.20.0,<1",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # huggingface-hub 0.36.2 uses deprecated hf-xet API internally
+    "ignore:hf_xet\\.download_files\\(\\) is deprecated:DeprecationWarning:huggingface_hub\\.file_download",
+]

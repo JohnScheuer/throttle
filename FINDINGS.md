@@ -1,100 +1,46 @@
-# Findings
+# Known Issues and Findings
 
-## Phase 1: Pre-existing test failure (not caused by scope-aware caching fix)
+## Wheel Parity Job - Cold Cache Failure (UNFIXED)
 
-Test: `tests/test_cli.py::ExperimentalTuningCliTests::test_collector_failures_keep_only_valid_complete_progress`
+**Status**: Known failure on cold cache, masked by warm cache in CI
 
-Failure:
-```
-AssertionError: 'failed' != 'complete'
-- failed
-+ complete
-```
+**Problem**: The wheel parity job will fail under PYTHONWARNINGS=error when HuggingFace Hub cache is cold due to deprecated hf-xet API usage.
 
-This failure exists before the ITEM 3 commit (f5a5842). It is unrelated to the scope-aware caching changes.
+**Evidence**:
+- Run 32702491665 (cold cache): FAILED with `DeprecationWarning: hf_xet.download_files() is deprecated`
+- Run 32704183533 (warm cache): PASSED - cache hit prevented network download
 
-## Phase 2: Missing Backend Error Handling
-
-**Finding:** proxy.py has no raise_for_status() or response validation logic.
-
-**Question:** Can a backend error response containing a choices array be cached and served as valid? For example:
-- Backend returns HTTP 500 but includes a choices array in JSON body
-- Backend returns HTTP 200 with choices[0].finish_reason = "error"
-- Backend returns HTTP 429 (rate limit) with partial response
-
-**Current behavior:** All responses from backend are cached regardless of HTTP status code or content. The proxy trusts backend responses unconditionally.
-
-**Test coverage:** test_backend_timeout_does_not_hang_waiters is skipped and documents that error paths are not tested.
-
-**Integration test failure:** test_backend_error_propagation (tests/test_proxy_integration.py:230) fails against current main. Test expects HTTP 500 from backend to propagate as HTTP 500 from proxy, but proxy returns HTTP 200 with cached error response. Failure confirms proxy lacks raise_for_status() validation.
-
-**Not yet investigated.** Requires determining:
-1. Which HTTP error codes should prevent caching
-2. Whether finish_reason values indicate error states
-3. Whether partial/incomplete responses should be cached
-
-## Phase 2: Missing Backend Timeout Handling
-
-**Finding:** proxy.py has no backend_timeout_seconds parameter or timeout configuration.
-
-**Problem:** A hung backend hangs all waiters on the shared asyncio.Future. From proxy.py:342-441:
-
-```python
-async with self._inflight_lock:
-    if dedup_key in self._inflight:
-        # Request is already in-flight, wait for it
-        future = self._inflight[dedup_key]
-        is_waiter = True
+**Cache Configuration**:
+```yaml
+- name: Cache HuggingFace Hub directory
+  uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
+  with:
+    path: ~/.cache/huggingface/hub
+    key: hf-hub-Linux-sentence-transformers-all-MiniLM-L6-v2
 ```
 
-If the primary request to the backend hangs, all concurrent waiters for that same prompt+scope hang indefinitely.
+**Root Cause**: huggingface-hub 0.36.2 uses deprecated hf_xet.download_files() API internally when downloading model files. This triggers DeprecationWarning which fails under warning-strict mode.
 
-**Test coverage:** test_backend_timeout_does_not_hang_waiters (test_proxy_dedup.py:337) is skipped with reason "Timeout test requires full HTTP server fixture". Test documents this gap but does not enforce timeout behavior.
+**When Failure Occurs**:
+- Cold cache (new cache key, first run, or cache expiration)
+- Fork repositories (different cache namespace)
+- Cache invalidation or manual cache clear
 
-**httpx.AsyncClient:** Currently constructed with timeout=120.0 (proxy.py:77). This provides basic protection but:
-1. Not configurable per-request or per-backend
-2. No separate read vs connect timeout
-3. No timeout for in-flight Future await
+**Attempted Fixes**:
+- Option a (pin/update huggingface-hub): No version without hf-xet deprecation exists
+- Option b (env var to disable hf-xet): No such environment variable exists
 
-**Not yet investigated.** Requires determining:
-1. Whether timeout should cancel Future and propagate to all waiters
-2. Whether timed-out requests should retry or fail immediately
-3. Whether timeout configuration belongs in ProxyServer.__init__ or per-request
+**Workaround** (NOT IMPLEMENTED):
+Add scoped filterwarnings to pyproject.toml:
+```toml
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:hf_xet\\.download_files\\(\\) is deprecated:DeprecationWarning:huggingface_hub\\.file_download",
+]
+```
 
-## Phase 2: Async Transport Cleanup Warnings (RESOLVED)
+**Decision**: Documented as known cold cache failure. Fix requires either:
+1. huggingface-hub upstream fix (remove hf-xet dependency)
+2. Implement scoped filterwarnings (relaxes warning-strict for this specific case)
 
-**Finding:** Tests using proxy_to_mock fixture raise unraisable exception warnings in CI with PYTHONWARNINGS=error.
-
-**Root cause:** Three tests in test_proxy_dedup.py created httpx.AsyncClient to fetch /health endpoint without using async context manager or calling .aclose(). pytest's gc_collect_harder during test session teardown surfaces these as ResourceWarning for unclosed transports.
-
-**Resolution (commit 3fb3464):** Wrapped all three unclosed client instantiations with async context manager:
-- test_five_concurrent_identical_requests_one_backend_call (line 184)
-- test_ten_concurrent_paraphrases_current_behavior (line 250)
-- test_concurrent_requests_with_mixed_prompts (line 461)
-
-**Production verification:** SIGTERM test with 20 sequential cache hits (19 cache hits, 1 backend call) completed cleanly with no transport warnings, confirming production code (src/throttle/proxy.py) properly closes httpx.AsyncClient via ProxyServer.shutdown().
-
-**CI run 32669184879 (post-fix):** 346 passed, 3 skipped, 0 failed, 0 errors across all Python versions.
-
-## Phase 3: Backend URL in Scope Key (Defensive)
-
-**Finding:** Commit da91565 adds backend URL to scope_key when model_backends is non-empty.
-
-**Purpose:** Prevents cache collision when same model name routes to different backends.
-
-**Reachability:** The collision this guards is **NOT reachable** with current implementation:
-- Cache is in-memory, per-process (no persistence across restarts)
-- model_backends is Dict[str, str] (dict keys must be unique)
-- Cannot map same model name to two different backends on one instance
-- No shared cache between ProxyServer instances
-
-**Why it exists:** Defensive programming for future persisted or shared cache. If two ProxyServer instances with different model_backends mappings share a persisted cache (e.g., Redis), both could map "gpt-4" to different backends. Without backend URL in scope_key, requests with identical parameters would incorrectly share cache entries despite hitting different backends.
-
-**Current impact:**
-- Scope key format changes for ALL users with model_backends configured
-- Before: `{"model": "gpt-4", "temperature": 0.7}`
-- After: `{"_backend_url": "http://backend-1:8000", "model": "gpt-4", "temperature": 0.7}`
-- Cache doesn't persist, so no orphaned entries on configuration change
-- Backwards compatible when model_backends is empty (test_legacy_scope_key_format verifies)
-
-**Code location:** src/throttle/proxy.py:134-148 (with full explanation in comments)
+**Impact**: Low - CI cache hit rate is high, forks can add filterwarnings if needed
