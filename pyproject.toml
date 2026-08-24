@@ -33,6 +33,13 @@ throttle = ["prompts.jsonl", "warmup_prompts.jsonl"]
 # 3.13, so the base Throttle install remains usable on newer interpreters.
 guidellm = ["guidellm[recommended]==0.7.3; python_version < '3.14'"]
 
+# Embeddings for semantic cache tier (optional)
+embeddings = [
+    "optimum[onnxruntime]>=1.16.0,<2",
+    "transformers>=4.36.0,<5",
+    "torch>=2.1.0,<3",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
