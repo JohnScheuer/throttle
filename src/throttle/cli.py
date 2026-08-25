@@ -648,6 +648,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="API key for authentication (also reads OPENAI_API_KEY env var)",
     )
 
+    watch = subparsers.add_parser(
+        "watch",
+        help="read vLLM /metrics and report cost per million tokens (no requests sent)",
+        description=(
+            "Passively reads vLLM /metrics (Prometheus text format) and translates "
+            "throughput into dollars per million tokens. Nothing enters the request path. "
+            "Requires --gpu-rate-per-hour. Refuses to print a cost figure when generation "
+            "throughput is unavailable."
+        ),
+    )
+    watch.add_argument(
+        "--metrics-url",
+        default="http://localhost:8000/metrics",
+        metavar="URL",
+        help="vLLM /metrics endpoint (default: http://localhost:8000/metrics)",
+    )
+    watch.add_argument(
+        "--gpu-rate-per-hour",
+        type=float,
+        required=True,
+        metavar="DOLLARS",
+        help="GPU cost in $/hr. Required — no default is honest.",
+    )
+    watch.add_argument(
+        "--interval",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="scrape interval in seconds (default: 15)",
+    )
+    watch.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="vLLM max_num_seqs for batch fill computation (optional)",
+    )
+    watch.add_argument(
+        "--json",
+        action="store_true",
+        help="emit raw JSON snapshots instead of formatted text",
+    )
+
     proxy = subparsers.add_parser(
         "proxy",
         help="run an OpenAI-compatible caching proxy server",
@@ -3571,6 +3614,51 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         return EXIT_FAILED
 
 
+def _handle_watch(args) -> int:
+    """Stream vLLM cost metrics to stdout. Nothing enters the request path."""
+    from throttle.advisor import stream_metrics
+
+    print(f"Watching {args.metrics_url} every {args.interval:.0f}s")
+    print(f"GPU rate: ${args.gpu_rate_per_hour:.2f}/hr")
+    print("Press Ctrl+C to stop.")
+    print()
+
+    try:
+        for snap in stream_metrics(
+            args.metrics_url,
+            args.gpu_rate_per_hour,
+            interval_seconds=args.interval,
+            max_num_seqs=args.max_num_seqs,
+        ):
+            if args.json:
+                import json as _json
+                print(_json.dumps(snap.to_dict()))
+                import sys as _sys
+                _sys.stdout.flush()
+            else:
+                _render_watch_snap(snap)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    return EXIT_OK
+
+
+def _render_watch_snap(snap) -> None:
+    """Format a CostSnapshot for human display."""
+    import time as _time
+    print(f"--- {_time.strftime('%H:%M:%S')} ---")
+    if snap.generation_throughput_toks_per_sec is not None:
+        print(f"  Gen throughput : {snap.generation_throughput_toks_per_sec:.1f} tok/s")
+    if snap.num_requests_running is not None:
+        fill = f" ({snap.batch_fill:.0%} fill)" if snap.batch_fill is not None else ""
+        print(f"  Requests       : {snap.num_requests_running:.0f} running{fill}")
+    if snap.cost_per_million_tokens is not None:
+        print(f"  Cost           : ${snap.cost_per_hour:.2f}/hr  "
+              f"${snap.cost_per_million_tokens:.4f}/Mtok")
+    for r in snap.refusals:
+        print(f"  ⚠ {r['figure']}: {r['reason'][:80]}")
+    print()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3643,6 +3731,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _handle_validate_sim(args)
     if args.command == "proxy":
         return _handle_proxy(args)
+    if args.command == "watch":
+        return _handle_watch(args)
     parser.error("a subcommand is required")
     return EXIT_USAGE
 
