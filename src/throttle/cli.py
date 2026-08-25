@@ -608,8 +608,8 @@ def build_parser() -> argparse.ArgumentParser:
     measure.add_argument(
         "--repeat",
         type=int,
-        default=5,
-        help="number of times to repeat the workload (default: 5)",
+        default=10,
+        help="number of times to repeat the workload (default: 10, runtime ~100 seconds at default arrival rate)",
     )
     measure.add_argument(
         "--arrival-rate",
