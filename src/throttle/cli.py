@@ -2595,6 +2595,176 @@ def _handle_cost(args: argparse.Namespace) -> int:
 
 
 
+def _handle_compare_measure(report_paths: list[str]) -> int:
+    """Compare measure outputs with statistical testing."""
+    import json
+    import random
+    import statistics
+
+    # Load all measure outputs
+    measures = []
+    for path in report_paths:
+        with open(path) as f:
+            measures.append(json.load(f))
+
+    print("Throttle Compare - Measure Outputs")
+    print("=" * 80)
+    print()
+
+    # Extract data for each measure
+    results = []
+    for m in measures:
+        label = m["label"]
+        note = m.get("note", "")
+        median_input = m["median_dollars_per_million_input"]
+        median_output = m["median_dollars_per_million_output"]
+        ci_input = m["ci_95_input"]
+        ci_output = m["ci_95_output"]
+
+        # Get per-run costs for bootstrap
+        input_costs = [r["dollars_per_million_input"] for r in m["runs"]]
+        output_costs = [r["dollars_per_million_output"] for r in m["runs"]]
+
+        results.append({
+            "label": label,
+            "note": note,
+            "median_input": median_input,
+            "median_output": median_output,
+            "ci_input": ci_input,
+            "ci_output": ci_output,
+            "input_costs": input_costs,
+            "output_costs": output_costs,
+        })
+
+    # Check for overlaps between all pairs
+    overlaps = []
+    for i in range(len(results)):
+        for j in range(i + 1, len(results)):
+            r1, r2 = results[i], results[j]
+
+            # Check if input intervals overlap
+            input_overlap = not (r1["ci_input"][1] < r2["ci_input"][0] or
+                                r2["ci_input"][1] < r1["ci_input"][0])
+
+            # Check if output intervals overlap
+            output_overlap = not (r1["ci_output"][1] < r2["ci_output"][0] or
+                                  r2["ci_output"][1] < r1["ci_output"][0])
+
+            if input_overlap or output_overlap:
+                # Compute overlap amounts
+                if input_overlap:
+                    input_overlap_start = max(r1["ci_input"][0], r2["ci_input"][0])
+                    input_overlap_end = min(r1["ci_input"][1], r2["ci_input"][1])
+                    input_overlap_amount = input_overlap_end - input_overlap_start
+                else:
+                    input_overlap_amount = 0
+
+                if output_overlap:
+                    output_overlap_start = max(r1["ci_output"][0], r2["ci_output"][0])
+                    output_overlap_end = min(r1["ci_output"][1], r2["ci_output"][1])
+                    output_overlap_amount = output_overlap_end - output_overlap_start
+                else:
+                    output_overlap_amount = 0
+
+                overlaps.append({
+                    "label1": r1["label"],
+                    "label2": r2["label"],
+                    "input_overlap": input_overlap,
+                    "output_overlap": output_overlap,
+                    "input_overlap_amount": input_overlap_amount,
+                    "output_overlap_amount": output_overlap_amount,
+                })
+
+    # If overlaps exist, cannot rank
+    if overlaps:
+        print("NO SIGNIFICANT DIFFERENCE")
+        print()
+        for overlap in overlaps:
+            print(f"{overlap['label1']} vs {overlap['label2']}:")
+            if overlap['input_overlap']:
+                print(f"  Input intervals overlap by ${overlap['input_overlap_amount']:.2f}/M")
+            if overlap['output_overlap']:
+                print(f"  Output intervals overlap by ${overlap['output_overlap_amount']:.2f}/M")
+        print()
+        print("Cannot rank configurations with overlapping confidence intervals.")
+        print()
+
+        # Still print table but without ranking
+        print("Configuration Details:")
+        print()
+        print(f"{'Label':<20} {'Note':<30} {'$/M Input':<25} {'$/M Output':<25}")
+        print("-" * 100)
+        for r in results:
+            note_display = r['note'][:28] + ".." if len(r['note']) > 30 else r['note']
+            input_display = f"${r['median_input']:.2f} [{r['ci_input'][0]:.2f}, {r['ci_input'][1]:.2f}]"
+            output_display = f"${r['median_output']:.2f} [{r['ci_output'][0]:.2f}, {r['ci_output'][1]:.2f}]"
+            print(f"{r['label']:<20} {note_display:<30} {input_display:<25} {output_display:<25}")
+
+        return EXIT_OK
+
+    # No overlaps - can rank
+    # Sort by total cost (input + output)
+    results_sorted = sorted(results, key=lambda r: r['median_input'] + r['median_output'])
+
+    print("Ranked by Total Cost ($/M tokens)")
+    print()
+
+    # Print header
+    print(f"{'Rank':<6} {'Label':<20} {'Note':<30} {'$/M Input':<25} {'$/M Output':<25}")
+    print("-" * 106)
+
+    # Print each configuration
+    for rank, r in enumerate(results_sorted, 1):
+        note_display = r['note'][:28] + ".." if len(r['note']) > 30 else r['note']
+        input_display = f"${r['median_input']:.2f} [{r['ci_input'][0]:.2f}, {r['ci_input'][1]:.2f}]"
+        output_display = f"${r['median_output']:.2f} [{r['ci_output'][0]:.2f}, {r['ci_output'][1]:.2f}]"
+        print(f"{rank:<6} {r['label']:<20} {note_display:<30} {input_display:<25} {output_display:<25}")
+
+    # Compute pairwise deltas with bootstrap
+    if len(results_sorted) >= 2:
+        print()
+        print("Pairwise Differences (bootstrap difference method, 10000 resamples):")
+        print()
+
+        for i in range(len(results_sorted) - 1):
+            r1 = results_sorted[i]
+            r2 = results_sorted[i + 1]
+
+            # Bootstrap the difference
+            random.seed(42)
+            n_bootstrap = 10000
+            input_diffs = []
+            output_diffs = []
+
+            for _ in range(n_bootstrap):
+                # Resample from each configuration's runs
+                sample1_input = statistics.median(random.choices(r1["input_costs"], k=len(r1["input_costs"])))
+                sample2_input = statistics.median(random.choices(r2["input_costs"], k=len(r2["input_costs"])))
+                input_diffs.append(sample2_input - sample1_input)
+
+                sample1_output = statistics.median(random.choices(r1["output_costs"], k=len(r1["output_costs"])))
+                sample2_output = statistics.median(random.choices(r2["output_costs"], k=len(r2["output_costs"])))
+                output_diffs.append(sample2_output - sample1_output)
+
+            input_diffs.sort()
+            output_diffs.sort()
+            ci_lower_idx = int(0.025 * n_bootstrap)
+            ci_upper_idx = int(0.975 * n_bootstrap)
+
+            input_diff_median = statistics.median(input_diffs)
+            input_diff_ci = [input_diffs[ci_lower_idx], input_diffs[ci_upper_idx]]
+
+            output_diff_median = statistics.median(output_diffs)
+            output_diff_ci = [output_diffs[ci_lower_idx], output_diffs[ci_upper_idx]]
+
+            print(f"{r2['label']} - {r1['label']}:")
+            print(f"  Input:  ${input_diff_median:+.2f}/M  [{input_diff_ci[0]:+.2f}, {input_diff_ci[1]:+.2f}]")
+            print(f"  Output: ${output_diff_median:+.2f}/M  [{output_diff_ci[0]:+.2f}, {output_diff_ci[1]:+.2f}]")
+            print()
+
+    return EXIT_OK
+
+
 def _handle_measure(args: argparse.Namespace) -> int:
     """Measure cost per million tokens with repeated trials."""
     from throttle.workload import WorkloadGenerator
@@ -3229,6 +3399,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "golden":
         return _handle_golden(parser, args)
     if args.command == "compare":
+        # Detect if these are measure outputs (have ci_95_input field) or benchmark reports
+        try:
+            with open(args.reports[0]) as f:
+                first_report = json.load(f)
+
+            if "ci_95_input" in first_report:
+                # Measure outputs - use new comparison logic
+                return _handle_compare_measure(args.reports)
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, IndexError):
+            # Fall through to original benchmark report comparison
+            pass
+
+        # Original benchmark report comparison
         try:
             if len(args.reports) not in {2, 6}:
                 parser.error(
