@@ -492,6 +492,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--output", type=Path, default=DEFAULT_COMPARE_OUTPUT)
 
+    report = subparsers.add_parser(
+        "report", help="generate HTML report with chart comparing measure outputs"
+    )
+    report.add_argument(
+        "reports",
+        nargs=2,
+        type=Path,
+        help="two measure output JSON files to compare",
+    )
+    report.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="output HTML file path",
+    )
+
     demo = subparsers.add_parser(
         "demo",
         help="run a fast simulator demo comparing baseline vs tuned configuration",
@@ -2695,7 +2711,8 @@ def _handle_compare_measure(report_paths: list[str]) -> int:
         print(f"{'Label':<20} {'Note':<30} {'$/M Input':<25} {'$/M Output':<25}")
         print("-" * 100)
         for r in results:
-            note_display = r['note'][:28] + ".." if len(r['note']) > 30 else r['note']
+            note = r['note'] or ""
+            note_display = note[:28] + ".." if len(note) > 30 else note
             input_display = f"${r['median_input']:.2f} [{r['ci_input'][0]:.2f}, {r['ci_input'][1]:.2f}]"
             output_display = f"${r['median_output']:.2f} [{r['ci_output'][0]:.2f}, {r['ci_output'][1]:.2f}]"
             print(f"{r['label']:<20} {note_display:<30} {input_display:<25} {output_display:<25}")
@@ -2715,7 +2732,8 @@ def _handle_compare_measure(report_paths: list[str]) -> int:
 
     # Print each configuration
     for rank, r in enumerate(results_sorted, 1):
-        note_display = r['note'][:28] + ".." if len(r['note']) > 30 else r['note']
+        note = r['note'] or ""
+        note_display = note[:28] + ".." if len(note) > 30 else note
         input_display = f"${r['median_input']:.2f} [{r['ci_input'][0]:.2f}, {r['ci_input'][1]:.2f}]"
         output_display = f"${r['median_output']:.2f} [{r['ci_output'][0]:.2f}, {r['ci_output'][1]:.2f}]"
         print(f"{rank:<6} {r['label']:<20} {note_display:<30} {input_display:<25} {output_display:<25}")
@@ -2765,6 +2783,179 @@ def _handle_compare_measure(report_paths: list[str]) -> int:
     return EXIT_OK
 
 
+def _handle_report(args: argparse.Namespace) -> int:
+    """Generate HTML report comparing two measure outputs."""
+    import json
+    import statistics
+
+    # Load both reports
+    try:
+        with open(args.reports[0]) as f:
+            report1 = json.load(f)
+        with open(args.reports[1]) as f:
+            report2 = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Error loading reports: {e}")
+        return EXIT_FAILED
+
+    # Validate format
+    if "ci_95_input" not in report1 or "ci_95_input" not in report2:
+        print("Error: Reports must be measure output JSON files")
+        return EXIT_FAILED
+
+    # Extract data
+    label1 = report1["label"]
+    label2 = report2["label"]
+
+    r1_input_median = report1["median_dollars_per_million_input"]
+    r1_input_ci = report1["ci_95_input"]
+    r1_output_median = report1["median_dollars_per_million_output"]
+    r1_output_ci = report1["ci_95_output"]
+
+    r2_input_median = report2["median_dollars_per_million_input"]
+    r2_input_ci = report2["ci_95_input"]
+    r2_output_median = report2["median_dollars_per_million_output"]
+    r2_output_ci = report2["ci_95_output"]
+
+    # Determine if significant (using same logic as compare)
+    # Check if confidence intervals overlap
+    input_overlap = not (r1_input_ci[1] < r2_input_ci[0] or r2_input_ci[1] < r1_input_ci[0])
+    output_overlap = not (r1_output_ci[1] < r2_output_ci[0] or r2_output_ci[1] < r1_output_ci[0])
+
+    is_significant = not (input_overlap or output_overlap)
+    banner_text = "SIGNIFICANT DIFFERENCE" if is_significant else "NO SIGNIFICANT DIFFERENCE"
+    banner_color = "#dc3545" if is_significant else "#6c757d"
+
+    # Generate HTML
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Throttle Cost Comparison</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <style>
+        body {{ font-family: system-ui, -apple-system, sans-serif; margin: 40px; background: #f8f9fa; }}
+        .container {{ max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; margin-bottom: 10px; }}
+        .banner {{ background: {banner_color}; color: white; padding: 15px; text-align: center; font-size: 20px; font-weight: bold; border-radius: 4px; margin: 20px 0; }}
+        .chart-container {{ position: relative; height: 400px; margin: 30px 0; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #dee2e6; }}
+        th {{ background: #f8f9fa; font-weight: 600; }}
+        .note {{ color: #6c757d; font-size: 14px; margin-top: 20px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Throttle Cost Comparison</h1>
+        <p>Comparing <strong>{label1}</strong> vs <strong>{label2}</strong></p>
+
+        <div class="banner">{banner_text}</div>
+
+        <div class="chart-container">
+            <canvas id="costChart"></canvas>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Configuration</th>
+                    <th>Input ($/M tokens)</th>
+                    <th>Output ($/M tokens)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>{label1}</strong></td>
+                    <td>${r1_input_median:.2f} <span style="color: #6c757d;">[${r1_input_ci[0]:.2f}, ${r1_input_ci[1]:.2f}]</span></td>
+                    <td>${r1_output_median:.2f} <span style="color: #6c757d;">[${r1_output_ci[0]:.2f}, ${r1_output_ci[1]:.2f}]</span></td>
+                </tr>
+                <tr>
+                    <td><strong>{label2}</strong></td>
+                    <td>${r2_input_median:.2f} <span style="color: #6c757d;">[${r2_input_ci[0]:.2f}, ${r2_input_ci[1]:.2f}]</span></td>
+                    <td>${r2_output_median:.2f} <span style="color: #6c757d;">[${r2_output_ci[0]:.2f}, ${r2_output_ci[1]:.2f}]</span></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <p class="note">
+            95% confidence intervals shown in brackets.
+            {"Intervals do not overlap - difference is statistically significant." if is_significant else "Intervals overlap - difference is not statistically significant."}
+        </p>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('costChart').getContext('2d');
+        new Chart(ctx, {{
+            type: 'bar',
+            data: {{
+                labels: ['{label1}', '{label2}'],
+                datasets: [
+                    {{
+                        label: 'Input ($/M tokens)',
+                        data: [{r1_input_median:.2f}, {r2_input_median:.2f}],
+                        backgroundColor: 'rgba(54, 162, 235, 0.7)',
+                        borderColor: 'rgba(54, 162, 235, 1)',
+                        borderWidth: 1,
+                        errorBars: {{
+                            '{label1}': {{minus: {r1_input_median - r1_input_ci[0]:.2f}, plus: {r1_input_ci[1] - r1_input_median:.2f}}},
+                            '{label2}': {{minus: {r2_input_median - r2_input_ci[0]:.2f}, plus: {r2_input_ci[1] - r2_input_median:.2f}}}
+                        }}
+                    }},
+                    {{
+                        label: 'Output ($/M tokens)',
+                        data: [{r1_output_median:.2f}, {r2_output_median:.2f}],
+                        backgroundColor: 'rgba(255, 99, 132, 0.7)',
+                        borderColor: 'rgba(255, 99, 132, 1)',
+                        borderWidth: 1,
+                        errorBars: {{
+                            '{label1}': {{minus: {r1_output_median - r1_output_ci[0]:.2f}, plus: {r1_output_ci[1] - r1_output_median:.2f}}},
+                            '{label2}': {{minus: {r2_output_median - r2_output_ci[0]:.2f}, plus: {r2_output_ci[1] - r2_output_median:.2f}}}
+                        }}
+                    }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{
+                    title: {{
+                        display: true,
+                        text: 'Cost per Million Tokens (95% CI)',
+                        font: {{ size: 16 }}
+                    }},
+                    legend: {{
+                        position: 'top'
+                    }}
+                }},
+                scales: {{
+                    y: {{
+                        beginAtZero: true,
+                        title: {{
+                            display: true,
+                            text: '$ / Million Tokens'
+                        }}
+                    }}
+                }}
+            }}
+        }});
+    </script>
+</body>
+</html>
+"""
+
+    # Write HTML file
+    try:
+        with open(args.out, 'w') as f:
+            f.write(html)
+        print(f"Report written to: {args.out}")
+        return EXIT_OK
+    except OSError as e:
+        print(f"Error writing report: {e}")
+        return EXIT_FAILED
+
+
 def _handle_measure(args: argparse.Namespace) -> int:
     """Measure cost per million tokens with repeated trials."""
     from throttle.workload import WorkloadGenerator
@@ -2793,7 +2984,7 @@ def _handle_measure(args: argparse.Namespace) -> int:
     try:
         with httpx.Client(timeout=10.0) as client:
             response = client.post(
-                f"{args.endpoint_url}/chat/completions",
+                f"{args.endpoint_url}/v1/chat/completions",
                 headers=headers,
                 json={
                     "model": args.model,
@@ -2869,7 +3060,7 @@ def _handle_measure(args: argparse.Namespace) -> int:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     try:
                         response = await client.post(
-                            f"{args.endpoint_url}/chat/completions",
+                            f"{args.endpoint_url}/v1/chat/completions",
                             headers=headers,
                             json={
                                 "model": args.model,
@@ -3161,7 +3352,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     try:
                         response = await client.post(
-                            f"{args.endpoint_url}/chat/completions",
+                            f"{args.endpoint_url}/v1/chat/completions",
                             headers=headers,
                             json={
                                 "model": args.model,
@@ -3398,6 +3589,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _handle_experimental_tuning(parser, args)
     if args.command == "golden":
         return _handle_golden(parser, args)
+    if args.command == "report":
+        return _handle_report(args)
     if args.command == "compare":
         # Detect if these are measure outputs (have ci_95_input field) or benchmark reports
         try:
