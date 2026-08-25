@@ -523,6 +523,7 @@ class ParserAndPlanTests(unittest.TestCase):
                 "compare",
                 "demo",
                 "cost",
+                "measure",
                 "validate-sim",
                 "proxy",
             },

@@ -574,6 +574,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="API key for authentication (also reads OPENAI_API_KEY env var)",
     )
 
+    measure = subparsers.add_parser(
+        "measure",
+        help="measure cost per million tokens with statistical rigor",
+        description=(
+            "Run repeated measurements against a live endpoint to measure cost per "
+            "million tokens with confidence intervals. Results are saved to JSON for "
+            "later comparison. The operator is responsible for server configuration - "
+            "Throttle does not restart or reconfigure the server."
+        ),
+    )
+    measure.add_argument(
+        "--endpoint-url",
+        required=True,
+        help="inference server URL to measure",
+    )
+    measure.add_argument(
+        "--model",
+        default="default",
+        help="model name (default: 'default')",
+    )
+    measure.add_argument(
+        "--gpu-hourly-rate",
+        type=float,
+        required=True,
+        help="GPU hourly rate in dollars",
+    )
+    measure.add_argument(
+        "--label",
+        required=True,
+        help="label for this measurement (used as output filename)",
+    )
+    measure.add_argument(
+        "--repeat",
+        type=int,
+        default=5,
+        help="number of times to repeat the workload (default: 5)",
+    )
+    measure.add_argument(
+        "--note",
+        help="optional note about server configuration",
+    )
+    measure.add_argument(
+        "--api-key",
+        help="API key for authentication (also reads OPENAI_API_KEY env var)",
+    )
+
     proxy = subparsers.add_parser(
         "proxy",
         help="run an OpenAI-compatible caching proxy server",
@@ -2537,6 +2583,228 @@ def _handle_cost(args: argparse.Namespace) -> int:
 
 
 
+def _handle_measure(args: argparse.Namespace) -> int:
+    """Measure cost per million tokens with repeated trials."""
+    from throttle.workload import WorkloadGenerator
+    from throttle.cost_model import calculate_cost
+    import time
+    import json
+    from datetime import datetime
+    import statistics
+
+    try:
+        import httpx
+    except ImportError:
+        print("Error: httpx is required for measure")
+        print("Install with: pip install httpx")
+        return EXIT_FAILED
+
+    api_key = _get_api_key(args)
+    headers = _build_headers(api_key)
+
+    print(f"Throttle Measure - {args.label}")
+    print("=" * 60)
+    print()
+
+    # Test endpoint connectivity first
+    print(f"Testing connection to {args.endpoint_url}...")
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                f"{args.endpoint_url}/chat/completions",
+                headers=headers,
+                json={
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 1,
+                },
+            )
+            if response.status_code != 200:
+                print(f"Error: Endpoint returned status {response.status_code}")
+                return EXIT_FAILED
+    except httpx.RequestError as e:
+        print(f"Error: Cannot connect to endpoint: {e}")
+        return EXIT_FAILED
+
+    print("Connection successful.")
+    print()
+
+    # Fixed workload: 20 requests at 1 req/sec (same as validate-sim light load)
+    arrival_rate = 1.0
+    num_requests = 20
+    mean_prompt_tokens = 200
+    mean_output_tokens = 150
+
+    print(f"Running {args.repeat} trials...")
+    print(f"  Workload: {num_requests} requests at {arrival_rate:.1f} req/sec")
+    print(f"  Mean prompt tokens: {mean_prompt_tokens}")
+    print(f"  Mean output tokens: {mean_output_tokens}")
+    print()
+
+    workload_gen = WorkloadGenerator(seed=42)
+    all_runs = []
+
+    for run_idx in range(args.repeat):
+        print(f"Trial {run_idx + 1}/{args.repeat}...", end=" ", flush=True)
+
+        # Generate workload (same for all runs for consistency)
+        workload = workload_gen.generate_chat_workload(
+            num_requests=num_requests,
+            arrival_rate_requests_per_sec=arrival_rate,
+            mean_prompt_tokens=mean_prompt_tokens,
+            mean_output_tokens=mean_output_tokens,
+        )
+
+        # Reuse validate-sim's concurrent dispatch
+        async def run_concurrent_workload():
+            import asyncio
+            import threading
+
+            measured_requests = []
+            real_total_input = 0
+            real_total_output = 0
+            peak_concurrent = 0
+            current_in_flight = 0
+            lock = threading.Lock()
+
+            async def send_request(arrival_time, prompt_tokens, max_tokens, request_idx):
+                nonlocal real_total_input, real_total_output, peak_concurrent, current_in_flight
+
+                # Wait until scheduled arrival time
+                if arrival_time > 0:
+                    await asyncio.sleep(arrival_time)
+
+                # Track in-flight requests
+                with lock:
+                    current_in_flight += 1
+                    if current_in_flight > peak_concurrent:
+                        peak_concurrent = current_in_flight
+
+                prompt = "Test " * prompt_tokens
+                req_start = time.perf_counter_ns()
+
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    try:
+                        response = await client.post(
+                            f"{args.endpoint_url}/chat/completions",
+                            headers=headers,
+                            json={
+                                "model": args.model,
+                                "messages": [{"role": "user", "content": prompt}],
+                                "max_tokens": max_tokens,
+                            },
+                        )
+                        req_end = time.perf_counter_ns()
+
+                        if response.status_code != 200:
+                            raise Exception(f"Request {request_idx+1} failed with status {response.status_code}")
+
+                        data = response.json()
+                        usage = data.get("usage", {})
+                        actual_input = usage.get("prompt_tokens", 0)
+                        actual_output = usage.get("completion_tokens", 0)
+
+                        with lock:
+                            real_total_input += actual_input
+                            real_total_output += actual_output
+                            current_in_flight -= 1
+
+                        req_duration_ns = req_end - req_start
+                        result = {
+                            "prompt_tokens": actual_input,
+                            "completion_tokens": actual_output,
+                            "duration_seconds": req_duration_ns / 1e9,
+                        }
+
+                        return result
+                    except Exception as e:
+                        with lock:
+                            current_in_flight -= 1
+                        raise
+
+            # Launch all tasks concurrently
+            tasks = [
+                send_request(arrival_time, prompt_tokens, max_tokens, i)
+                for i, (arrival_time, prompt_tokens, max_tokens) in enumerate(workload)
+            ]
+
+            overall_start = time.perf_counter_ns()
+            measured_requests = await asyncio.gather(*tasks)
+            overall_end = time.perf_counter_ns()
+            real_wall_clock = (overall_end - overall_start) / 1e9
+
+            return measured_requests, real_total_input, real_total_output, real_wall_clock, peak_concurrent
+
+        try:
+            import asyncio
+            measured_requests, real_total_input, real_total_output, real_wall_clock, peak_concurrent = asyncio.run(run_concurrent_workload())
+        except Exception as e:
+            print(f"FAILED: {e}")
+            return EXIT_FAILED
+
+        real_cost = calculate_cost(
+            input_tokens=real_total_input,
+            output_tokens=real_total_output,
+            wall_clock_seconds=real_wall_clock,
+            gpu_hourly_rate_dollars=args.gpu_hourly_rate,
+        )
+
+        all_runs.append({
+            "run_index": run_idx,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "wall_clock_seconds": real_wall_clock,
+            "total_input_tokens": real_total_input,
+            "total_output_tokens": real_total_output,
+            "dollars_per_million_input": real_cost.dollars_per_million_input_tokens,
+            "dollars_per_million_output": real_cost.dollars_per_million_output_tokens,
+            "total_dollars": real_cost.total_dollars,
+            "peak_concurrent_requests": peak_concurrent,
+            "per_request_timings": measured_requests,
+        })
+
+        print(f"${real_cost.dollars_per_million_input_tokens:.2f}/M in, ${real_cost.dollars_per_million_output_tokens:.2f}/M out")
+
+    # Compute median across runs
+    input_costs = [r["dollars_per_million_input"] for r in all_runs]
+    output_costs = [r["dollars_per_million_output"] for r in all_runs]
+    median_input = statistics.median(input_costs)
+    median_output = statistics.median(output_costs)
+
+    print()
+    print(f"Median across {args.repeat} trials:")
+    print(f"  ${median_input:.2f} per million input tokens")
+    print(f"  ${median_output:.2f} per million output tokens")
+    print()
+
+    # Write results to JSON
+    output = {
+        "label": args.label,
+        "endpoint_url": args.endpoint_url,
+        "model": args.model,
+        "gpu_hourly_rate": args.gpu_hourly_rate,
+        "note": args.note if args.note else None,
+        "workload": {
+            "num_requests": num_requests,
+            "arrival_rate_req_per_sec": arrival_rate,
+            "mean_prompt_tokens": mean_prompt_tokens,
+            "mean_output_tokens": mean_output_tokens,
+        },
+        "num_trials": args.repeat,
+        "median_dollars_per_million_input": median_input,
+        "median_dollars_per_million_output": median_output,
+        "runs": all_runs,
+    }
+
+    output_file = f"{args.label}.json"
+    with open(output_file, 'w') as f:
+        json.dump(output, f, indent=2)
+
+    print(f"Results written to: {output_file}")
+    print()
+
+    return EXIT_OK
+
+
 def _handle_validate_sim(args: argparse.Namespace) -> int:
     """Validate simulator accuracy against real measurements at three load levels."""
     from throttle.simulator import VLLMSimulator, SimulatorConfig
@@ -2952,8 +3220,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _handle_demo(args)
     if args.command == "cost":
         return _handle_cost(args)
-    if args.command == "tune":
-        return _handle_tune(args)
+    if args.command == "measure":
+        return _handle_measure(args)
     if args.command == "validate-sim":
         return _handle_validate_sim(args)
     if args.command == "proxy":
