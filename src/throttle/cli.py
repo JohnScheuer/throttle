@@ -543,35 +543,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="API key for authentication (also reads OPENAI_API_KEY env var)",
     )
 
-    tune = subparsers.add_parser(
-        "tune",
-        help="find optimal configuration by measuring costs at different settings",
-        description=(
-            "Run cost measurements across different configurations to find the optimal "
-            "setup. This is a simplified version - for production use, run 'throttle golden' "
-            "for the full counterbalanced protocol."
-        ),
-    )
-    tune.add_argument(
-        "--endpoint-url",
-        required=True,
-        help="inference server URL (e.g., http://localhost:8000/v1)",
-    )
-    tune.add_argument(
-        "--model",
-        default="default",
-        help="model name to request (default: 'default')",
-    )
-    tune.add_argument(
-        "--gpu-hourly-rate",
-        type=float,
-        required=True,
-        help="GPU hourly rate in dollars",
-    )
-    tune.add_argument(
-        "--api-key",
-        help="API key for authentication (also reads OPENAI_API_KEY env var)",
-    )
 
     validate_sim = subparsers.add_parser(
         "validate-sim",
@@ -2564,38 +2535,6 @@ def _handle_cost(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _handle_tune(args: argparse.Namespace) -> int:
-    """Find optimal configuration by measuring costs."""
-    print("Throttle Tune - Configuration Optimization")
-    print("=" * 60)
-    print()
-    print("Note: This is a simplified tuning command.")
-    print("For production use, run 'throttle golden' for the full counterbalanced protocol.")
-    print()
-    print(f"Endpoint: {args.endpoint_url}")
-    print(f"GPU hourly rate: ${args.gpu_hourly_rate:.2f}/hour")
-    print()
-    print("Running cost measurement at current configuration...")
-    print()
-
-    # For now, just run a single cost measurement
-    # In the future, this could sweep concurrency levels or other parameters
-    import argparse as ap
-    cost_args = ap.Namespace(
-        endpoint_url=args.endpoint_url,
-        model=args.model,
-        gpu_hourly_rate=args.gpu_hourly_rate,
-        num_requests=20,
-        api_key=args.api_key if hasattr(args, 'api_key') else None,
-    )
-
-    result = _handle_cost(cost_args)
-
-    if result == EXIT_OK:
-        print()
-        print("Tuning complete. For multi-configuration testing, use 'throttle golden'.")
-
-    return result
 
 
 def _handle_validate_sim(args: argparse.Namespace) -> int:
