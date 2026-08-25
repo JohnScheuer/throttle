@@ -120,10 +120,82 @@ def run_try(
     Scrape metrics for duration_minutes, print throughput summary.
     Does not change any config — user applies the change manually first.
     """
-    print(f"\n--try: measuring throughput for {duration_minutes}m")
-    print(f"  Config label  : {config_str}")
-    print(f"  NOTE: Apply '{config_str}' to your vLLM instance before")
-    print(f"        starting this measurement.")
+    print(f"\n--try: {config_str}")
+    print()
+    print(f"  This flag must be set at vLLM launch — it cannot be changed")
+    print(f"  on a running server. Before this measurement starts:")
+    print()
+    print(f"  1. Stop your vLLM server")
+    print(f"  2. Restart it with: --{config_str.replace('=', ' ')}")
+    print(f"  3. Wait for it to be ready")
+    print()
+
+    input("  Press Enter when vLLM is running with the new config, "
+           "or Ctrl+C to abort: ")
+
+    # Verify restart actually happened: counters reset to zero on vLLM restart.
+    # This is a reliable signal — a running server has non-zero counters.
+    print()
+    print("  Verifying restart...")
+    import sys
+    sys.path.insert(0, "src")
+    from throttle.advisor import _scrape
+
+    try:
+        metrics_after = _scrape(metrics_url)
+    except ConnectionError as e:
+        print(f"  ERROR: Cannot reach {metrics_url}: {e}")
+        print(f"  Is vLLM running?")
+        return
+
+    # Check for counter reset: num_preemptions_total resets to 0 on restart
+    preemptions = metrics_after.get("vllm:num_preemptions_total", None)
+    requests_total = metrics_after.get("vllm:request_success_total", None)
+
+    restarted = False
+    if preemptions is not None and preemptions == 0.0:
+        restarted = True
+        print("  ✓ Server appears restarted (preemption counter at zero)")
+    elif requests_total is not None and requests_total == 0.0:
+        restarted = True
+        print("  ✓ Server appears restarted (request counter at zero)")
+    else:
+        print("  ⚠ Cannot confirm server restarted.")
+        print("    Preemption and request counters are non-zero.")
+        print("    If you did restart, counters may have already accumulated.")
+        confirm = input("  Continue anyway? (y/N): ").strip().lower()
+        if confirm != "y":
+            print("  Aborted. Restart vLLM and try again.")
+            return
+
+    # If config key is a known vLLM metric label, try to verify the value
+    # vLLM exposes some config in metric labels — check if we can read it
+    config_key = config_str.split("=")[0].strip() if "=" in config_str else None
+    config_val = config_str.split("=")[1].strip() if "=" in config_str else None
+
+    if config_key and config_val:
+        # Look for the key in metric label values
+        # vLLM labels appear as: metric_name{max_num_seqs="64",...} value
+        label_verified = False
+        for raw_line in _scrape.__doc__ or []:  # placeholder — see below
+            pass
+        # Re-scrape raw text to check labels
+        import urllib.request
+        try:
+            with urllib.request.urlopen(metrics_url, timeout=5) as resp:
+                raw_body = resp.read().decode("utf-8")
+            needle = f'{config_key}="{config_val}"'
+            needle2 = f"{config_key}={config_val}"
+            if needle in raw_body or needle2 in raw_body:
+                print(f"  ✓ Verified: {config_key}={config_val} visible in metrics labels")
+                label_verified = True
+            else:
+                # Key not in labels — can't verify, but don't block
+                print(f"  ~ {config_key} not visible in metrics labels "
+                      f"(vLLM does not expose all config as labels)")
+                print(f"    Measurement will proceed unverified.")
+        except Exception:
+            pass  # verification is best-effort, not a gate
     print()
     print(f"  {'Elapsed':>8}  {'Throughput':>14}  {'Cost':>16}  {'Batch fill'}")
     print(f"  {'-'*8}  {'-'*14}  {'-'*16}  {'-'*12}")
