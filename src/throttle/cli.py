@@ -612,6 +612,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of times to repeat the workload (default: 5)",
     )
     measure.add_argument(
+        "--arrival-rate",
+        type=float,
+        default=10.0,
+        help="arrival rate in requests per second (default: 10.0)",
+    )
+    measure.add_argument(
+        "--num-requests",
+        type=int,
+        default=100,
+        help="number of requests per trial (default: 100)",
+    )
+    measure.add_argument(
         "--note",
         help="optional note about server configuration",
     )
@@ -2629,9 +2641,9 @@ def _handle_measure(args: argparse.Namespace) -> int:
     print("Connection successful.")
     print()
 
-    # Fixed workload: 20 requests at 1 req/sec (same as validate-sim light load)
-    arrival_rate = 1.0
-    num_requests = 20
+    # Workload parameters from args
+    arrival_rate = args.arrival_rate
+    num_requests = args.num_requests
     mean_prompt_tokens = 200
     mean_output_tokens = 150
 
@@ -2639,6 +2651,7 @@ def _handle_measure(args: argparse.Namespace) -> int:
     print(f"  Workload: {num_requests} requests at {arrival_rate:.1f} req/sec")
     print(f"  Mean prompt tokens: {mean_prompt_tokens}")
     print(f"  Mean output tokens: {mean_output_tokens}")
+    print(f"  Fixed seed: trials measure server variance, not workload variance")
     print()
 
     workload_gen = WorkloadGenerator(seed=42)
@@ -2647,7 +2660,7 @@ def _handle_measure(args: argparse.Namespace) -> int:
     for run_idx in range(args.repeat):
         print(f"Trial {run_idx + 1}/{args.repeat}...", end=" ", flush=True)
 
-        # Generate workload (same for all runs for consistency)
+        # Generate workload (same seed for all runs to measure server variance only)
         workload = workload_gen.generate_chat_workload(
             num_requests=num_requests,
             arrival_rate_requests_per_sec=arrival_rate,
@@ -2764,16 +2777,39 @@ def _handle_measure(args: argparse.Namespace) -> int:
 
         print(f"${real_cost.dollars_per_million_input_tokens:.2f}/M in, ${real_cost.dollars_per_million_output_tokens:.2f}/M out")
 
-    # Compute median across runs
+    # Compute median and bootstrap 95% CI across runs
     input_costs = [r["dollars_per_million_input"] for r in all_runs]
     output_costs = [r["dollars_per_million_output"] for r in all_runs]
     median_input = statistics.median(input_costs)
     median_output = statistics.median(output_costs)
 
+    # Bootstrap percentile confidence intervals
+    import random
+    random.seed(42)
+    n_bootstrap = 10000
+    bootstrap_input = []
+    bootstrap_output = []
+    for _ in range(n_bootstrap):
+        resample = random.choices(range(len(all_runs)), k=len(all_runs))
+        bootstrap_input.append(statistics.median([input_costs[i] for i in resample]))
+        bootstrap_output.append(statistics.median([output_costs[i] for i in resample]))
+
+    bootstrap_input.sort()
+    bootstrap_output.sort()
+    ci_lower_idx = int(0.025 * n_bootstrap)
+    ci_upper_idx = int(0.975 * n_bootstrap)
+
+    input_ci_lower = bootstrap_input[ci_lower_idx]
+    input_ci_upper = bootstrap_input[ci_upper_idx]
+    output_ci_lower = bootstrap_output[ci_lower_idx]
+    output_ci_upper = bootstrap_output[ci_upper_idx]
+
     print()
-    print(f"Median across {args.repeat} trials:")
-    print(f"  ${median_input:.2f} per million input tokens")
-    print(f"  ${median_output:.2f} per million output tokens")
+    print(f"Results (95% CI via bootstrap percentile method, {n_bootstrap} resamples):")
+    print(f"  Input:  ${median_input:.2f}/M  [${input_ci_lower:.2f}, ${input_ci_upper:.2f}]")
+    print(f"  Output: ${median_output:.2f}/M  [${output_ci_lower:.2f}, ${output_ci_upper:.2f}]")
+    print()
+    print(f"Interval reflects server variance at a fixed workload, not variation in traffic mix.")
     print()
 
     # Write results to JSON
@@ -2788,10 +2824,15 @@ def _handle_measure(args: argparse.Namespace) -> int:
             "arrival_rate_req_per_sec": arrival_rate,
             "mean_prompt_tokens": mean_prompt_tokens,
             "mean_output_tokens": mean_output_tokens,
+            "fixed_seed_explanation": "trials measure server variance, not workload variance",
         },
         "num_trials": args.repeat,
         "median_dollars_per_million_input": median_input,
         "median_dollars_per_million_output": median_output,
+        "ci_95_input": [input_ci_lower, input_ci_upper],
+        "ci_95_output": [output_ci_lower, output_ci_upper],
+        "ci_method": "bootstrap percentile",
+        "ci_resamples": n_bootstrap,
         "runs": all_runs,
     }
 
