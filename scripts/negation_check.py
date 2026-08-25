@@ -22,12 +22,14 @@ def get_repo_url():
                 url = line.split()[1]
                 if url.startswith("git@"):
                     url = url.replace(":", "/").replace("git@", "https://")
+                if url.startswith("https://"):
+                    url = url.replace("https://", "")
                 if url.endswith(".git"):
                     url = url[:-4]
                 return url
     except:
         pass
-    return "https://github.com/KushagraKanaujia/throttle"
+    return "github.com/KushagraKanaujia/throttle"
 
 def cosine_sim(a, b):
     """Compute cosine similarity between two vectors."""
@@ -35,6 +37,21 @@ def cosine_sim(a, b):
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(x * x for x in b))
     return dot / (mag_a * mag_b) if mag_a and mag_b else 0.0
+
+def strip_prefix(text):
+    """Strip 'user: ' prefix from prompt."""
+    if text.startswith("user: "):
+        return text[6:]
+    return text
+
+def supports_color():
+    """Check if terminal supports color."""
+    return hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+
+def supports_unicode():
+    """Check if terminal supports unicode."""
+    encoding = sys.stdout.encoding or ''
+    return encoding.lower() in ('utf-8', 'utf8')
 
 def main():
     parser = argparse.ArgumentParser(
@@ -107,21 +124,58 @@ def main():
     
     # Default output
     if not args.full:
-        print(f"{len(false_matches)} QUESTION PAIRS WOULD GET THE WRONG CACHED ANSWER")
+        use_color = supports_color()
+        use_unicode = supports_unicode()
+
+        # ANSI color codes
+        RED = '\033[91m' if use_color else ''
+        DIM = '\033[2m' if use_color else ''
+        RESET = '\033[0m' if use_color else ''
+
+        # Box drawing characters
+        if use_unicode:
+            top_left = '╭'
+            top_right = '╮'
+            bottom_left = '╰'
+            bottom_right = '╯'
+            horiz = '─'
+            sep_line = '─' * 64
+        else:
+            top_left = '+'
+            top_right = '+'
+            bottom_left = '+'
+            bottom_right = '+'
+            horiz = '-'
+            sep_line = '-' * 64
+
+        # Header box
+        title = f"  {len(false_matches)} QUESTION PAIRS WOULD GET THE WRONG CACHED ANSWER"
+        box_width = 64
+        title_padding = box_width - len(title.strip()) - 2
+
+        print(f"  {top_left}{horiz * (box_width - 2)}{top_right}")
+        print(f"  │{title}{' ' * title_padding}│" if use_unicode else f"  |{title}{' ' * title_padding}|")
+        print(f"  {bottom_left}{horiz * (box_width - 2)}{bottom_right}")
         print()
-        
+
+        # False matches
         for fm in false_matches:
-            print(f'  "{fm["p1"]}"')
-            print(f'  "{fm["p2"]}"')
-            print(f'  Similarity: {fm["sim"]:.4f} — your cache treats these as the same question.')
-            print(f"  They are not.")
+            p1 = strip_prefix(fm["p1"])
+            p2 = strip_prefix(fm["p2"])
+            score = f"{fm['sim']:.4f}"
+
+            print(f"    {RED}{score}{RESET}   {p1}")
+            print(f"             {p2}")
+            print(f"             {DIM}→ your cache treats these as the same question{RESET}")
             print()
-        
-        print(f"Embedder: {embedder_name}")
-        print(f"Threshold: {args.threshold}")
-        print(f"Measured against {len(pairs)} pairs. Run with --full for the complete table.")
+
+        # Footer
+        print(f"  {sep_line}")
+        print(f"  Embedder    {embedder_name}")
+        print(f"  Threshold   {args.threshold}")
+        print(f"  Pairs       {len(pairs)} measured · run --full for the complete table")
         print()
-        print(get_repo_url())
+        print(f"  {get_repo_url()}")
     else:
         # Full output
         print(f"COMPLETE TABLE")
@@ -129,28 +183,32 @@ def main():
         print(f"Embedder: {embedder_name}")
         print(f"Threshold: {args.threshold}")
         print()
-        
+
         print(f"FALSE MATCHES ({len(false_matches)} pairs):")
         print()
         for fm in false_matches:
-            print(f'  "{fm["p1"]}"')
-            print(f'  "{fm["p2"]}"')
+            p1 = strip_prefix(fm["p1"])
+            p2 = strip_prefix(fm["p2"])
+            print(f'  "{p1}"')
+            print(f'  "{p2}"')
             print(f'  Similarity: {fm["sim"]:.4f} [{fm["cat"]}]')
             print()
-        
+
         print(f"PARAPHRASE RECALL: {len(paraphrases) - len(lost)}/{len(paraphrases)} ({100*(len(paraphrases) - len(lost))/len(paraphrases):.0f}%)")
         print(f"Lost paraphrases: {len(lost)}")
         print()
-        
+
         print("ALL PAIRS (sorted by similarity):")
         print()
         for r in results:
             marker = "✓" if r["sim"] >= args.threshold else " "
             cat_label = r["cat"][:10].ljust(10)
-            p1_short = r["p1"][:30] + "..." if len(r["p1"]) > 30 else r["p1"]
-            p2_short = r["p2"][:30] + "..." if len(r["p2"]) > 30 else r["p2"]
+            p1 = strip_prefix(r["p1"])
+            p2 = strip_prefix(r["p2"])
+            p1_short = p1[:30] + "..." if len(p1) > 30 else p1
+            p2_short = p2[:30] + "..." if len(p2) > 30 else p2
             print(f"{marker} {r['sim']:.4f} [{cat_label}] {p1_short} / {p2_short}")
-        
+
         print()
         print(get_repo_url())
     
