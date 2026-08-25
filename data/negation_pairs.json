@@ -1,0 +1,408 @@
+{
+  "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "date_measured": "2026-08-24",
+  "pairs": [
+    {
+      "prompt1": "user: What is the capital of France?",
+      "prompt2": "user: Tell me the capital of France",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9474339485168457
+    },
+    {
+      "prompt1": "user: How do I install Python?",
+      "prompt2": "user: What's the process for installing Python?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.8968380689620972
+    },
+    {
+      "prompt1": "user: Explain async/await in JavaScript",
+      "prompt2": "user: Can you describe async/await in JavaScript?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9127300381660461
+    },
+    {
+      "prompt1": "user: How to reverse a list in Python?",
+      "prompt2": "user: What's the way to reverse a list in Python?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9943851232528687
+    },
+    {
+      "prompt1": "user: Best practices for REST APIs",
+      "prompt2": "user: What are the best practices for REST APIs?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9850294589996338
+    },
+    {
+      "prompt1": "user: Debug memory leak in Node.js",
+      "prompt2": "user: How can I debug a memory leak in Node.js?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9632611274719238
+    },
+    {
+      "prompt1": "user: Optimize SQL query performance",
+      "prompt2": "user: How do I optimize SQL query performance?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9605443477630615
+    },
+    {
+      "prompt1": "user: Set up CI/CD with GitHub Actions",
+      "prompt2": "user: How to set up CI/CD using GitHub Actions?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9849020838737488
+    },
+    {
+      "prompt1": "user: Docker vs Kubernetes differences",
+      "prompt2": "user: What are the differences between Docker and Kubernetes?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9222761392593384
+    },
+    {
+      "prompt1": "user: React hooks best practices",
+      "prompt2": "user: What are best practices for React hooks?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9826422333717346
+    },
+    {
+      "prompt1": "user: Handle errors in async Python",
+      "prompt2": "user: How should I handle errors in async Python?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9724010229110718
+    },
+    {
+      "prompt1": "user: GraphQL vs REST comparison",
+      "prompt2": "user: Can you compare GraphQL and REST?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9347617626190186
+    },
+    {
+      "prompt1": "user: Test React components",
+      "prompt2": "user: How do I test React components?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9488964676856995
+    },
+    {
+      "prompt1": "user: Set up PostgreSQL on Ubuntu",
+      "prompt2": "user: How to set up PostgreSQL on Ubuntu?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9863032698631287
+    },
+    {
+      "prompt1": "user: Improve API response time",
+      "prompt2": "user: How can I improve my API response time?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9685846567153931
+    },
+    {
+      "prompt1": "user: Configure Nginx for production",
+      "prompt2": "user: How do I configure Nginx for production?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9797219634056091
+    },
+    {
+      "prompt1": "user: Implement JWT authentication",
+      "prompt2": "user: How to implement JWT authentication?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9830970764160156
+    },
+    {
+      "prompt1": "user: Profile Python code performance",
+      "prompt2": "user: How can I profile Python code performance?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.8574211597442627
+    },
+    {
+      "prompt1": "user: Set up Redis caching",
+      "prompt2": "user: How do I set up Redis caching?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.979687511920929
+    },
+    {
+      "prompt1": "user: Deploy app to AWS",
+      "prompt2": "user: How to deploy an app to AWS?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9761132001876831
+    },
+    {
+      "prompt1": "user: Migrate from MySQL to PostgreSQL",
+      "prompt2": "user: How do I migrate from MySQL to PostgreSQL?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9810342192649841
+    },
+    {
+      "prompt1": "user: Handle CORS in Express",
+      "prompt2": "user: How should I handle CORS in Express?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.959609866142273
+    },
+    {
+      "prompt1": "user: Optimize React rendering",
+      "prompt2": "user: How can I optimize React rendering?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9791322946548462
+    },
+    {
+      "prompt1": "user: Set up monitoring with Prometheus",
+      "prompt2": "user: How to set up monitoring using Prometheus?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9829784631729126
+    },
+    {
+      "prompt1": "user: Implement rate limiting",
+      "prompt2": "user: How do I implement rate limiting?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9756765365600586
+    },
+    {
+      "prompt1": "user: Configure SSL certificates",
+      "prompt2": "user: How to configure SSL certificates?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9786747694015503
+    },
+    {
+      "prompt1": "user: Debug TypeScript compilation errors",
+      "prompt2": "user: How can I debug TypeScript compilation errors?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9523887634277344
+    },
+    {
+      "prompt1": "user: Set up load balancing",
+      "prompt2": "user: How do I set up load balancing?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9665971398353577
+    },
+    {
+      "prompt1": "user: Implement WebSocket connections",
+      "prompt2": "user: How to implement WebSocket connections?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9804931879043579
+    },
+    {
+      "prompt1": "user: Optimize database indexes",
+      "prompt2": "user: How can I optimize database indexes?",
+      "category": "paraphrase",
+      "cosine_similarity": 0.9685418009757996
+    },
+    {
+      "prompt1": "user: How do I enable caching in Redis?",
+      "prompt2": "user: How do I disable caching in Redis?",
+      "category": "antonym",
+      "cosine_similarity": 0.9463594555854797
+    },
+    {
+      "prompt1": "user: Is it safe to use eval in Python?",
+      "prompt2": "user: Is it dangerous to use eval in Python?",
+      "category": "antonym",
+      "cosine_similarity": 0.9874380826950073
+    },
+    {
+      "prompt1": "user: How to increase request timeout?",
+      "prompt2": "user: How to decrease request timeout?",
+      "category": "antonym",
+      "cosine_similarity": 0.9784162640571594
+    },
+    {
+      "prompt1": "user: Should I encrypt API keys?",
+      "prompt2": "user: Should I decrypt API keys?",
+      "category": "antonym",
+      "cosine_similarity": 0.9033988118171692
+    },
+    {
+      "prompt1": "user: How to compress images?",
+      "prompt2": "user: How to decompress images?",
+      "category": "antonym",
+      "cosine_similarity": 0.7756012082099915
+    },
+    {
+      "prompt1": "user: Why is my API slow?",
+      "prompt2": "user: Why is my API fast?",
+      "category": "antonym",
+      "cosine_similarity": 0.9485366940498352
+    },
+    {
+      "prompt1": "user: How to enable debug mode?",
+      "prompt2": "user: How to disable debug mode?",
+      "category": "antonym",
+      "cosine_similarity": 0.914228618144989
+    },
+    {
+      "prompt1": "user: Should I cache this query?",
+      "prompt2": "user: Should I skip caching this query?",
+      "category": "antonym",
+      "cosine_similarity": 0.9245002865791321
+    },
+    {
+      "prompt1": "user: How to lock database rows?",
+      "prompt2": "user: How to unlock database rows?",
+      "category": "antonym",
+      "cosine_similarity": 0.8497971296310425
+    },
+    {
+      "prompt1": "user: When to scale up?",
+      "prompt2": "user: When to scale down?",
+      "category": "antonym",
+      "cosine_similarity": 0.9476901888847351
+    },
+    {
+      "prompt1": "user: How do I install pandas 1.5?",
+      "prompt2": "user: How do I install pandas 2.0?",
+      "category": "version",
+      "cosine_similarity": 0.9171083569526672
+    },
+    {
+      "prompt1": "user: How to configure React Router v5?",
+      "prompt2": "user: How to configure React Router v6?",
+      "category": "version",
+      "cosine_similarity": 0.8818472027778625
+    },
+    {
+      "prompt1": "user: Migrate from Python 3.8 to 3.9",
+      "prompt2": "user: Migrate from Python 3.8 to 3.11",
+      "category": "version",
+      "cosine_similarity": 0.9094028472900391
+    },
+    {
+      "prompt1": "user: Use OpenSSL 1.1 instead of 1.0",
+      "prompt2": "user: Use OpenSSL 3.0 instead of 1.0",
+      "category": "version",
+      "cosine_similarity": 0.9321619272232056
+    },
+    {
+      "prompt1": "user: Set max connections to 100",
+      "prompt2": "user: Set max connections to 500",
+      "category": "version",
+      "cosine_similarity": 0.881481409072876
+    },
+    {
+      "prompt1": "user: How does Docker networking work?",
+      "prompt2": "user: How much does Docker cost?",
+      "category": "scope",
+      "cosine_similarity": 0.5887256264686584
+    },
+    {
+      "prompt1": "user: What is Kubernetes?",
+      "prompt2": "user: Who created Kubernetes?",
+      "category": "scope",
+      "cosine_similarity": 0.8438674211502075
+    },
+    {
+      "prompt1": "user: How to set up PostgreSQL?",
+      "prompt2": "user: Why use PostgreSQL?",
+      "category": "scope",
+      "cosine_similarity": 0.659827470779419
+    },
+    {
+      "prompt1": "user: Explain REST API design",
+      "prompt2": "user: When was REST invented?",
+      "category": "scope",
+      "cosine_similarity": 0.48699015378952026
+    },
+    {
+      "prompt1": "user: How does Redis work?",
+      "prompt2": "user: Where is Redis used?",
+      "category": "scope",
+      "cosine_similarity": 0.8694767951965332
+    },
+    {
+      "prompt1": "user: How to allow CORS?",
+      "prompt2": "user: How to block CORS?",
+      "category": "antonym",
+      "cosine_similarity": 0.8523533940315247
+    },
+    {
+      "prompt1": "user: Should I use synchronous calls?",
+      "prompt2": "user: Should I use asynchronous calls?",
+      "category": "antonym",
+      "cosine_similarity": 0.8607476949691772
+    },
+    {
+      "prompt1": "user: How to start the server?",
+      "prompt2": "user: How to stop the server?",
+      "category": "antonym",
+      "cosine_similarity": 0.6305962800979614
+    },
+    {
+      "prompt1": "user: When to use caching?",
+      "prompt2": "user: When to avoid caching?",
+      "category": "antonym",
+      "cosine_similarity": 0.9674227237701416
+    },
+    {
+      "prompt1": "user: How to open database connections?",
+      "prompt2": "user: How to close database connections?",
+      "category": "antonym",
+      "cosine_similarity": 0.7461318373680115
+    },
+    {
+      "prompt1": "user: Install Node.js 16",
+      "prompt2": "user: Install Node.js 18",
+      "category": "version",
+      "cosine_similarity": 0.9082089066505432
+    },
+    {
+      "prompt1": "user: Use TensorFlow 2.x",
+      "prompt2": "user: Use TensorFlow 1.x",
+      "category": "version",
+      "cosine_similarity": 0.9519885778427124
+    },
+    {
+      "prompt1": "user: Update to Ubuntu 20.04",
+      "prompt2": "user: Update to Ubuntu 22.04",
+      "category": "version",
+      "cosine_similarity": 0.8195481896400452
+    },
+    {
+      "prompt1": "user: How to configure Nginx?",
+      "prompt2": "user: Who maintains Nginx?",
+      "category": "scope",
+      "cosine_similarity": 0.6965960264205933
+    },
+    {
+      "prompt1": "user: What is GraphQL?",
+      "prompt2": "user: Where is GraphQL used?",
+      "category": "scope",
+      "cosine_similarity": 0.9413583874702454
+    }
+  ],
+  "threshold_table": {
+    "0.90": {
+      "paraphrase_recall": "28/30",
+      "false_positives": "15/30"
+    },
+    "0.91": {
+      "paraphrase_recall": "28/30",
+      "false_positives": "12/30"
+    },
+    "0.92": {
+      "paraphrase_recall": "27/30",
+      "false_positives": "10/30"
+    },
+    "0.93": {
+      "paraphrase_recall": "26/30",
+      "false_positives": "9/30"
+    },
+    "0.94": {
+      "paraphrase_recall": "25/30",
+      "false_positives": "8/30"
+    },
+    "0.95": {
+      "paraphrase_recall": "23/30",
+      "false_positives": "4/30"
+    },
+    "0.96": {
+      "paraphrase_recall": "21/30",
+      "false_positives": "3/30"
+    },
+    "0.97": {
+      "paraphrase_recall": "16/30",
+      "false_positives": "2/30"
+    },
+    "0.98": {
+      "paraphrase_recall": "9/30",
+      "false_positives": "1/30"
+    },
+    "0.99": {
+      "paraphrase_recall": "1/30",
+      "false_positives": "0/30"
+    }
+  }
+}
