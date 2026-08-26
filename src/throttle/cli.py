@@ -3572,7 +3572,14 @@ def _handle_proxy(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from .config import load_config, apply_config_defaults
+
     parser = build_parser()
+
+    # Load config file and apply as defaults (CLI flags will override)
+    config = load_config()
+    apply_config_defaults(parser, config)
+
     args = parser.parse_args(argv)
     if args.command in {"plan", "smoke", "benchmark"}:
         _warn_if_exploratory_sweep(args)
