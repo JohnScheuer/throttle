@@ -64,9 +64,26 @@ not counterbalance time drift. Do not spend money on a sweep expecting its
 single-run report to become decision-eligible. Use `throttle golden --help`
 when the question is whether one verified server configuration beat another.
 
-## Try it safely
+## Installation
 
-Throttle requires Python 3.11+. Clone the public repository and install from source:
+Throttle requires Python 3.11+ and is available on PyPI:
+
+```sh
+pip install throttle-pro
+throttle --version
+```
+
+**Quickstart:** If you have a vLLM server with Prometheus metrics exposed (default port 8000), get live cost-per-million-tokens instantly:
+
+```sh
+throttle watch --gpu-rate-per-hour 1.50
+```
+
+This reads `/metrics` without sending requests — one command to see real-time $/MTok.
+
+### Install from source
+
+To install the development version:
 
 ```sh
 git clone https://github.com/KushagraKanaujia/throttle.git
