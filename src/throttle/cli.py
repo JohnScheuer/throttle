@@ -4018,6 +4018,17 @@ def _render_watch_snap(snap) -> None:
               f"${snap.cost_per_million_tokens:.4f}/Mtok")
     for r in snap.refusals:
         print(f"  ⚠ {r['figure']}: {r['reason'][:80]}")
+    # Tier 2 suggestion — only appears after 5 minutes of observation
+    suggestion = getattr(snap, "suggestion", None)
+    window_ready = getattr(snap, "window_ready", False)
+    window_minutes = getattr(snap, "window_elapsed_minutes", 0.0)
+    if suggestion:
+        print(f"  💡 {suggestion['action']}")
+        print(f"     {suggestion['reason']}")
+        if suggestion.get("suggested_next_step"):
+            print(f"     Next: {suggestion['suggested_next_step']}")
+    elif not window_ready and window_minutes > 0:
+        print(f"  ⏳ Collecting baseline... ({window_minutes:.0f}m of 5m needed for suggestions)")
     print()
 
 
