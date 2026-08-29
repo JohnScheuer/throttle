@@ -28,6 +28,7 @@ from .benchmark import (
     RunProgress,
     build_plan,
     load_prompts,
+    normalize_chat_completions_url,
     run_native,
     validate_config,
 )
@@ -3226,6 +3227,11 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
     api_key = _get_api_key(args)
     headers = _build_headers(api_key)
 
+    chat_completions_url = normalize_chat_completions_url(
+        args.endpoint_url,
+        allow_insecure_http=True,
+    )
+
     print("Throttle Simulator Validation")
     print("=" * 60)
     print()
@@ -3235,7 +3241,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
     try:
         with httpx.Client(timeout=10.0) as client:
             response = client.post(
-                f"{args.endpoint_url}/chat/completions",
+                chat_completions_url,
                 headers=headers,
                 json={
                     "model": args.model,
@@ -3352,7 +3358,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     try:
                         response = await client.post(
-                            f"{args.endpoint_url}/v1/chat/completions",
+                            chat_completions_url,
                             headers=headers,
                             json={
                                 "model": args.model,
