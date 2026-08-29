@@ -4001,6 +4001,13 @@ def _render_watch_snap(snap) -> None:
     """Format a CostSnapshot for human display."""
     import time as _time
     print(f"--- {_time.strftime('%H:%M:%S')} ---")
+    # One-line summary: understandable by a founder or eng lead, not just an engineer
+    if snap.cost_per_million_tokens is not None and snap.generation_throughput_toks_per_sec is not None:
+        print(f"  You're spending ${snap.cost_per_hour:.2f}/hr to generate "
+              f"{snap.generation_throughput_toks_per_sec:.0f} tok/s "
+              f"(${snap.cost_per_million_tokens:.2f} per million tokens)")
+    elif snap.refusals:
+        print(f"  Cost unavailable — {snap.refusals[0]['reason'][:60]}")
     if snap.generation_throughput_toks_per_sec is not None:
         print(f"  Gen throughput : {snap.generation_throughput_toks_per_sec:.1f} tok/s")
     if snap.num_requests_running is not None:
