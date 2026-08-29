@@ -1,0 +1,59 @@
+# Throttle Configuration File Example
+#
+# Copy this file to ~/.throttle/config.yaml and customize for your environment.
+# All settings are optional - CLI flags always override config file values.
+#
+# Config file support requires PyYAML:
+#   pip install pyyaml
+
+# Endpoint configuration
+# model: "meta-llama/Llama-2-7b-chat-hf"
+# url: "http://localhost:8000"
+# api-key-env: "OPENAI_API_KEY"
+# allow-insecure-http: false
+
+# Cost model configuration
+# cost-model: "dedicated-hourly"  # Options: unknown, dedicated-hourly, serverless-active-seconds, user-supplied
+# gpus: 1
+# per-gpu-hourly-price: 1.50
+# allow-unknown-cost: false
+
+# Workload configuration
+# concurrency: [1, 2, 4, 8]
+# max-tokens: 128
+# timeout-seconds: 120.0
+# stream: true
+# seed: 42
+
+# Safety limits
+# max-requests: 10000
+# max-errors: 1
+# max-concurrency: 64
+# max-estimated-spend: 3.0
+
+# Proxy configuration (for `throttle proxy` command)
+# backend-url: "http://localhost:11434"
+# port: 8082
+# enable-cache: false
+
+# Workload files (optional)
+# prompts: "./my-prompts.jsonl"
+# warmup-prompts: "./my-warmup-prompts.jsonl"
+
+# Example: RunPod configuration
+# model: "meta-llama/Llama-2-7b-chat-hf"
+# url: "https://api.runpod.ai/v2/<endpoint-id>/openai/v1"
+# api-key-env: "RUNPOD_API_KEY"
+# cost-model: "serverless-active-seconds"
+# active-second-price: 0.000404
+# max-active-workers: 3
+# concurrency: [1, 2, 4]
+# max-tokens: 128
+
+# Example: Ollama local configuration
+# model: "llama3.2:1b"
+# url: "http://localhost:11434"
+# allow-insecure-http: true
+# cost-model: "unknown"
+# allow-unknown-cost: true
+# concurrency: [1, 2]
