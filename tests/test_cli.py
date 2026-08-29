@@ -504,7 +504,8 @@ def _supported_golden_artifact() -> dict[str, object]:
 
 
 class ParserAndPlanTests(unittest.TestCase):
-    def test_parser_has_eight_explicit_subcommands(self) -> None:
+    def test_parser_subcommands_match_expected(self) -> None:
+        """Verify all CLI subcommands are present and accounted for."""
         parser = build_parser()
         subparser_action = next(
             action
@@ -526,6 +527,8 @@ class ParserAndPlanTests(unittest.TestCase):
                 "measure",
                 "validate-sim",
                 "proxy",
+                "watch",
+                "report",
             },
         )
 

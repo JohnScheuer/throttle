@@ -2046,7 +2046,23 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         baseline_value,
         candidate_value,
     ) = _golden_config_flags(parser, args)
-    if args.concurrency is None and args.request_rate is None:
+
+    # Golden protocol requires exactly one closed-loop concurrency value
+    if args.request_rate is not None:
+        _parser_error(
+            parser,
+            "Golden protocol requires closed-loop concurrency, not --request-rate. "
+            "Remove --request-rate or use a different command."
+        )
+    if args.concurrency is not None and len(args.concurrency) != 1:
+        _parser_error(
+            parser,
+            f"Golden protocol requires a single concurrency value, but received {len(args.concurrency)} "
+            f"values: {args.concurrency}. This may come from your ~/.throttle/config.yaml. "
+            f"Either set a single concurrency value in your config, or pass --concurrency N explicitly."
+        )
+
+    if args.concurrency is None:
         # Preserve the historical 1-versus-8 default while making every other
         # pair exercise at least its larger configured treatment value.
         args.concurrency = [max(baseline_value, candidate_value)]
@@ -3630,12 +3646,36 @@ def _handle_watch(args) -> int:
     print()
 
     try:
+        first_snapshot = True
         for snap in stream_metrics(
             args.metrics_url,
             args.gpu_rate_per_hour,
             interval_seconds=args.interval,
             max_num_seqs=args.max_num_seqs,
         ):
+            # On first snapshot, check for connection failure and exit immediately
+            if first_snapshot:
+                first_snapshot = False
+                # Check for connection error (refusal with figure="all")
+                conn_errors = [r for r in snap.refusals if r.get("figure") == "all"]
+                if conn_errors:
+                    print(f"ERROR: Cannot reach vLLM metrics endpoint at {args.metrics_url}")
+                    print(f"       {conn_errors[0]['reason']}")
+                    print()
+                    print("This usually means:")
+                    print("  - No vLLM server is running")
+                    print("  - The server is at a different URL")
+                    print()
+                    print("To fix:")
+                    print("  1. Start a vLLM server first:")
+                    print("     vllm serve <model>")
+                    print("  2. Or use Ollama:")
+                    print("     ollama serve")
+                    print("  3. Then run 'throttle watch' again")
+                    print("  4. Or specify a different endpoint:")
+                    print(f"     throttle watch --url http://host:port/metrics --gpu-rate-per-hour {args.gpu_rate_per_hour}")
+                    return EXIT_FAILED
+
             if args.json:
                 import json as _json
                 print(_json.dumps(snap.to_dict()))

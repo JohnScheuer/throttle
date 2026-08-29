@@ -55,6 +55,28 @@ This protocol caught multiple false reports from the corrupted repository and is
 - PyPI publication workflow
 - PR #21, #22, #23 merged to main
 - README updated with pipx install path
+- **Adversarial audit and blocker fixes** (see below)
+
+### Adversarial Audit Findings (2026-08-29)
+
+Pre-company submission audit revealed one important UX issue and one false alarm:
+
+**Fixed - Golden Protocol Config Conflict:**
+- **Issue**: User's `~/.throttle/config.yaml` with `concurrency: [2, 4]` silently conflicted with golden protocol's single-value requirement
+- **Root Cause**: Golden CLI defaulted silently instead of erroring explicitly
+- **Fix**: Added validation at cli.py:2050-2063 that errors clearly when receiving multiple concurrency values
+- **Impact**: Aligns with tool philosophy - make conflicts explicit rather than silently resolving them
+- **False Alarm**: Initial audit incorrectly reported this as "21 failing tests" - tests pass in clean state
+
+**Fixed - Watch Command Timeout:**
+- **Issue**: `throttle watch` hung indefinitely when no vLLM server available
+- **Fix**: Added connection error detection at cli.py:3657-3677 with graceful exit and helpful error message
+- **Impact**: Better first-time user experience
+
+**Test Suite Status:**
+- 404 tests passing (100% of non-skipped tests)
+- 1 test skipped (intentionally excluded)
+- No known failures
 
 ## Recent Decisions
 
