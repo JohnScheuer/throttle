@@ -77,6 +77,41 @@ python -m pip install .
 throttle --version
 ```
 
+### Configuration File (Optional)
+
+Throttle supports loading default values from `~/.throttle/config.yaml` to avoid repeating CLI flags. All config values are optional, and CLI flags always override config file settings.
+
+**Setup:**
+```sh
+# Install PyYAML (optional dependency)
+pip install pyyaml
+
+# Create config directory and copy example
+mkdir -p ~/.throttle
+cp .throttle.yaml.example ~/.throttle/config.yaml
+
+# Edit with your preferred defaults
+nano ~/.throttle/config.yaml
+```
+
+**Example config:**
+```yaml
+# Endpoint defaults
+model: "meta-llama/Llama-2-7b-chat-hf"
+url: "http://localhost:8000/v1"
+api-key-env: "OPENAI_API_KEY"
+
+# Workload defaults
+max-tokens: 128
+concurrency: [1, 2, 4, 8]
+
+# Proxy defaults
+port: 8080
+enable-cache: true
+```
+
+See [.throttle.yaml.example](.throttle.yaml.example) for all available options. If PyYAML is not installed, Throttle runs normally without config file support.
+
 ### Quick Start (Local Testing)
 
 The fastest way to try Throttle is against a local Ollama server:
