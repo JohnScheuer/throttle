@@ -95,9 +95,20 @@ def apply_config_defaults(parser: Any, config: dict[str, Any]) -> None:
     # Apply defaults to the main parser
     parser.set_defaults(**defaults)
 
+    # Set required=False for args present in config (João's fix)
+    for action in parser._actions:
+        if hasattr(action, 'required') and action.required and hasattr(action, 'dest'):
+            if action.dest in defaults:
+                action.required = False
+
     # Also apply to all subparsers if they exist
     if hasattr(parser, "_subparsers"):
         for action in parser._subparsers._actions:
             if hasattr(action, "choices") and action.choices:
                 for subparser in action.choices.values():
                     subparser.set_defaults(**defaults)
+                    # Set required=False for args present in config in subparsers too
+                    for sub_action in subparser._actions:
+                        if hasattr(sub_action, 'required') and sub_action.required and hasattr(sub_action, 'dest'):
+                            if sub_action.dest in defaults:
+                                sub_action.required = False
