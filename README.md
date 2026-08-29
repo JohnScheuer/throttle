@@ -66,11 +66,26 @@ when the question is whether one verified server configuration beat another.
 
 ## Installation
 
-Throttle requires Python 3.11+ and is available on PyPI:
+Throttle requires Python 3.11+ and is available on PyPI. Install with pipx (recommended for CLI tools):
 
 ```sh
-pip install throttle-pro
+pipx install throttle-pro
 throttle --version
+```
+
+If you don't have pipx, install it first:
+```sh
+# macOS
+brew install pipx
+
+# Linux/WSL
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+```
+
+**Alternative:** If you're already inside a virtualenv, use pip:
+```sh
+pip install throttle-pro
 ```
 
 **Quickstart:** If you have a vLLM server with Prometheus metrics exposed (default port 8000), get live cost-per-million-tokens instantly:
