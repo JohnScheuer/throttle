@@ -348,6 +348,7 @@ def _golden_args(
     baseline_max_num_seqs: str = "1",
     candidate_max_num_seqs: str = "8",
     concurrency: int | None = None,
+    requests_per_block: int | None = None,
 ) -> list[str]:
     if runtime_args is None:
         runtime_args = (
@@ -363,6 +364,7 @@ def _golden_args(
             "570.86",
         )
     load_args = () if concurrency is None else ("--concurrency", str(concurrency))
+    rpb_args = () if requests_per_block is None else ("--requests-per-block", str(requests_per_block))
     return [
         "golden",
         "--model",
@@ -376,6 +378,7 @@ def _golden_args(
         "--candidate-config",
         f"max_num_seqs={candidate_max_num_seqs}",
         *load_args,
+        *rpb_args,
         "--cost-model",
         "dedicated-hourly",
         "--total-hourly-price",
@@ -1471,45 +1474,12 @@ class ParserAndPlanTests(unittest.TestCase):
                         "C3 verified",
                     ],
                 ),
-                patch(
-                    "throttle.cli._position_is_usable_for_golden",
-                    return_value=True,
-                ),
-                patch(
-                    "throttle.cli.validate_golden_sequence",
-                    side_effect=lambda reports: {
-                        "artifact_type": "throttle_golden_live_comparison",
-                        "status": "complete",
-                        "golden_protocol_eligible": True,
-                        "eligibility_reasons": [],
-                        "run_fingerprints": [f"fp-{i}" for i in range(len(reports))],
-                        "treatment": {
-                            "baseline_value": 1,
-                            "candidate_value": 8,
-                            "closed_loop_concurrency": 8,
-                        },
-                        "conditions": [
-                            {
-                                "condition_id": "concurrency_8",
-                                "state": "supported",
-                                "throughput_delta_percent_ci": {
-                                    "estimate": 5.0,
-                                    "low": 1.0,
-                                    "high": 9.0,
-                                },
-                            }
-                        ],
-                        "overall_outcome": "supported",
-                        "decision_eligible": True,
-                        "decision_summary": {"text": "Candidate supported."},
-                        "disclaimer": "Exploratory result only.",
-                        "decision_state": "supported",
-                    },
-                ),
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
-                exit_code = main(_golden_args(output_dir))
+                # requests_per_block=201 makes the MIN_DECISION_REQUESTS gate
+                # explicit: 3 blocks × 67 = 201 >= 200 passes, but only deliberately.
+                exit_code = main(_golden_args(output_dir, requests_per_block=201))
 
             aggregate = json.loads(
                 (output_dir / "golden.json").read_text(encoding="utf-8")
