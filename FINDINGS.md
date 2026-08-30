@@ -68,105 +68,62 @@ Measured throughput is **FLAT** across a 10x change in arrival rate.
 
 Per-request timings from the JSON show roughly 36 tok/s per individual request. Total system throughput also 36 tok/s. **Total equals per-request, which is what you see when exactly one request is in flight at a time.**
 
-## Finding 1: validate-sim Executes Requests Serially (UNFIXED)
+## Finding 1: validate-sim Executes Requests Serially (FIXED)
 
-**The three load levels never happened.** Every scenario measured single-stream decode and the arrival rate parameter did nothing.
+**Status**: Fixed in commit prior to 2026-08-29. Test added to prevent regression.
 
-### Code Evidence
+**Original Issue**: The three load levels never happened. Every scenario measured single-stream decode and the arrival rate parameter did nothing.
 
-Request dispatch loop in `src/throttle/cli.py` lines 2686-2697:
+### Fix Evidence
 
-```python
-for i, (_, prompt_tokens, max_tokens) in enumerate(workload):
-    prompt = "Test " * prompt_tokens
+Current implementation in `src/throttle/cli.py` lines 3270-3559:
 
-    req_start = time.perf_counter_ns()
-    response = client.post(
-        f"{args.endpoint_url}/chat/completions",
-        json={
-            "model": args.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-        },
-    )
-    req_end = time.perf_counter_ns()
-```
+- Line 3389: `async def run_concurrent_workload()` - uses async/await
+- Line 3401: `async def send_request(arrival_time, ...)` - async request handler
+- Line 3405-3406: `await asyncio.sleep(arrival_time)` - respects arrival times
+- Line 3463-3466: Creates all tasks upfront
+- Line 3469: `await asyncio.gather(*tasks)` - concurrent execution
+- Line 3476: `asyncio.run(run_concurrent_workload())` - runs async workload
+- Lines 3482-3485: **Fails if peak_concurrent == 1** - detects serial execution
 
-**Analysis**:
-- The loop calls `client.post()` which blocks until the response is received
-- No `asyncio.gather`, no task group, no concurrent dispatch mechanism
-- Each request waits for the previous one to complete before starting
+### Test Coverage
 
-### What the arrival_rate Parameter Does
-
-Line 2657 passes `arrival_rate` to workload generation:
-
-```python
-workload = workload_gen.generate_chat_workload(
-    num_requests=scenario['num_requests'],
-    arrival_rate_requests_per_sec=scenario['arrival_rate'],
-    mean_prompt_tokens=200,
-    mean_output_tokens=150,
-)
-```
-
-Line 2686 shows the arrival time is discarded:
-
-```python
-for i, (_, prompt_tokens, max_tokens) in enumerate(workload):
-```
-
-The `_` is the arrival time. It is generated but never used. Requests are sent serially regardless of their intended arrival times.
+`tests/test_validate_sim_concurrency.py`:
+- Lines 105-109: Asserts `peak_concurrent > 1` to prove request overlap
+- Uses mock backend with 0.5s sleep to detect serial vs concurrent execution
+- Verifies validate-sim's built-in serial detection fires when needed
 
 ### Impact
 
-- Light/Medium/Heavy scenarios all measured the same workload: single-stream sequential requests
-- The measured throughput being flat (36.9, 36.8, 34.9 tok/s) confirms no concurrency
-- All "load level" comparisons are invalid
-- Simulator error percentages reflect serial execution, not the intended concurrent load
+- All three load levels (Light/Medium/Heavy) now test actual concurrent load
+- Arrival rate parameter is used correctly
+- Load level comparisons are valid
+- Simulator error percentages reflect real concurrent behavior
 
-## Finding 2: No API Key Support (UNFIXED)
+---
 
-**Issue**: `validate-sim` has no flag for an API key or authorization header.
+## Finding 2: No API Key Support (FIXED)
 
-### Code Evidence
+**Status**: Fixed in commit prior to 2026-08-29.
 
-Connectivity test (lines 2590-2599):
+**Original Issue**: `validate-sim` had no flag for an API key or authorization header.
 
-```python
-with httpx.Client(timeout=10.0) as client:
-    response = client.post(
-        f"{args.endpoint_url}/chat/completions",
-        json={
-            "model": args.model,
-            "messages": [{"role": "user", "content": "test"}],
-            "max_tokens": 1,
-        },
-    )
-```
+### Fix Evidence
 
-Actual requests (lines 2690-2697):
-
-```python
-response = client.post(
-    f"{args.endpoint_url}/chat/completions",
-    json={
-        "model": args.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-    },
-)
-```
-
-Neither passes any `Authorization` header. The argument parser has no `--api-key` option.
+- Line 590-592: `--api-key` argument added to argument parser
+- Line 3286: `api_key = _get_api_key(args)` - retrieves API key from args or environment
+- Line 3287: `headers = _build_headers(api_key)` - builds Authorization header
+- Line 3304: Connectivity test uses `headers=headers`
+- Line 3421: Actual requests use `headers=headers`
 
 ### Impact
 
-- RunPod vLLM template sets `VLLM_API_KEY`, so every request returned Unauthorized
-- Required manual proxy to inject bearer token
-- Most production vLLM endpoints require authentication
-- **Blocks real users from validating against their own secured endpoints**
+- RunPod vLLM endpoints with `VLLM_API_KEY` now work
+- Users can validate against secured production endpoints
+- No manual proxy required for authentication
+
+---
 
 ## Status
 
-Both findings are **unfixed**. No changes have been made to the code.
+Both findings are **FIXED** as of 2026-08-29.
