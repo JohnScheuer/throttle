@@ -1,50 +1,63 @@
 # Throttle
 
-**A local CLI for benchmarking LLM inference endpoints**
+**Benchmark your LLM inference server without guessing**
 
-Throttle is a bring-your-own-endpoint CLI for measuring existing
-OpenAI-compatible chat-completions servers. It provisions nothing, changes
-nothing on the server, and never claims universal optimization or projected
-savings.
+## What breaks without this
 
-Throttle has eight explicit workflows:
+You're tuning `max_num_seqs` or batch size on your vLLM/Ollama server. You change it, curl a few requests, eyeball the latency, and deploy. But you don't know if throughput actually improved, if the change regressed under load, or if the test was fair. Throttle gives you decision-grade evidence: counterbalanced runs, statistical intervals, and strict validation gates so you know whether a configuration change actually won.
 
-- `throttle plan` sends zero traffic and shows the destination, request/token
-  ceilings, duration, cost bound, and privacy implications.
-- `throttle smoke` is a short connectivity/load-shape check. Its default is 27
-  calls: concurrency 1/4/8 × (8 measured + 1 separate warm-up). It is always
-  non-decision-grade.
-- `throttle benchmark` runs sustained, repeated blocks using closed-loop
-  concurrency or open-loop request rates. A multi-load sweep is exploratory:
-  its current condition-major order is not counterbalanced, so it cannot reach
-  `decision_eligible: true` even when every request succeeds.
-- `throttle diagnose` is a lightweight pre-flight bottleneck classifier that
-  runs before formal benchmarking. It identifies the dominant serving regime
-  (dispatch-bound, orchestration-bound, compute-bound, memory-bound, or mixed)
-  to guide configuration tuning.
-- `throttle experimental-tuning` is an explicit, suggestion-only smoke run
-  that samples a configured vLLM Prometheus exporter. It never applies a
-  setting and cannot change decision or Golden eligibility.
-- `throttle golden` orchestrates the counterbalanced
-  B1/C1/B2/C2/B3/C3 protocol for a controlled baseline/candidate comparison.
-  This is the path for a decision-eligible configuration result.
-- `throttle compare` compares saved reports offline. Two inputs perform a
-  normal saved-run comparison; six ordered inputs validate the golden
-  B1/C1/B2/C2/B3/C3 protocol.
-- `throttle proxy` runs a standalone OpenAI-compatible HTTP server that sits
-  in front of real inference backends and caches responses using semantic
-  similarity matching. Unlike the benchmark cache, this serves external HTTP
-  clients (curl, OpenAI SDKs, etc.) for production traffic caching.
+## What it does
 
-Results describe only the declared workload and manifest.
+Throttle measures existing OpenAI-compatible inference endpoints (vLLM, Ollama, SGLang, LMDeploy, etc.). It provisions nothing, changes nothing on the server, and never claims universal optimization. It runs controlled experiments:
 
-## Proven Results
+- **`throttle benchmark`**: Sustained load testing with repeated blocks, streaming validation, and cost attribution
+- **`throttle golden`**: Six-position counterbalanced B1/C1/B2/C2/B3/C3 protocol for decision-eligible configuration comparisons
+- **`throttle compare`**: Offline statistical comparison of saved runs
+- **`throttle proxy`**: OpenAI-compatible caching proxy for production traffic
+- **`throttle diagnose`**: Pre-flight bottleneck classification (dispatch/compute/memory-bound)
+- **`throttle smoke`**: Quick connectivity check (27 requests, always non-decision-grade)
+- **`throttle plan`**: Zero-traffic dry-run showing costs and limits before sending requests
 
-Throttle has one decision-eligible result: a six-position counterbalanced Golden protocol run on Qwen2.5-0.5B-Instruct with vLLM 0.16.0 on an A100 80GB GPU. Changing `max_num_seqs` from 1 to 8 produced a measured **+189.5% to +246.2%** throughput increase (95% CI) at closed-loop concurrency 8. This result passed all protocol gates and is `decision_eligible: true`.
+Results describe only the declared workload and manifest. No universal claims, no projected savings.
 
-The caching proxy has been verified compatible with **Ollama** in CI integration tests. Compatibility with **vLLM, SGLang, and LMDeploy** is expected (they implement the OpenAI-compatible `/v1/chat/completions` API) but requires GPU verification. See `validation/gpu_backend_verification.sh` for a runnable verification script on Linux with CUDA.
+## One command to try it
 
-**See [RESULTS.md](RESULTS.md) for the full validated evidence**, including exact numbers, hardware details, protocol audit, and limitations. All claims trace to specific JSON artifacts in `validation/`.
+```bash
+# Install
+pipx install throttle-pro
+
+# Test against local Ollama (if you have it running)
+export OLLAMA_API_KEY="ollama"  # Ollama doesn't need auth, but throttle requires the variable
+throttle smoke \
+  --model llama3.2:1b \
+  --url http://localhost:11434/v1 \
+  --api-key-env OLLAMA_API_KEY \
+  --cost-model unknown \
+  --allow-unknown-cost
+```
+
+## Validated Results
+
+**One decision-eligible result exists:**
+
+Qwen2.5-0.5B-Instruct on **A100 80GB** with **vLLM 0.16.0 native protocol**, changing `max_num_seqs` from **1→8**, closed-loop concurrency 8, 128 max tokens: **+189.5% to +246.2%** throughput increase (95% CI, six-position counterbalanced golden protocol, `decision_eligible: true`).
+
+Artifact: `validation/golden-live-20260817/golden.json`
+
+**Backends tested on real GPUs but not decision-eligible:**
+
+On **RTX 4090** (RunPod, Aug 19, 2026), Throttle successfully drove 1,608 measured streaming responses across **vLLM**, **SGLang**, **Ollama**, and **LMDeploy**. All four returned `status: complete`, conditions `decision_grade: true`, but overall `decision_eligible: false` due to:
+- Missing immutable provenance (image digest, model revision, runtime-verified flags)
+- Non-counterbalanced condition order (exploratory c1/c4 sweep, not golden protocol)
+- Search boundary reached (inconclusive)
+
+See `validation/runpod-five-stack-20260819/REPORT.md` for full details. These runs demonstrate measurement compatibility, not configuration decisions.
+
+**Proxy verified:**
+
+The caching proxy is CI-tested against **Ollama** with llama3.2:1b and llama3.2:3b models (`.github/workflows/ci.yml`).
+
+**See [RESULTS.md](RESULTS.md) for complete validated evidence**, including exact numbers, hardware details, protocol audit, and limitations. Every claim traces to a specific JSON artifact in `validation/`.
 
 ## Choose the right path first
 
@@ -314,7 +327,7 @@ CUDA keeps the additional immutable container-image, CUDA, and driver
 requirements. Those fixed reasons are written under
 `decision_ineligible_reasons` instead of being hidden.
 
-Example pinned exploratory sweep:
+Example pinned exploratory sweep (CUDA/vLLM):
 
 ```sh
 throttle benchmark \
@@ -326,8 +339,6 @@ throttle benchmark \
   --requests-per-block 67 \
   --warmup-requests 3 \
   --max-tokens 128 \
-  --p95-slo-ms 5000 \
-  --ttft-slo-ms 1000 \
   --cache-policy disabled \
   --model-revision 0123456789abcdef0123456789abcdef01234567 \
   --accelerator-backend cuda \
@@ -347,25 +358,9 @@ throttle benchmark \
   --output exploratory-sweep.json
 ```
 
-Direct-host Metal, ROCm, and CPU runs use platform-neutral provenance instead
-of fake CUDA or container values. For example, append the following runtime
-controls to a pinned Apple Silicon run:
+This exploratory sweep is `decision_eligible: false` (non-counterbalanced condition order). Use `throttle golden` for decision-grade comparisons.
 
-```sh
---accelerator-backend metal \
---accelerator 'Apple Silicon integrated GPU' \
---accelerator-fingerprint 'operator-private-stable-device-id' \
---accelerator-runtime-version 'MLX 0.32.0' \
---host-os-version 'macOS 15.0 build 24A335' \
---software-environment-digest 'python-environment@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-```
-
-The software-environment digest must identify retained immutable evidence such
-as a canonical dependency lock, installed-package manifest, or native binary
-closure. Throttle validates the declaration and comparisons; it does not build
-or independently inspect that environment. Use a non-secret label followed by
-`@sha256:<64 lowercase hex>` (or a bare SHA-256 digest); URLs, credentials,
-absolute paths, traversal segments, and control characters are rejected.
+**Note:** Metal, ROCm, and CPU backends are supported in code but have zero GPU validation artifacts. The A100 80GB (CUDA) is the only GPU type with a decision-eligible golden protocol result.
 
 Use `--block-seconds 20` instead of `--requests-per-block` for duration-bounded
 blocks. The achieved duration—not merely the configured value—controls the
@@ -647,30 +642,30 @@ key, DNS lookup, HTTP client, output directory, or traffic:
 
 ```sh
 throttle golden --dry-run \
-  --model Qwen/Qwen3-8B \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
   --url https://inference.example/v1 \
   --api-key-env VLLM_API_KEY \
-  --baseline-config max_num_seqs=8 \
-  --candidate-config max_num_seqs=10 \
-  --concurrency 16 \
+  --baseline-config max_num_seqs=1 \
+  --candidate-config max_num_seqs=8 \
+  --concurrency 8 \
   --cost-model dedicated-hourly \
   --gpus 1 \
-  --total-hourly-price 0.50 \
+  --total-hourly-price 1.39 \
   --cache-policy disabled \
   --model-revision 0123456789abcdef0123456789abcdef01234567 \
   --image-digest 'registry.example/vllm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   --gpu 'NVIDIA A100 80GB PCIe' \
   --gpu-fingerprint 'operator-private-stable-device-id' \
-  --cuda-version 13.0 \
-  --driver-version 580.42 \
-  --server-version 0.27.1 \
+  --cuda-version 12.4 \
+  --driver-version 550.54.15 \
+  --server-version 0.6.0 \
   --engine-flag enable_chunked_prefill=true \
   --engine-flags-provenance runtime_verified \
-  --p95-slo-ms 5000 \
-  --ttft-slo-ms 1000 \
   --evidence-source live_inference \
   --output-dir golden-run-001
 ```
+
+This example matches the validated golden run in `validation/golden-live-20260817/`.
 
 Replace those SLO examples with the operator's actual thresholds. A
 throughput-only golden decision is permitted when no latency SLO is declared,
