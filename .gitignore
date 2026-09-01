@@ -43,7 +43,7 @@ Thumbs.db
 /benchmark.json
 /comparison.json
 *.json.bak
-demo-*.json
+demo*.json
 
 # Build artifacts are generated in CI and uploaded as artifacts
 dist/
