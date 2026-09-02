@@ -865,18 +865,25 @@ returns `130`.
 
 ## Test
 
-The suite is offline-only and blocks non-loopback DNS/socket use:
+The test suite has two counts depending on whether a live Ollama backend is available at localhost:11434:
 
+**Without Ollama (offline-only tests):**
 ```sh
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+PYTHONPATH=src .venv/bin/python -m pytest tests/ -v
+# Expected: 397 passed, 10 skipped
 ```
 
-It covers modes, URL/proxy safety, response validation, streaming termination,
-hard stops, partial reports, cost separation, open/closed-loop scheduling,
-confidence and boundary logic, manifest tampering, saved comparisons, the
-GuideLLM subprocess boundary, the six-run golden gate, and the opt-in
-collector/analyzer/safety chain. Default commands are tested with collector
-bombs so they cannot accidentally start experimental metric collection.
+**With Ollama running (includes integration tests):**
+```sh
+# Start Ollama first: ollama serve
+# Pull models: ollama pull llama3.2:1b && ollama pull llama3.2:3b
+PYTHONPATH=src .venv/bin/python -m pytest tests/ -v
+# Expected: 406 passed, 1 skipped
+```
+
+The 9 additional tests verify proxy cache behavior, integration, and streaming against a live backend. Without Ollama, these tests skip gracefully. The 1 always-skipped test requires embeddings dependencies (`pip install throttle-pro[embeddings]`).
+
+The suite blocks non-loopback DNS/socket use via an offline guard in CI. It covers modes, URL/proxy safety, response validation, streaming termination, hard stops, partial reports, cost separation, open/closed-loop scheduling, confidence and boundary logic, manifest tampering, saved comparisons, the GuideLLM subprocess boundary, the six-run golden gate, and the opt-in collector/analyzer/safety chain. Default commands are tested with collector bombs so they cannot accidentally start experimental metric collection.
 
 ## Explicitly deferred
 

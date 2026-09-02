@@ -45,5 +45,10 @@ Thumbs.db
 *.json.bak
 demo*.json
 
+# Scratch test files for local debugging (not for commit)
+/test_*.py
+/debug_*.py
+/run_*.sh
+
 # Build artifacts are generated in CI and uploaded as artifacts
 dist/
