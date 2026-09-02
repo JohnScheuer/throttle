@@ -153,8 +153,7 @@ class SimilarityCache:
         # Negation words
         negations = {"not", "no", "never", "without", "don't", "doesn't", "can't",
                      "won't", "shouldn't", "wouldn't", "couldn't", "isn't", "aren't",
-                     "wasn't", "weren't", "haven't", "hasn't", "hadn't",
-                     "avoid", "skip", "bypass", "prevent"}
+                     "wasn't", "weren't", "haven't", "hasn't", "hadn't"}
 
         # Check for negation presence difference
         has_neg_a = bool(tokens_a & negations)
