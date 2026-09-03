@@ -235,6 +235,7 @@ def _add_manifest_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--accelerator-runtime-version", default="unknown")
     parser.add_argument("--host-os-version", default="unknown")
     parser.add_argument("--software-environment-digest", default="unknown")
+    parser.add_argument("--server-name", default="unknown")
     parser.add_argument("--server-version", default="unknown")
     parser.add_argument(
         "--engine-flag",
@@ -929,6 +930,7 @@ def _build_config(
         accelerator_runtime_version=getattr(args, "accelerator_runtime_version", "unknown"),
         host_os_version=getattr(args, "host_os_version", "unknown"),
         software_environment_digest=getattr(args, "software_environment_digest", "unknown"),
+        server_name=getattr(args, "server_name", "unknown"),
         server_version=getattr(args, "server_version", "unknown"),
         engine_flags=_engine_flags(parser, getattr(args, "engine_flag", [])),
         engine_flags_provenance=getattr(args, "engine_flags_provenance", "operator_attested"),

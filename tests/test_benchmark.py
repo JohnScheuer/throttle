@@ -28,6 +28,7 @@ from throttle.benchmark import (
     _block_report,
     _best_tested,
     canonical_workload_hash,
+    load_prompts,
     run_native,
 )
 from throttle.compare import (
@@ -39,6 +40,7 @@ from throttle.compare import (
 from throttle.golden import (
     GoldenTreatmentError,
     golden_positions,
+    golden_preflight_reasons,
     parse_golden_treatment_flags,
     validate_golden_sequence,
 )
@@ -174,6 +176,7 @@ def _run_config(
         gpu_fingerprint="same-test-gpu",
         cuda_version="test-cuda",
         driver_version="test-driver",
+        server_name="test-engine",
         server_version="test-server",
         engine_flags_provenance="runtime_verified",
         evidence_source="synthetic_validation",
@@ -450,6 +453,7 @@ def _saved_report(
                 "backend": "native",
                 "backend_version": "native-protocol-1",
                 "http_client_version": httpx.__version__,
+                "server_name": "test-engine",
                 "server_version": "test-server",
                 "effective_flags": {
                     "max_num_seqs": flag_value,
@@ -3202,6 +3206,43 @@ class GoldenProtocolTests(unittest.TestCase):
         self.assertFalse(result["golden_protocol_eligible"])
         self.assertIn(
             "uncontrolled_or_missing_safety",
+            result["eligibility_reasons"],
+        )
+
+    def test_golden_requires_server_name_not_just_server_version(self) -> None:
+        # server_name (the serving engine's identity, e.g. "vllm") is a
+        # separate field from server_version (e.g. "0.16.0"). Toggling only
+        # server_name must add only its own preflight reason, isolated from
+        # every other reason the base config would already produce.
+        base = _run_config(
+            mode="golden",
+            blocks=3,
+            requests_per_block=200,
+            conditions=(LoadCondition("closed_loop", 8.0, 8),),
+        )
+        prompts = load_prompts()
+        warmup = load_prompts(warmup=True)
+        flags = dict(
+            baseline_flag=("max_num_seqs", "1"), candidate_flag=("max_num_seqs", "8")
+        )
+        base_reasons = golden_preflight_reasons(base, [prompts], [warmup], **flags)
+        self.assertNotIn("golden_requires_server_name", base_reasons)
+
+        missing_name = replace(base, server_name="unknown")
+        reasons = golden_preflight_reasons(missing_name, [prompts], [warmup], **flags)
+        self.assertEqual(
+            set(reasons) - set(base_reasons), {"golden_requires_server_name"}
+        )
+
+    def test_golden_requires_server_name_to_match_across_positions(self) -> None:
+        reports = _golden_sequence()
+        reports[3]["manifest"]["engine"]["server_name"] = "ollama"  # type: ignore[index]
+
+        result = validate_golden_sequence(reports)
+        self.assertEqual(result["status"], "ineligible")
+        self.assertFalse(result["golden_protocol_eligible"])
+        self.assertIn(
+            "uncontrolled_or_missing_engine_server_name",
             result["eligibility_reasons"],
         )
 
