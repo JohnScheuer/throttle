@@ -3050,6 +3050,23 @@ class ExperimentalTuningCliTests(unittest.TestCase):
                         else:
                             invalid_parent.mkdir()
                             invalid_parent.chmod(0o500)
+                            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                                # Root bypasses filesystem permission bits, so
+                                # chmod 0o500 doesn't actually make the
+                                # directory unwritable here. The precondition
+                                # this subtest depends on can't hold under
+                                # root, so there's nothing being tested;
+                                # skip rather than assert a write failure
+                                # that root will never produce. Same reasoning
+                                # as skipping when a real backend isn't
+                                # reachable: a test whose precondition can't
+                                # hold in this environment isn't testing
+                                # anything by failing.
+                                self.skipTest(
+                                    "unwritable_directory precondition doesn't "
+                                    "hold when running as root (root bypasses "
+                                    "permission bits)"
+                                )
                         output = root / "smoke.json"
                         experimental_output = root / "experimental.json"
                         if target_kind == "ordinary":
