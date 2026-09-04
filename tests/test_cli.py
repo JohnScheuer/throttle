@@ -521,6 +521,7 @@ class ParserAndPlanTests(unittest.TestCase):
                 "diagnose",
                 "experimental-tuning",
                 "golden",
+                "golden-report",
                 "compare",
                 "demo",
                 "cost",

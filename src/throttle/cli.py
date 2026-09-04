@@ -509,6 +509,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="output HTML file path",
     )
 
+    golden_report = subparsers.add_parser(
+        "golden-report",
+        help="generate self-contained HTML report from golden protocol artifacts",
+        description=(
+            "Transform golden protocol artifacts (golden.json + position reports) into "
+            "a self-contained HTML deliverable answering: should you change this setting "
+            "(yes/no), what it's worth (throughput + cost), what was tested, why believe it, "
+            "and what this doesn't prove. Single file, no external assets, opens offline."
+        ),
+    )
+    golden_report.add_argument(
+        "--golden-dir",
+        type=Path,
+        required=True,
+        help="directory containing golden.json and position reports (B1.json, C1.json, etc.)",
+    )
+    golden_report.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="output HTML file path",
+    )
+    golden_report.add_argument(
+        "--gpu-hourly-rate",
+        type=float,
+        help="GPU hourly rate in dollars for cost calculation (e.g., 1.39 for A100 80GB)",
+    )
+    golden_report.add_argument(
+        "--operator-name",
+        default="Throttle",
+        help="operator name for report footer (default: 'Throttle')",
+    )
+    golden_report.add_argument(
+        "--operator-email",
+        default="kushthrottle@gmail.com",
+        help="operator email for report footer (default: 'kushthrottle@gmail.com')",
+    )
+
     demo = subparsers.add_parser(
         "demo",
         help="run a fast simulator demo comparing baseline vs tuned configuration",
@@ -3016,6 +3054,56 @@ def _handle_report(args: argparse.Namespace) -> int:
         return EXIT_FAILED
 
 
+def _handle_golden_report(args: argparse.Namespace) -> int:
+    """Generate self-contained HTML report from golden protocol artifacts."""
+    from throttle.golden_report import generate_html_report
+    import sys
+
+    golden_dir = args.golden_dir.expanduser().resolve()
+
+    # Check golden_dir exists
+    if not golden_dir.exists():
+        print(f"Error: Directory not found: {golden_dir}", file=sys.stderr)
+        return EXIT_FAILED
+
+    if not golden_dir.is_dir():
+        print(f"Error: Not a directory: {golden_dir}", file=sys.stderr)
+        return EXIT_FAILED
+
+    # Find golden.json
+    golden_json_path = golden_dir / "golden.json"
+    if not golden_json_path.exists():
+        print(f"Error: golden.json not found in {golden_dir}", file=sys.stderr)
+        return EXIT_FAILED
+
+    # Find position reports (B1, B2, B3, C1, C2, C3)
+    position_files = []
+    for pos in ['B1', 'B2', 'B3', 'C1', 'C2', 'C3']:
+        pos_file = golden_dir / f"{pos}.json"
+        if not pos_file.exists():
+            print(f"Error: {pos}.json not found in {golden_dir}", file=sys.stderr)
+            return EXIT_FAILED
+        position_files.append(pos_file)
+
+    # Generate report
+    try:
+        generate_html_report(
+            golden_json_path=golden_json_path,
+            position_reports=position_files,
+            output_path=args.output.expanduser().resolve(),
+            gpu_hourly_rate=args.gpu_hourly_rate,
+            operator_name=args.operator_name,
+            operator_email=args.operator_email,
+        )
+        print(f"Golden protocol report generated: {args.output}")
+        return EXIT_OK
+    except Exception as e:
+        print(f"Error generating report: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return EXIT_FAILED
+
+
 def _handle_measure(args: argparse.Namespace) -> int:
     """Measure cost per million tokens with repeated trials."""
     from throttle.workload import WorkloadGenerator
@@ -3730,6 +3818,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _handle_experimental_tuning(parser, args)
     if args.command == "golden":
         return _handle_golden(parser, args)
+    if args.command == "golden-report":
+        return _handle_golden_report(args)
     if args.command == "report":
         return _handle_report(args)
     if args.command == "compare":
