@@ -3357,6 +3357,20 @@ def _handle_measure(args: argparse.Namespace) -> int:
 
 def _handle_validate_sim(args: argparse.Namespace) -> int:
     """Validate simulator accuracy against real measurements at three load levels."""
+    import os
+
+    # Require explicit opt-in via environment variable
+    if os.environ.get("THROTTLE_ENABLE_EXPERIMENTAL") != "1":
+        print("Error: validate-sim is an experimental command.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("This command has known issues:", file=sys.stderr)
+        print("  - Serial execution bug (requests sent one-by-one, not concurrently)", file=sys.stderr)
+        print("  - Results are not decision-eligible", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("To enable experimental commands, set:", file=sys.stderr)
+        print("  export THROTTLE_ENABLE_EXPERIMENTAL=1", file=sys.stderr)
+        return EXIT_USAGE
+
     from throttle.simulator import VLLMSimulator, SimulatorConfig
     from throttle.workload import WorkloadGenerator
     from throttle.cost_model import calculate_cost
