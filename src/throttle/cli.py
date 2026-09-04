@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -61,6 +62,15 @@ from .golden import (
 )
 from .models import CostModel, EndpointConfig, LoadCondition, RunConfig, SafetyLimits
 from .provenance import ACCELERATOR_BACKENDS
+from .result_store import (
+    Provenance,
+    ResultStoreError,
+    append_record,
+    build_record,
+    find_match,
+    format_match_message,
+    load_records,
+)
 
 DEFAULT_OUTPUT = Path("throttle-report.json")
 DEFAULT_COMPARE_OUTPUT = Path("throttle-comparison.json")
@@ -481,6 +491,43 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_GOLDEN_OUTPUT_DIR,
         help="new directory for B1.json through C3.json and golden.json",
+    )
+    golden.add_argument(
+        "--operator",
+        default=None,
+        help=(
+            "who is running this, for the result store's provenance record "
+            "(defaults to $USER@hostname if not set)"
+        ),
+    )
+    golden.add_argument(
+        "--hardware-ownership",
+        choices=("owned", "rented"),
+        default=None,
+        help=(
+            "required to persist this run to the result store; a decision-eligible "
+            "result whose ownership can't be determined is not stored"
+        ),
+    )
+    golden.add_argument(
+        "--hardware-provider",
+        default="unknown",
+        help="e.g. runpod, lambda; only meaningful when --hardware-ownership rented",
+    )
+    golden.add_argument(
+        "--hardware-rate-usd-per-hour",
+        type=float,
+        default=None,
+    )
+    golden.add_argument(
+        "--environment-note",
+        default="unknown",
+        help="free text, e.g. 'RunPod pod, on-demand, deleted after run'",
+    )
+    golden.add_argument(
+        "--no-result-store",
+        action="store_true",
+        help="don't check for or persist to the result store for this run",
     )
 
     compare = subparsers.add_parser(
@@ -2079,6 +2126,152 @@ def _handle_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> in
     return EXIT_OK
 
 
+def _result_store_provenance(args: argparse.Namespace) -> Provenance | None:
+    """Build Provenance from CLI args, or None if it can't be determined.
+    Never guesses hardware_ownership; a run without it explicitly set just
+    isn't checked against or persisted to the result store.
+    """
+    ownership = getattr(args, "hardware_ownership", None)
+    if ownership is None:
+        return None
+    operator = getattr(args, "operator", None)
+    if not operator:
+        import getpass
+        import socket
+
+        try:
+            operator = f"{getpass.getuser()}@{socket.gethostname()}"
+        except OSError:
+            return None
+    try:
+        return Provenance(
+            operator=operator,
+            hardware_ownership=ownership,
+            environment_note=getattr(args, "environment_note", "unknown"),
+            hardware_provider=getattr(args, "hardware_provider", "unknown"),
+            hardware_rate_usd_per_hour=getattr(
+                args, "hardware_rate_usd_per_hour", None
+            ),
+        )
+    except ResultStoreError:
+        return None
+
+
+def _check_result_store_before_run(
+    base: RunConfig, baseline_value: int, candidate_value: int
+) -> None:
+    """Look for a prior matching or near-matching result before any GPU
+    time is spent. Never blocks the run either way, this is information for
+    the operator to act on, not an automatic decision.
+    """
+    identity = {
+        "model_id": base.model,
+        "model_revision": base.model_revision,
+        "gpu": base.gpu,
+        "gpu_count": base.cost.gpu_count,
+        "engine_name": base.server_name,
+        "engine_version": base.server_version,
+    }
+    if "unknown" in identity.values() or None in identity.values():
+        return
+    comparison = {
+        "changed_flag": "max_num_seqs",
+        "baseline_value": str(baseline_value),
+        "candidate_value": str(candidate_value),
+        "cache_policy": base.cache_policy,
+    }
+    try:
+        records = load_records()
+    except OSError:
+        return
+    match = find_match(identity, comparison, records)
+    if match is not None:
+        print(format_match_message(match), file=sys.stderr)
+
+
+def _persist_golden_result(
+    args: argparse.Namespace,
+    result: Mapping[str, Any],
+    completed_reports: Sequence[Mapping[str, Any]],
+    display_aggregate_path: Path,
+    base: RunConfig,
+    baseline_value: int,
+    candidate_value: int,
+    cost_estimate: float,
+) -> None:
+    """Persist a completed, decision-eligible golden result. Never raises:
+    a result-store failure must not turn a successful golden run into a
+    failed one, it's reported and skipped instead.
+    """
+    if getattr(args, "no_result_store", False):
+        return
+    if not result.get("decision_eligible"):
+        return
+    provenance = _result_store_provenance(args)
+    if provenance is None:
+        print(
+            "Result not persisted to the result store: --hardware-ownership "
+            "wasn't set, so provenance can't be determined.",
+            file=sys.stderr,
+        )
+        return
+    if not completed_reports:
+        return
+    manifest = completed_reports[0].get("manifest", {})
+    engine = manifest.get("engine", {})
+    runtime = manifest.get("runtime", {})
+    model = manifest.get("model", {})
+    workload = manifest.get("workload", {})
+    outcome_field = None
+    for condition in result.get("conditions", []):
+        ci = condition.get("throughput_delta_percent_ci")
+        if ci:
+            outcome_field = ci
+            break
+    try:
+        record = build_record(
+            decision_eligible=True,
+            decision_state=result.get("decision_state", "unknown"),
+            overall_outcome=result.get("overall_outcome", "unknown"),
+            throughput_delta_percent_estimate=(outcome_field or {}).get("estimate"),
+            throughput_delta_percent_low=(outcome_field or {}).get("low"),
+            throughput_delta_percent_high=(outcome_field or {}).get("high"),
+            model_id=model.get("id", base.model),
+            model_revision=model.get("immutable_revision", base.model_revision),
+            gpu=runtime.get("gpu", base.gpu),
+            gpu_count=base.cost.gpu_count or 1,
+            gpu_fingerprint_sha256=runtime.get("gpu_fingerprint_sha256", "unknown"),
+            engine_name=engine.get("server_name", base.server_name),
+            engine_version=engine.get("server_version", base.server_version),
+            throttle_client_backend=engine.get("backend", "unknown"),
+            throttle_client_backend_version=engine.get("backend_version", "unknown"),
+            cuda_version=runtime.get("cuda_version", base.cuda_version),
+            driver_version=runtime.get("driver_version", base.driver_version),
+            image_digest=runtime.get("image_digest", base.image_digest),
+            changed_flag="max_num_seqs",
+            baseline_value=str(baseline_value),
+            candidate_value=str(candidate_value),
+            measured_sha256=workload.get("measured_sha256", "unknown"),
+            warmup_sha256=workload.get("warmup_sha256", "unknown"),
+            measured_prompt_count=workload.get("measured_prompt_count"),
+            warmup_prompt_count=workload.get("warmup_prompt_count"),
+            seed=workload.get("seed"),
+            cache_policy=workload.get("cache_policy", base.cache_policy),
+            source_run_fingerprints=result.get("run_fingerprints", []),
+            artifact_paths=[str(display_aggregate_path)],
+            cost_usd_estimate=cost_estimate,
+            result_id=hashlib.sha256(
+                json.dumps(result, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+            provenance=provenance,
+        )
+        path = append_record(record)
+    except (ResultStoreError, OSError, TypeError, ValueError) as exc:
+        print(f"Result not persisted to the result store: {exc}", file=sys.stderr)
+        return
+    print(f"Persisted to result store: {path}", file=sys.stderr)
+
+
 def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     (
         baseline_flag,
@@ -2123,6 +2316,8 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             file=sys.stderr,
         )
         return EXIT_USAGE
+    if not getattr(args, "no_result_store", False):
+        _check_result_store_before_run(base, baseline_value, candidate_value)
     display_output_dir = args.output_dir.expanduser()
     output_dir = display_output_dir.resolve()
     if output_dir.exists():
@@ -2328,6 +2523,16 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
     _print_golden(result, display_aggregate_path, live_session=True)
     if not result["golden_protocol_eligible"]:
         return EXIT_USAGE
+    _persist_golden_result(
+        args,
+        result,
+        completed_reports,
+        display_aggregate_path,
+        base,
+        baseline_value,
+        candidate_value,
+        result.get("session_totals", {}).get("estimated_cost", 0.0),
+    )
     return EXIT_OK if result["decision_eligible"] else EXIT_INCONCLUSIVE
 
 
