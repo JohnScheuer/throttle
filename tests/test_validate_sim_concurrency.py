@@ -70,6 +70,9 @@ def test_validate_sim_concurrent_execution(tmp_path, monkeypatch):
     # Change to tmp dir for output file
     monkeypatch.chdir(tmp_path)
 
+    # Enable experimental commands for validate-sim
+    monkeypatch.setenv("THROTTLE_ENABLE_EXPERIMENTAL", "1")
+
     # Run validate-sim - only runs light load scenario (20 requests at 1 req/sec)
     args = argparse.Namespace(
         endpoint_url=f"http://localhost:{port}/v1",
