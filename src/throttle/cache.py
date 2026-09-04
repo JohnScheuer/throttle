@@ -98,9 +98,23 @@ class SimilarityCache:
                 self._embedding_fallback_logged = True
                 self.enable_embeddings = False
 
+    # Contraction expansion for better lexical matching
+    _CONTRACTIONS = {
+        "what's": "what is", "it's": "it is", "that's": "that is",
+        "don't": "do not", "doesn't": "does not", "can't": "cannot",
+        "won't": "will not", "isn't": "is not", "aren't": "are not",
+        "i'm": "i am", "you're": "you are", "we're": "we are",
+    }
+
     def _jaccard_similarity(self, prompt_a: str, prompt_b: str) -> float:
-        set_a = set(prompt_a.lower().split())
-        set_b = set(prompt_b.lower().split())
+        def normalize(text: str) -> set[str]:
+            lowered = text.lower()
+            for contraction, expansion in self._CONTRACTIONS.items():
+                lowered = lowered.replace(contraction, expansion)
+            return set(lowered.split())
+
+        set_a = normalize(prompt_a)
+        set_b = normalize(prompt_b)
 
         intersection = len(set_a.intersection(set_b))
         union = len(set_a.union(set_b))

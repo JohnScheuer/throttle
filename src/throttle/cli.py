@@ -28,6 +28,7 @@ from .benchmark import (
     RunProgress,
     build_plan,
     load_prompts,
+    normalize_chat_completions_url,
     run_native,
     validate_config,
 )
@@ -509,6 +510,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="output HTML file path",
     )
 
+    golden_report = subparsers.add_parser(
+        "golden-report",
+        help="generate self-contained HTML report from golden protocol artifacts",
+        description=(
+            "Transform golden protocol artifacts (golden.json + position reports) into "
+            "a self-contained HTML deliverable answering: should you change this setting "
+            "(yes/no), what it's worth (throughput + cost), what was tested, why believe it, "
+            "and what this doesn't prove. Single file, no external assets, opens offline."
+        ),
+    )
+    golden_report.add_argument(
+        "--golden-dir",
+        type=Path,
+        required=True,
+        help="directory containing golden.json and position reports (B1.json, C1.json, etc.)",
+    )
+    golden_report.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="output HTML file path",
+    )
+    golden_report.add_argument(
+        "--gpu-hourly-rate",
+        type=float,
+        help="GPU hourly rate in dollars for cost calculation (e.g., 1.39 for A100 80GB)",
+    )
+    golden_report.add_argument(
+        "--operator-name",
+        default="Throttle",
+        help="operator name for report footer (default: 'Throttle')",
+    )
+    golden_report.add_argument(
+        "--operator-email",
+        default="kushthrottle@gmail.com",
+        help="operator email for report footer (default: 'kushthrottle@gmail.com')",
+    )
+
     demo = subparsers.add_parser(
         "demo",
         help="run a fast simulator demo comparing baseline vs tuned configuration",
@@ -563,7 +602,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_sim = subparsers.add_parser(
         "validate-sim",
-        help="validate simulator accuracy against real GPU measurements",
+        help=argparse.SUPPRESS,
         description=(
             "Compare simulator predictions to actual measurements from a live endpoint. "
             "This helps validate simulator assumptions and identify which parameters need "
@@ -647,6 +686,49 @@ def build_parser() -> argparse.ArgumentParser:
     measure.add_argument(
         "--api-key",
         help="API key for authentication (also reads OPENAI_API_KEY env var)",
+    )
+
+    watch = subparsers.add_parser(
+        "watch",
+        help="read vLLM /metrics and report cost per million tokens (no requests sent)",
+        description=(
+            "Passively reads vLLM /metrics (Prometheus text format) and translates "
+            "throughput into dollars per million tokens. Nothing enters the request path. "
+            "Requires --gpu-rate-per-hour. Refuses to print a cost figure when generation "
+            "throughput is unavailable."
+        ),
+    )
+    watch.add_argument(
+        "--metrics-url",
+        default="http://localhost:8000/metrics",
+        metavar="URL",
+        help="vLLM /metrics endpoint (default: http://localhost:8000/metrics)",
+    )
+    watch.add_argument(
+        "--gpu-rate-per-hour",
+        type=float,
+        required=True,
+        metavar="DOLLARS",
+        help="GPU cost in $/hr. Required — no default is honest.",
+    )
+    watch.add_argument(
+        "--interval",
+        type=float,
+        default=15.0,
+        metavar="SECONDS",
+        help="scrape interval in seconds (default: 15)",
+    )
+    watch.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="vLLM max_num_seqs for batch fill computation (optional)",
+    )
+    watch.add_argument(
+        "--json",
+        action="store_true",
+        help="emit raw JSON snapshots instead of formatted text",
     )
 
     proxy = subparsers.add_parser(
@@ -2004,7 +2086,23 @@ def _handle_golden(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         baseline_value,
         candidate_value,
     ) = _golden_config_flags(parser, args)
-    if args.concurrency is None and args.request_rate is None:
+
+    # Golden protocol requires exactly one closed-loop concurrency value
+    if args.request_rate is not None:
+        _parser_error(
+            parser,
+            "Golden protocol requires closed-loop concurrency, not --request-rate. "
+            "Remove --request-rate or use a different command."
+        )
+    if args.concurrency is not None and len(args.concurrency) != 1:
+        _parser_error(
+            parser,
+            f"Golden protocol requires a single concurrency value, but received {len(args.concurrency)} "
+            f"values: {args.concurrency}. This may come from your ~/.throttle/config.yaml. "
+            f"Either set a single concurrency value in your config, or pass --concurrency N explicitly."
+        )
+
+    if args.concurrency is None:
         # Preserve the historical 1-versus-8 default while making every other
         # pair exercise at least its larger configured treatment value.
         args.concurrency = [max(baseline_value, candidate_value)]
@@ -2958,6 +3056,56 @@ def _handle_report(args: argparse.Namespace) -> int:
         return EXIT_FAILED
 
 
+def _handle_golden_report(args: argparse.Namespace) -> int:
+    """Generate self-contained HTML report from golden protocol artifacts."""
+    from throttle.golden_report import generate_html_report
+    import sys
+
+    golden_dir = args.golden_dir.expanduser().resolve()
+
+    # Check golden_dir exists
+    if not golden_dir.exists():
+        print(f"Error: Directory not found: {golden_dir}", file=sys.stderr)
+        return EXIT_FAILED
+
+    if not golden_dir.is_dir():
+        print(f"Error: Not a directory: {golden_dir}", file=sys.stderr)
+        return EXIT_FAILED
+
+    # Find golden.json
+    golden_json_path = golden_dir / "golden.json"
+    if not golden_json_path.exists():
+        print(f"Error: golden.json not found in {golden_dir}", file=sys.stderr)
+        return EXIT_FAILED
+
+    # Find position reports (B1, B2, B3, C1, C2, C3)
+    position_files = []
+    for pos in ['B1', 'B2', 'B3', 'C1', 'C2', 'C3']:
+        pos_file = golden_dir / f"{pos}.json"
+        if not pos_file.exists():
+            print(f"Error: {pos}.json not found in {golden_dir}", file=sys.stderr)
+            return EXIT_FAILED
+        position_files.append(pos_file)
+
+    # Generate report
+    try:
+        generate_html_report(
+            golden_json_path=golden_json_path,
+            position_reports=position_files,
+            output_path=args.output.expanduser().resolve(),
+            gpu_hourly_rate=args.gpu_hourly_rate,
+            operator_name=args.operator_name,
+            operator_email=args.operator_email,
+        )
+        print(f"Golden protocol report generated: {args.output}")
+        return EXIT_OK
+    except Exception as e:
+        print(f"Error generating report: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return EXIT_FAILED
+
+
 def _handle_measure(args: argparse.Namespace) -> int:
     """Measure cost per million tokens with repeated trials."""
     from throttle.workload import WorkloadGenerator
@@ -3211,6 +3359,20 @@ def _handle_measure(args: argparse.Namespace) -> int:
 
 def _handle_validate_sim(args: argparse.Namespace) -> int:
     """Validate simulator accuracy against real measurements at three load levels."""
+    import os
+
+    # Require explicit opt-in via environment variable
+    if os.environ.get("THROTTLE_ENABLE_EXPERIMENTAL") != "1":
+        print("Error: validate-sim is an experimental command.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("This command has known issues:", file=sys.stderr)
+        print("  - Serial execution bug (requests sent one-by-one, not concurrently)", file=sys.stderr)
+        print("  - Results are not decision-eligible", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("To enable experimental commands, set:", file=sys.stderr)
+        print("  export THROTTLE_ENABLE_EXPERIMENTAL=1", file=sys.stderr)
+        return EXIT_USAGE
+
     from throttle.simulator import VLLMSimulator, SimulatorConfig
     from throttle.workload import WorkloadGenerator
     from throttle.cost_model import calculate_cost
@@ -3228,6 +3390,11 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
     api_key = _get_api_key(args)
     headers = _build_headers(api_key)
 
+    chat_completions_url = normalize_chat_completions_url(
+        args.endpoint_url,
+        allow_insecure_http=True,
+    )
+
     print("Throttle Simulator Validation")
     print("=" * 60)
     print()
@@ -3237,7 +3404,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
     try:
         with httpx.Client(timeout=10.0) as client:
             response = client.post(
-                f"{args.endpoint_url}/chat/completions",
+                chat_completions_url,
                 headers=headers,
                 json={
                     "model": args.model,
@@ -3354,7 +3521,7 @@ def _handle_validate_sim(args: argparse.Namespace) -> int:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     try:
                         response = await client.post(
-                            f"{args.endpoint_url}/v1/chat/completions",
+                            chat_completions_url,
                             headers=headers,
                             json={
                                 "model": args.model,
@@ -3573,8 +3740,84 @@ def _handle_proxy(args: argparse.Namespace) -> int:
         return EXIT_FAILED
 
 
+def _handle_watch(args) -> int:
+    """Stream vLLM cost metrics to stdout. Nothing enters the request path."""
+    from throttle.advisor import stream_metrics
+
+    print(f"Watching {args.metrics_url} every {args.interval:.0f}s")
+    print(f"GPU rate: ${args.gpu_rate_per_hour:.2f}/hr")
+    print("Press Ctrl+C to stop.")
+    print()
+
+    try:
+        first_snapshot = True
+        for snap in stream_metrics(
+            args.metrics_url,
+            args.gpu_rate_per_hour,
+            interval_seconds=args.interval,
+            max_num_seqs=args.max_num_seqs,
+        ):
+            # On first snapshot, check for connection failure and exit immediately
+            if first_snapshot:
+                first_snapshot = False
+                # Check for connection error (refusal with figure="all")
+                conn_errors = [r for r in snap.refusals if r.get("figure") == "all"]
+                if conn_errors:
+                    print(f"ERROR: Cannot reach vLLM metrics endpoint at {args.metrics_url}")
+                    print(f"       {conn_errors[0]['reason']}")
+                    print()
+                    print("This usually means:")
+                    print("  - No vLLM server is running")
+                    print("  - The server is at a different URL")
+                    print()
+                    print("To fix:")
+                    print("  1. Start a vLLM server first:")
+                    print("     vllm serve <model>")
+                    print("  2. Or use Ollama:")
+                    print("     ollama serve")
+                    print("  3. Then run 'throttle watch' again")
+                    print("  4. Or specify a different endpoint:")
+                    print(f"     throttle watch --url http://host:port/metrics --gpu-rate-per-hour {args.gpu_rate_per_hour}")
+                    return EXIT_FAILED
+
+            if args.json:
+                import json as _json
+                print(_json.dumps(snap.to_dict()))
+                import sys as _sys
+                _sys.stdout.flush()
+            else:
+                _render_watch_snap(snap)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    return EXIT_OK
+
+
+def _render_watch_snap(snap) -> None:
+    """Format a CostSnapshot for human display."""
+    import time as _time
+    print(f"--- {_time.strftime('%H:%M:%S')} ---")
+    if snap.generation_throughput_toks_per_sec is not None:
+        print(f"  Gen throughput : {snap.generation_throughput_toks_per_sec:.1f} tok/s")
+    if snap.num_requests_running is not None:
+        fill = f" ({snap.batch_fill:.0%} fill)" if snap.batch_fill is not None else ""
+        print(f"  Requests       : {snap.num_requests_running:.0f} running{fill}")
+    if snap.cost_per_million_tokens is not None:
+        print(f"  Cost           : ${snap.cost_per_hour:.2f}/hr  "
+              f"${snap.cost_per_million_tokens:.4f}/Mtok")
+    for r in snap.refusals:
+        print(f"  ⚠ {r['figure']}: {r['reason'][:80]}")
+    print()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    from .config import load_config, apply_config_defaults
+
     parser = build_parser()
+
+    # Load config file and apply as defaults (CLI flags will override)
+    config = load_config()
+    apply_config_defaults(parser, config)
+
     args = parser.parse_args(argv)
     if args.command in {"plan", "smoke", "benchmark"}:
         _warn_if_exploratory_sweep(args)
@@ -3591,6 +3834,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _handle_experimental_tuning(parser, args)
     if args.command == "golden":
         return _handle_golden(parser, args)
+    if args.command == "golden-report":
+        return _handle_golden_report(args)
     if args.command == "report":
         return _handle_report(args)
     if args.command == "compare":
@@ -3645,6 +3890,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _handle_validate_sim(args)
     if args.command == "proxy":
         return _handle_proxy(args)
+    if args.command == "watch":
+        return _handle_watch(args)
     parser.error("a subcommand is required")
     return EXIT_USAGE
 

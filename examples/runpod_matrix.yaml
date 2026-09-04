@@ -1,0 +1,72 @@
+# Golden Protocol Matrix - RunPod Validation
+#
+# This matrix defines three replication cells for validating the golden protocol
+# across different GPU tiers and configuration parameters on RunPod infrastructure.
+#
+# Usage:
+#   1. Set environment variables for API keys:
+#      export RUNPOD_API_KEY="your-runpod-api-key"
+#
+#   2. Deploy vLLM endpoints on RunPod with the specified models
+#
+#   3. Run the matrix:
+#      python3 scripts/run_golden_matrix.py --matrix examples/runpod_matrix.yaml
+#
+# Resume support:
+#   If a run fails midway, use --resume to skip completed cells:
+#      python3 scripts/run_golden_matrix.py --matrix examples/runpod_matrix.yaml --resume
+
+cells:
+  # Cell 1: A100 80GB - Qwen2.5-7B - max_num_seqs variation
+  # Premium tier GPU, testing batch size scaling
+  - name: "A100-Qwen2.5-7B-max_num_seqs"
+    endpoint: "https://YOUR-RUNPOD-A100-ENDPOINT.runpod.net/v1"
+    api_key_env: "RUNPOD_API_KEY"
+    model: "Qwen/Qwen2.5-7B-Instruct"
+    gpu: "A100 80GB PCIe"
+    gpu_hourly_rate: 1.39  # RunPod A100 80GB PCIe rate (as of 2026-08)
+    baseline_config:
+      max_num_seqs: 1
+    candidate_config:
+      max_num_seqs: 8
+    estimated_duration_minutes: 45
+    timeout_seconds: 3600
+
+  # Cell 2: RTX 4090 - Qwen2.5-7B - max_num_seqs variation
+  # Mid-tier GPU, testing cost-performance tradeoff
+  - name: "RTX4090-Qwen2.5-7B-max_num_seqs"
+    endpoint: "https://YOUR-RUNPOD-RTX4090-ENDPOINT.runpod.net/v1"
+    api_key_env: "RUNPOD_API_KEY"
+    model: "Qwen/Qwen2.5-7B-Instruct"
+    gpu: "RTX 4090 24GB"
+    gpu_hourly_rate: 0.69  # RunPod RTX 4090 rate (as of 2026-08)
+    baseline_config:
+      max_num_seqs: 1
+    candidate_config:
+      max_num_seqs: 8
+    estimated_duration_minutes: 50  # Slightly longer due to slower GPU
+    timeout_seconds: 3600
+
+  # Cell 3: RTX 4090 - Qwen2.5-7B - gpu_memory_utilization variation
+  # Testing memory optimization parameter instead of batch size
+  # This validates that golden protocol works for non-batch-size parameters
+  - name: "RTX4090-Qwen2.5-7B-gpu_memory_utilization"
+    endpoint: "https://YOUR-RUNPOD-RTX4090-ENDPOINT.runpod.net/v1"
+    api_key_env: "RUNPOD_API_KEY"
+    model: "Qwen/Qwen2.5-7B-Instruct"
+    gpu: "RTX 4090 24GB"
+    gpu_hourly_rate: 0.69  # RunPod RTX 4090 rate (as of 2026-08)
+    baseline_config:
+      gpu_memory_utilization: 0.85
+    candidate_config:
+      gpu_memory_utilization: 0.95
+    estimated_duration_minutes: 50
+    timeout_seconds: 3600
+
+# Total estimated cost: $1.94 USD
+# Total estimated duration: 145 minutes (~2.4 hours)
+#
+# Actual costs may vary based on:
+# - Actual run duration (depends on network latency, request processing time)
+# - RunPod pricing changes
+# - Additional overhead for golden protocol setup/teardown
