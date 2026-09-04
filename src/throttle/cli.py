@@ -601,7 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_sim = subparsers.add_parser(
         "validate-sim",
-        help="validate simulator accuracy against real GPU measurements",
+        help=argparse.SUPPRESS,
         description=(
             "Compare simulator predictions to actual measurements from a live endpoint. "
             "This helps validate simulator assumptions and identify which parameters need "

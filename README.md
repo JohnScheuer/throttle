@@ -20,6 +20,14 @@ Throttle measures existing OpenAI-compatible inference endpoints (vLLM, Ollama, 
 
 Results describe only the declared workload and manifest. No universal claims, no projected savings.
 
+## Complement to vLLM auto_tune
+
+vLLM's [auto_tune](https://docs.vllm.ai/en/latest/features/performance.html#automatic-tuning) does exactly what its name says: it automatically searches a parameter grid to find a good configuration for your hardware. It runs each candidate config sequentially, measures throughput, and reports the best one. This is excellent for quickly narrowing the search space without manual iteration.
+
+Throttle complements this workflow by answering the next question: **did that configuration change actually win?** After auto_tune (or manual tuning) gives you a candidate, Throttle's `golden` protocol runs a controlled baseline-vs-candidate comparison with counterbalanced ordering (B1/C1/B2/C2/B3/C3) to control for time drift, confidence intervals to quantify uncertainty, and strict validation gates to ensure the result is decision-grade.
+
+**What Throttle does not do:** Throttle does not search parameter spaces, suggest configs, or claim to be better than auto_tune. It validates changes. Use auto_tune to search, then use Throttle's golden protocol to prove the winning config actually beat your baseline.
+
 ## One command to try it
 
 ```bash
