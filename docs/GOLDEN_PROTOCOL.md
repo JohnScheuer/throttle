@@ -47,8 +47,8 @@ the same instant.
 Before traffic, record and independently retain evidence for:
 
 - model repository commit (full 40- or 64-hex revision, never `main`);
-- accelerator backend/label and one stable private fingerprint (only its
-  SHA-256 is reported);
+- accelerator backend/label and engine name (e.g. `vllm`, not just its version)
+  and one stable private fingerprint (only its SHA-256 is reported);
 - accelerator runtime, server, and Throttle versions;
 - one immutable software-environment digest;
 - for CUDA, the image name plus `@sha256:<64 hex>` digest and the CUDA/driver
@@ -66,6 +66,16 @@ the measured workload, and are excluded from measurements.
 Choose `disabled`, `cold`, `warm`, or `representative` cache policy before the
 first run, then hold it constant. Do not clear or warm caches opportunistically
 between variants.
+
+**Constructing `--gpu-fingerprint`:** this value is never sent anywhere, only
+its SHA-256 is (see `--gpu-fingerprint-supplied` in the manifest). Build it
+from device model, VRAM, driver version, and CUDA version, for example
+`NVIDIA-A100-80GB-driver550.127.05-cuda12.8`. Do **not** include the device
+UUID or serial number: on rented hardware (RunPod, Lambda, etc.) the UUID
+changes on every fresh allocation even when it's physically the same GPU
+model, so a fingerprint built from it will never match itself across two
+separate rentals, defeating its purpose for anyone comparing results across
+runs.
 
 ## Per-position measurement floor
 
@@ -122,9 +132,10 @@ throttle golden --dry-run \
   --model-revision 0123456789abcdef0123456789abcdef01234567 \
   --image-digest 'registry.example/vllm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   --gpu 'NVIDIA A100 80GB PCIe' \
-  --gpu-fingerprint 'operator-private-stable-device-id' \
+  --gpu-fingerprint 'NVIDIA-A100-80GB-driver550.127.05-cuda12.8' \
   --cuda-version 13.0 \
   --driver-version 580.42 \
+  --server-name vllm \
   --server-version 0.27.1 \
   --engine-flag enable_chunked_prefill=true \
   --engine-flags-provenance runtime_verified \

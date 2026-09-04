@@ -385,6 +385,8 @@ def _golden_args(
         "--model-revision",
         "0123456789abcdef0123456789abcdef01234567",
         *runtime_args,
+        "--server-name",
+        "vllm",
         "--server-version",
         "0.27.1",
         "--engine-flag",

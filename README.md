@@ -352,9 +352,10 @@ throttle benchmark \
   --accelerator-backend cuda \
   --image-digest 'registry.example/vllm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   --gpu 'NVIDIA A100 80GB PCIe' \
-  --gpu-fingerprint 'operator-private-stable-device-id' \
+  --gpu-fingerprint 'NVIDIA-A100-80GB-driver550.127.05-cuda12.8' \
   --cuda-version 13.0 \
   --driver-version 580.42 \
+  --server-name vllm \
   --server-version 0.27.1 \
   --engine-flag max_num_seqs=1 \
   --engine-flag enable_chunked_prefill=true \
@@ -663,10 +664,11 @@ throttle golden --dry-run \
   --model-revision 0123456789abcdef0123456789abcdef01234567 \
   --image-digest 'registry.example/vllm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   --gpu 'NVIDIA A100 80GB PCIe' \
-  --gpu-fingerprint 'operator-private-stable-device-id' \
-  --cuda-version 12.4 \
-  --driver-version 550.54.15 \
-  --server-version 0.6.0 \
+  --gpu-fingerprint 'NVIDIA-A100-80GB-driver550.127.05-cuda12.8' \
+  --cuda-version 13.0 \
+  --driver-version 580.42 \
+  --server-name vllm \
+  --server-version 0.27.1 \
   --engine-flag enable_chunked_prefill=true \
   --engine-flags-provenance runtime_verified \
   --evidence-source live_inference \

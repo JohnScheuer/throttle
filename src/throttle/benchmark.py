@@ -2001,6 +2001,7 @@ def _manifest(
             "http_client_version": httpx.__version__
             if config.backend == "native"
             else None,
+            "server_name": config.server_name,
             "server_version": config.server_version,
             "effective_flags": engine_flags,
             "effective_flags_provenance": config.engine_flags_provenance,

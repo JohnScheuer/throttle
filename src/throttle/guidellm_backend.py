@@ -991,6 +991,7 @@ def _matrix_manifest(config: Any, prompt_tokens: int) -> dict[str, Any]:
             "backend": "guidellm",
             "backend_version": GUIDELLM_VERSION,
             "http_client_version": None,
+            "server_name": config.server_name,
             "server_version": config.server_version,
             "effective_flags": engine_flags,
             "effective_flags_provenance": config.engine_flags_provenance,

@@ -336,6 +336,9 @@ class RunConfig:
     cache_ttl_seconds: float = 3600.0
     cache_max_size: int = 1000
     cache_similarity_threshold: float = 0.85
+    # Appended at the end, same as the accelerator_backend block above, to
+    # preserve every existing field's positional slot for legacy callers.
+    server_name: str = "unknown"
 
     def planned_request_count(self) -> int | None:
         if self.requests_per_block is None:

@@ -222,6 +222,8 @@ def golden_preflight_reasons(
         f"golden_runtime_{reason}"
         for reason in runtime_provenance_reasons(runtime, CURRENT_MANIFEST_VERSION)
     )
+    if base.server_name == "unknown":
+        reasons.append("golden_requires_server_name")
     if base.server_version == "unknown":
         reasons.append("golden_requires_server_version")
 
@@ -999,6 +1001,7 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
         ("manifest", "engine", "backend"),
         ("manifest", "engine", "backend_version"),
         ("manifest", "engine", "http_client_version"),
+        ("manifest", "engine", "server_name"),
         ("manifest", "engine", "server_version"),
         ("manifest", "workload", "seed"),
         ("manifest", "workload", "measured_sha256"),
@@ -1023,6 +1026,7 @@ def _protocol_checks(reports: Sequence[Mapping[str, Any]]) -> list[str]:
     if not isinstance(revision, str) or not IMMUTABLE_REVISION.fullmatch(revision):
         reasons.append("model_revision_is_not_immutable")
     for path, code in (
+        (("manifest", "engine", "server_name"), "server_name_missing"),
         (("manifest", "engine", "server_version"), "server_version_missing"),
     ):
         value = _path(reports[0], *path)

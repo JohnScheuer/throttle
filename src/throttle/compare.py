@@ -506,6 +506,7 @@ def _preflight_reason(report: Mapping[str, Any]) -> str | None:
         _path(report, "manifest", "engine", "backend"),
         _path(report, "manifest", "engine", "backend_version"),
         _path(report, "manifest", "engine", "http_client_version"),
+        _path(report, "manifest", "engine", "server_name"),
         _path(report, "manifest", "engine", "server_version"),
         _path(report, "manifest", "model", "id"),
         _path(report, "manifest", "model", "immutable_revision"),
@@ -1165,6 +1166,7 @@ _CONTROLLED_MANIFEST_PATHS: tuple[tuple[str, ...], ...] = (
     ("engine", "backend"),
     ("engine", "backend_version"),
     ("engine", "http_client_version"),
+    ("engine", "server_name"),
     ("engine", "server_version"),
     ("safety",),
 )
