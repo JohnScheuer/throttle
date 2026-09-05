@@ -57,6 +57,8 @@ def reference():
 
 @pytest.fixture(scope="module")
 def fixture():
+    if not FIXTURE.exists():
+        pytest.skip("Fixture JSON not yet generated — regenerate with optimum")
     return json.loads(FIXTURE.read_text())
 
 
