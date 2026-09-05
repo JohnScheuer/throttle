@@ -6,6 +6,11 @@ import time
 from pathlib import Path
 
 import pytest
+yaml = pytest.importorskip(
+    "yaml",
+    reason="pyyaml required — install with: pip install throttle-pro[config]",
+)
+
 
 
 def test_matrix_runner_against_mock_backend(tmp_path):
